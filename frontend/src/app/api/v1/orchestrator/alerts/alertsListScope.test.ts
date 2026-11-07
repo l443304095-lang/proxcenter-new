@@ -1,0 +1,211 @@
+/**
+ * Scope-specific tests for GET /api/v1/orchestrator/alerts.
+ * Verifies that the route resolves infraKind via getTenantInfrastructureScope
+ * and passes it (along with vdcScope=null for provider/msp) into the
+ * isAlertVisibleToTenant ctx.
+ */
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+
+const getAlertsMock = vi.fn()
+const isAlertVisibleToTenantMock = vi.fn()
+const getTenantInfrastructureScopeMock = vi.fn()
+const maskingScopeMock = vi.fn()
+const { rbacScopeMock } = vi.hoisted(() => ({ rbacScopeMock: vi.fn() }))
+
+import { FAKE_RBAC_SCOPE, forwardedRbacScope } from '@/__tests__/setup/rbacScope'
+
+vi.mock('@/lib/orchestrator/client', () => ({
+  alertsApi: { getAlerts: (...args: unknown[]) => getAlertsMock(...args) },
+}))
+
+vi.mock('@/lib/demo/demo-api', () => ({
+  demoResponse: () => null,
+}))
+
+vi.mock('@/lib/tenant', () => ({
+  getCurrentTenantId: vi.fn().mockResolvedValue('default'),
+  getTenantConnectionIds: vi.fn().mockResolvedValue(new Set<string>(['conn-1'])),
+  getSessionPrisma: vi.fn().mockResolvedValue({
+    alertSilence: {
+      findMany: vi.fn().mockResolvedValue([]),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+  }),
+}))
+
+vi.mock('@/lib/tenant/infraScope', () => ({
+  getTenantInfrastructureScope: (...args: unknown[]) => getTenantInfrastructureScopeMock(...args),
+  maskingScope: (...args: unknown[]) => maskingScopeMock(...args),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: vi.fn().mockResolvedValue(null),
+  getCurrentRbacInfraScope: (...args: unknown[]) => rbacScopeMock(...args),
+  PERMISSIONS: { CONNECTION_VIEW: 'connection.view' },
+}))
+
+vi.mock('@/lib/alerts/visibility', () => ({
+  isAlertVisibleToTenant: (...args: unknown[]) => isAlertVisibleToTenantMock(...args),
+}))
+
+vi.mock('@/lib/alerts/vdcVmids', () => ({
+  getVdcVmidsByConnection: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/lib/alerts/orchestratorFingerprint', () => ({
+  buildOrchestratorFingerprint: (a: { connection_id?: string; type?: string; resource?: string }) =>
+    `${a.connection_id}:${a.type}:${a.resource}`,
+}))
+
+import { GET } from './route'
+
+function makeReq() {
+  return new Request('http://localhost/api/v1/orchestrator/alerts')
+}
+
+beforeEach(() => {
+  getAlertsMock.mockReset()
+  isAlertVisibleToTenantMock.mockReset()
+  getTenantInfrastructureScopeMock.mockReset()
+  maskingScopeMock.mockReset()
+  rbacScopeMock.mockReset().mockResolvedValue(null)
+  isAlertVisibleToTenantMock.mockResolvedValue(true)
+})
+
+const alert1 = {
+  connection_id: 'conn-1',
+  type: 'cpu',
+  severity: 'warning',
+  resource_type: 'node',
+  resource: 'pve-node-1',
+  status: 'active',
+  last_seen_at: '2026-01-01T00:00:00Z',
+}
+
+describe('GET /api/v1/orchestrator/alerts — infraKind forwarding', () => {
+  it('passes infraKind:provider and vdcScope:null when tenant is provider', async () => {
+    getTenantInfrastructureScopeMock.mockResolvedValue({ kind: 'provider' })
+    maskingScopeMock.mockReturnValue(null)
+    getAlertsMock.mockResolvedValue({ data: { data: [alert1] } })
+
+    let capturedCtx: any
+    isAlertVisibleToTenantMock.mockImplementation((_alert: unknown, ctx: unknown) => {
+      capturedCtx = ctx
+      return Promise.resolve(true)
+    })
+
+    const res = await GET(makeReq())
+    expect(res.status).toBe(200)
+    expect(capturedCtx).toBeDefined()
+    expect(capturedCtx.infraKind).toBe('provider')
+    expect(capturedCtx.vdcScope).toBeNull()
+  })
+
+  it('passes infraKind:msp and vdcScope:null when tenant is msp', async () => {
+    getTenantInfrastructureScopeMock.mockResolvedValue({
+      kind: 'msp',
+      connectionIds: new Set(['conn-1']),
+    })
+    maskingScopeMock.mockReturnValue(null)
+    getAlertsMock.mockResolvedValue({ data: { data: [alert1] } })
+
+    let capturedCtx: any
+    isAlertVisibleToTenantMock.mockImplementation((_alert: unknown, ctx: unknown) => {
+      capturedCtx = ctx
+      return Promise.resolve(true)
+    })
+
+    const res = await GET(makeReq())
+    expect(res.status).toBe(200)
+    expect(capturedCtx.infraKind).toBe('msp')
+    expect(capturedCtx.vdcScope).toBeNull()
+  })
+
+  it('passes infraKind:iaas and non-null vdcScope when tenant is iaas', async () => {
+    const fakeVdcScope = { connectionIds: new Set(['conn-1']), vmids: new Set<string>() }
+    getTenantInfrastructureScopeMock.mockResolvedValue({
+      kind: 'iaas',
+      vdcScope: fakeVdcScope,
+    })
+    maskingScopeMock.mockReturnValue(fakeVdcScope)
+    getAlertsMock.mockResolvedValue({ data: { data: [alert1] } })
+
+    let capturedCtx: any
+    isAlertVisibleToTenantMock.mockImplementation((_alert: unknown, ctx: unknown) => {
+      capturedCtx = ctx
+      return Promise.resolve(true)
+    })
+
+    // For iaas, vdcVmids would be fetched (vdcScope is non-null).
+    // The mock for getVdcVmidsByConnection returns undefined — acceptable here.
+    const res = await GET(makeReq())
+    expect(res.status).toBe(200)
+    expect(capturedCtx.infraKind).toBe('iaas')
+    expect(capturedCtx.vdcScope).toBe(fakeVdcScope)
+  })
+
+  it('returns empty list when no alerts pass visibility for provider', async () => {
+    getTenantInfrastructureScopeMock.mockResolvedValue({ kind: 'provider' })
+    maskingScopeMock.mockReturnValue(null)
+    getAlertsMock.mockResolvedValue({ data: { data: [alert1] } })
+    isAlertVisibleToTenantMock.mockResolvedValue(false)
+
+    const res = await GET(makeReq())
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data).toHaveLength(0)
+  })
+})
+
+describe('RBAC infra scope forwarding (issue #525)', () => {
+  beforeEach(() => {
+    getTenantInfrastructureScopeMock.mockResolvedValue({ kind: 'provider' })
+    maskingScopeMock.mockReturnValue(null)
+    getAlertsMock.mockResolvedValue({ data: { data: [alert1] } })
+  })
+
+  it('forwards the caller scope into the visibility ctx', async () => {
+    rbacScopeMock.mockResolvedValue(FAKE_RBAC_SCOPE)
+    const listRes = await GET(makeReq())
+    expect(listRes.status).toBe(200)
+    expect(forwardedRbacScope(isAlertVisibleToTenantMock)).toBe(FAKE_RBAC_SCOPE)
+    expect(rbacScopeMock).toHaveBeenCalledWith('connection.view')
+  })
+
+  it('forwards null for an unrestricted caller', async () => {
+    const listRes = await GET(makeReq())
+    expect(listRes.status).toBe(200)
+    expect(forwardedRbacScope(isAlertVisibleToTenantMock)).toBeNull()
+  })
+})
+
+describe('status handling (#1086)', () => {
+  const resolvedNewer = { ...alert1, resource: 'pve-node-2', status: 'resolved', last_seen_at: '2026-02-01T00:00:00Z' }
+  const resolvedSame = { ...alert1, status: 'resolved', last_seen_at: '2026-03-01T00:00:00Z' }
+
+  beforeEach(() => {
+    getTenantInfrastructureScopeMock.mockResolvedValue({ kind: 'provider' })
+    maskingScopeMock.mockReturnValue(null)
+    getAlertsMock.mockImplementation(async ({ status }: { status: string }) => ({
+      data: { data: [alert1, resolvedNewer, resolvedSame].filter(a => a.status === status) },
+    }))
+  })
+
+  it('asks the orchestrator for the requested status only', async () => {
+    const res = await GET(new Request('http://localhost/api/v1/orchestrator/alerts?status=active'))
+    const body = await res.json()
+
+    expect(body.data).toEqual([expect.objectContaining({ status: 'active', resource: 'pve-node-1' })])
+    expect(body.total).toBe(1)
+    expect(getAlertsMock).toHaveBeenCalledTimes(1)
+    expect(getAlertsMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'active' }))
+  })
+
+  it('lists open alerts ahead of newer resolved history, without dedup across statuses', async () => {
+    const res = await GET(new Request('http://localhost/api/v1/orchestrator/alerts?limit=2'))
+    const body = await res.json()
+
+    expect(body.total).toBe(3)
+    expect(body.data.map((a: any) => a.status)).toEqual(['active', 'resolved'])
+  })
+})

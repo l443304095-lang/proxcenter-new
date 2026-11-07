@@ -1,0 +1,187 @@
+import { describe, it, expect, vi, beforeEach } from "vitest"
+import { buildPreflightCmd, parsePreflightOutput, checkVddkPreflight, runWarmNodePreflight } from "./vddk-preflight"
+
+vi.mock("@/lib/ssh/exec", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/ssh/exec")>()
+  return { ...actual, executeSSH: vi.fn() }
+})
+import { executeSSH } from "@/lib/ssh/exec"
+const mockSSH = executeSSH as unknown as ReturnType<typeof vi.fn>
+
+// runWarmNodePreflight resolves the node IP exactly like the warm engine does,
+// so the dialog verdict matches what runWarmMigration checks at planning time.
+vi.mock("@/lib/connections/getConnection", () => ({
+  getConnectionById: vi.fn(async () => ({ baseUrl: "https://pve.local:8006" })),
+}))
+vi.mock("../pve-tasks", () => ({
+  getNodeSshEndpointForMigration: vi.fn(async () => ({ host: "10.0.0.7", port: 2201, source: "override" })),
+}))
+vi.mock("@/lib/db/prisma", () => ({ prisma: {} }))
+import { getNodeSshEndpointForMigration } from "../pve-tasks"
+const mockNodeIp = getNodeSshEndpointForMigration as unknown as ReturnType<typeof vi.fn>
+
+const ALL_PRESENT = [
+  "nbdkit=/usr/sbin/nbdkit",
+  "nbd-client=/usr/sbin/nbd-client",
+  "vddk-plugin=/usr/lib/x86_64-linux-gnu/nbdkit/plugins/nbdkit-vddk-plugin.so",
+  "vddk-lib=/opt/vddk/lib64/libvixDiskLib.so.9",
+].join("\n")
+
+describe("buildPreflightCmd", () => {
+  it("probes nbdkit, nbd-client, the vddk plugin, and the VDDK lib under libdir", () => {
+    const cmd = buildPreflightCmd("/opt/vddk")
+    expect(cmd).toContain("command -v nbdkit")
+    expect(cmd).toContain("command -v nbd-client")
+    expect(cmd).toContain("nbdkit-vddk-plugin.so")
+    expect(cmd).toContain("'/opt/vddk'/lib64/libvixDiskLib.so")
+  })
+  // #946: which VDDK generation is installed decides which source versions the
+  // node can read, and the `vddk-lib` glob above cannot tell (it lands on the
+  // unversioned symlink). The probe resolves the SONAME nbdkit dlopens instead.
+  it("resolves the real VDDK library behind the so.8 SONAME", () => {
+    const cmd = buildPreflightCmd("/opt/vddk")
+    expect(cmd).toContain("vddk-real=")
+    expect(cmd).toContain("readlink -f '/opt/vddk'/lib64/libvixDiskLib.so.8")
+  })
+  it("reports the resolved VDDK library on the result", () => {
+    const out = [ALL_PRESENT, "vddk-real=/opt/vddk/lib64/libvixDiskLib.so.9.1.0.0"].join("\n")
+    expect(parsePreflightOutput(out, "/opt/vddk").vddkLib).toBe("/opt/vddk/lib64/libvixDiskLib.so.9.1.0.0")
+  })
+  it("leaves the resolved VDDK library undefined when the probe read nothing", () => {
+    expect(parsePreflightOutput([ALL_PRESENT, "vddk-real="].join("\n"), "/opt/vddk").vddkLib).toBeUndefined()
+  })
+  it("probes the Debian major version alongside the four dependencies", () => {
+    const cmd = buildPreflightCmd("/opt/vddk")
+    expect(cmd).toContain("debian-major=")
+    expect(cmd).toContain("/etc/os-release")
+  })
+})
+
+describe("parsePreflightOutput", () => {
+  it("reports ok when every dependency is present", () => {
+    const r = parsePreflightOutput(ALL_PRESENT, "/opt/vddk")
+    expect(r.ok).toBe(true)
+    expect(r.missing).toEqual([])
+  })
+  it("flags a missing binary with an actionable hint", () => {
+    const out = ALL_PRESENT.replace("nbdkit=/usr/sbin/nbdkit", "nbdkit=MISSING")
+    const r = parsePreflightOutput(out, "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.missing).toContain("nbdkit")
+    expect(r.error).toMatch(/apt install nbdkit/i)
+  })
+  it("flags a missing VDDK library with the 9.x symlink hint", () => {
+    const out = ALL_PRESENT.replace(/vddk-lib=.*/, "vddk-lib=")
+    const r = parsePreflightOutput(out, "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.missing).toContain("vddk-lib")
+    expect(r.error).toMatch(/libvixDiskLib|VDDK|symlink/i)
+  })
+  // roadmap#177: in OpenVDDK's directory the remedy is "Prepare this node".
+  it("points at OpenVDDK and its automated setup in OpenVDDK's directory", () => {
+    const out = ALL_PRESENT.replace(/vddk-lib=.*/, "vddk-lib=")
+    const r = parsePreflightOutput(out, "/usr/lib/openvddk")
+    expect(r.error).toContain("install OpenVDDK 0.7.4")
+    expect(r.error).toContain("Prepare this node")
+    expect(r.error).not.toContain("Broadcom")
+    expect(r.libdir).toBe("/usr/lib/openvddk")
+  })
+  it("names both libraries for an explicit libdir, which may hold either", () => {
+    const out = ALL_PRESENT.replace(/vddk-lib=.*/, "vddk-lib=")
+    const r = parsePreflightOutput(out, "/usr/lib/vmware-vix-disklib")
+    expect(r.error).toContain("install OpenVDDK 0.7.4")
+    expect(r.error).toContain("install the Broadcom VDDK")
+  })
+})
+
+describe("parsePreflightOutput: PVE 9 requirement", () => {
+  it("flags a Debian 12 node with missing pieces as unsupported, not merely unprepared", () => {
+    // The exact failure seen on a PVE 8 node: pieces missing, and apt has no
+    // nbdkit-plugin-vddk to offer on bookworm.
+    const r = parsePreflightOutput("debian-major=12\n", "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.osUnsupported).toBe(true)
+    expect(r.debianMajor).toBe(12)
+    expect(r.missing).toContain("vddk-plugin")
+    expect(r.error).toContain("Proxmox VE 9")
+    expect(r.error).toContain("Debian 12")
+    expect(r.error).toContain("Proxmox VE 8")
+  })
+
+  it("keeps the generic missing-list verdict on Debian 13", () => {
+    const r = parsePreflightOutput("debian-major=13\n", "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.osUnsupported).toBeUndefined()
+    expect(r.debianMajor).toBe(13)
+    expect(r.error).toContain("Missing:")
+  })
+
+  it("never blocks a ready node, whatever its Debian version", () => {
+    // A PVE 8 node someone provisioned by other means is ready: warm migration
+    // only needs the pieces to be present, the version gate is about apt.
+    const r = parsePreflightOutput(ALL_PRESENT + "\ndebian-major=12", "/opt/vddk")
+    expect(r.ok).toBe(true)
+    expect(r.osUnsupported).toBeUndefined()
+    expect(r.debianMajor).toBe(12)
+  })
+
+  it("falls through to the generic hints when the version is unreadable", () => {
+    // An unknown or future system must not be locked out by this check.
+    const r = parsePreflightOutput("debian-major=\n", "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.osUnsupported).toBeUndefined()
+    expect(r.debianMajor).toBeUndefined()
+    expect(r.error).toContain("Missing:")
+  })
+})
+
+describe("checkVddkPreflight", () => {
+  beforeEach(() => mockSSH.mockReset())
+  it("returns ok when the node has every dependency", async () => {
+    mockSSH.mockResolvedValue({ success: true, output: ALL_PRESENT })
+    const r = await checkVddkPreflight("conn", "10.99.99.201", "/opt/vddk")
+    expect(r.ok).toBe(true)
+    // The probe only reads, so it may run on a cluster outside the license (roadmap#58).
+    expect(mockSSH.mock.calls[0][4]).toEqual({ readOnly: true })
+  })
+  it("surfaces a clear error when the SSH probe itself fails", async () => {
+    mockSSH.mockResolvedValue({ success: false, error: "connection refused" })
+    const r = await checkVddkPreflight("conn", "10.99.99.201", "/opt/vddk")
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/connection refused|preflight/i)
+  })
+})
+
+describe("runWarmNodePreflight", () => {
+  beforeEach(() => {
+    mockSSH.mockReset()
+    mockNodeIp.mockClear()
+    mockNodeIp.mockResolvedValue({ host: "10.0.0.7", port: 2201, source: "override" })
+  })
+
+  it("resolves the node IP the way the engine does, then probes that node (OpenVDDK by default)", async () => {
+    mockSSH.mockResolvedValue({ success: true, output: ALL_PRESENT })
+    const r = await runWarmNodePreflight("conn", "pve1")
+    expect(r.ok).toBe(true)
+    expect(r.libdir).toBe("/usr/lib/openvddk")
+    // Engine parity: getNodeSshEndpointForMigration(prisma, connId, node, baseUrl)
+    expect(mockNodeIp).toHaveBeenCalledWith(expect.anything(), "conn", "pve1", "https://pve.local:8006")
+    // Probe ran against the resolved host and per-node port, with the default library's directory.
+    expect(mockSSH).toHaveBeenCalledWith("conn", { host: "10.0.0.7", port: 2201, source: "override" }, expect.stringContaining("'/usr/lib/openvddk'/lib64/libvixDiskLib.so"), undefined, { readOnly: true })
+  })
+
+  it("honours a custom vddkLibdir so the verdict matches the migration's libdir", async () => {
+    mockSSH.mockResolvedValue({ success: true, output: ALL_PRESENT })
+    const r = await runWarmNodePreflight("conn", "pve1", "/opt/vddk")
+    expect(r.libdir).toBe("/opt/vddk")
+    expect(mockSSH).toHaveBeenCalledWith("conn", { host: "10.0.0.7", port: 2201, source: "override" }, expect.stringContaining("'/opt/vddk'/lib64/libvixDiskLib.so"), undefined, { readOnly: true })
+  })
+
+  it("returns no-go with the missing deps when the node is not prepared", async () => {
+    mockSSH.mockResolvedValue({ success: true, output: "nbdkit=MISSING\nnbd-client=MISSING\nvddk-plugin=\nvddk-lib=" })
+    const r = await runWarmNodePreflight("conn", "pve1")
+    expect(r.ok).toBe(false)
+    expect(r.missing).toContain("vddk-plugin")
+    expect(r.missing).toContain("vddk-lib")
+  })
+})

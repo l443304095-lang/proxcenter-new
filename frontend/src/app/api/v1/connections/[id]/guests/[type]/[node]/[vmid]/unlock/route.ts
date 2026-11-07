@@ -1,0 +1,153 @@
+import { NextResponse } from "next/server"
+
+import { licenseExcludedResponse } from "@/lib/api/response"
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { safeLog } from "@/lib/log/sanitize"
+import { executeSSH } from "@/lib/ssh/exec"
+import { assertVmid } from "@/lib/ssh/validate"
+import { resolveNodeSshEndpoint } from "@/lib/ssh/node-endpoint"
+import { guardSessionGuest } from "@/lib/vdc/guestGuard"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+/**
+ * POST /api/v1/connections/{id}/guests/{type}/{node}/{vmid}/unlock
+ *
+ * Unlock a VM via SSH (qm unlock / pct unlock)
+ */
+async function postHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    if (!id || !type || !node || !vmid) {
+      return NextResponse.json({ error: "Missing parameters" }, { status: 400 })
+    }
+
+    if (type !== 'qemu' && type !== 'lxc') {
+      return NextResponse.json({ error: "Invalid type. Must be 'qemu' or 'lxc'" }, { status: 400 })
+    }
+
+    // Constrain the VMID to a positive integer before it is interpolated into
+    // the `qm/pct unlock` shell command executed on the node (command injection).
+    let safeVmid: string
+    try {
+      safeVmid = assertVmid(vmid)
+    } catch {
+      return NextResponse.json({ error: "Invalid vmid" }, { status: 400 })
+    }
+
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_CONFIG_HARDWARE, "vm", resourceId)
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+    if (!conn) {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    // A vDC session may only unlock a guest of its own pools.
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    // Check if the VM is locked
+    const configEndpoint = `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/config`
+    const config = await pveFetch<any>(conn, configEndpoint)
+
+    if (!config?.lock) {
+      return NextResponse.json({
+        data: { unlocked: false, reason: 'not_locked' },
+        message: 'VM is not locked'
+      })
+    }
+
+    const lockType = config.lock
+
+    // Get node IP and execute unlock via SSH
+    const nodeIp = await resolveNodeSshEndpoint(conn, node)
+    const unlockCmd = type === 'qemu' ? `qm unlock ${safeVmid}` : `pct unlock ${safeVmid}`
+    const sshResult = await executeSSH(id, nodeIp, unlockCmd)
+
+    if (sshResult.success) {
+      return NextResponse.json({
+        data: {
+          unlocked: true,
+          previousLock: lockType,
+          method: 'ssh',
+          output: sshResult.output
+        },
+        message: `VM ${vmid} unlocked successfully (was locked: ${lockType})`
+      })
+    } else {
+      // The SSH error names the host and port the connection reaches: it
+      // stays in the server log (roadmap#99).
+      console.error(`[unlock] SSH failed:`, safeLog(sshResult.error ?? ''))
+      return NextResponse.json({
+        error: 'The unlock command could not be run on the node',
+        lockType,
+        hint: `Run manually on PVE node: ${unlockCmd}`
+      }, { status: 500 })
+    }
+
+  } catch (e: any) {
+    // The cluster is outside the license: executeSSH refused the unlock
+    // itself (roadmap#58), with the code the UI recognises.
+    const excluded = licenseExcludedResponse(e)
+    if (excluded) return excluded
+    console.error(`[unlock] Error:`, e)
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+/**
+ * GET /api/v1/connections/{id}/guests/{type}/{node}/{vmid}/unlock
+ *
+ * Check if a VM is locked
+ */
+async function getHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    if (!id || !type || !node || !vmid) {
+      return NextResponse.json({ error: "Missing parameters" }, { status: 400 })
+    }
+
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_VIEW, "vm", resourceId)
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+    if (!conn) {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const configEndpoint = `/nodes/${encodeURIComponent(node)}/${encodeURIComponent(type)}/${encodeURIComponent(vmid)}/config`
+    const config = await pveFetch<any>(conn, configEndpoint)
+
+    return NextResponse.json({
+      data: {
+        locked: !!config?.lock,
+        lockType: config?.lock || null
+      }
+    })
+
+  } catch (e: any) {
+    console.error(`[unlock/check] Error:`, e)
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const POST = withAudit({ category: "vms", resourceType: "guest", resourceTypeParam: "type", resourceParam: "vmid", action: "update" }, withPublicApiGuard("vm-unlock", postHandler))
+export const GET = withPublicApiGuard("vm-unlock-get", getHandler)

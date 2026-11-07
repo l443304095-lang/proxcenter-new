@@ -1,0 +1,197 @@
+import { NextResponse } from "next/server"
+
+import { getCurrentTenantId } from "@/lib/tenant"
+import { checkPermission, guestPerimeterAllows, PERMISSIONS, buildNodeResourceId } from "@/lib/rbac"
+import { maskingScope } from "@/lib/tenant/infraScope"
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { prisma } from "@/lib/db/prisma"
+import { resolveScopeTenant, scopeTenantInfrastructure } from "@/lib/vdc/providerTarget"
+
+export const runtime = "nodejs"
+
+type RouteContext = { params: Promise<{ id: string }> | { id: string } }
+
+// GET /api/v1/connections/{id}/network-choices?node=X
+export async function GET(req: Request, ctx: RouteContext) {
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const connId = (params as any)?.id
+    if (!connId) return NextResponse.json({ error: "Missing connection ID" }, { status: 400 })
+
+    const url = new URL(req.url)
+    const node = url.searchParams.get("node")
+    if (!node) return NextResponse.json({ error: "Missing node query param" }, { status: 400 })
+
+    // connection.view is enough to populate the VM-create network picker:
+    // the endpoint only returns names a tenant is already authorised to
+    // attach to (their vDC VNets + shared bridges). node.network would gate
+    // real network-management operations, not this read-only helper.
+    // A flat-scoped caller (vm/tag/pool) matches no node resource either, so
+    // the Network tab of the creation wizard used to 403 (issue #262). Their
+    // guests on this cluster are what opens it.
+    const resourceId = buildNodeResourceId(connId, node)
+    const denied = await checkPermission(PERMISSIONS.CONNECTION_VIEW, "node", resourceId)
+
+    if (denied && !(await guestPerimeterAllows(connId, PERMISSIONS.CONNECTION_VIEW))) return denied
+
+    // `?targetVdcId=` (provider only): the choices that vDC's tenant gets,
+    // for a provider deploying into it (roadmap#65).
+    const scopeTenant = await resolveScopeTenant(req, connId, getCurrentTenantId)
+    if (!scopeTenant.ok) return scopeTenant.response
+    const tenantId = scopeTenant.tenantId
+    const infra = await scopeTenantInfrastructure(scopeTenant)
+    // MSP tenants own whole clusters and may only query connections they own.
+    // The shared getConnectionById below authorizes via the connection's OWN
+    // tenantId, so without this gate an MSP user could pass a non-owned connId
+    // and leak that cluster's bridge/VNet choices.
+    if (infra.kind === 'msp' && !infra.connectionIds.has(connId)) {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+    // provider + msp (maskingScope null) take the full-cluster branch below
+    // (all physical bridges + all SDN VNets); iaas tenants get their vDC slice.
+    const scope = maskingScope(infra)
+
+    const connMeta = await prisma.connection.findUnique({ where: { id: connId }, select: { tenantId: true } })
+    if (!connMeta) return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    const pveConn = await getConnectionById(connId, connMeta.tenantId)
+
+    // Subnet info per VNet pve_name. The DeployWizard's CloudInit step
+    // uses this to pre-fill IP/gateway/DNS fields for the selected VNet
+    // (so the user gets an "Auto-allocated from <CIDR>" hint and a fixed
+    // gateway, both driven by IPAM rather than typed by hand).
+    type SubnetInfo = { cidr: string; gateway: string; dnsServers: string[]; subnetId: string }
+    const subnetByPveName = new Map<string, SubnetInfo>()
+    {
+      const subnetRows = await prisma.vdcVnet.findMany({
+        where: {
+          vdc: { connectionId: connId, enabled: true },
+          subnet: { ipamEnabled: true },
+        },
+        select: {
+          pveName: true,
+          subnet: { select: { id: true, cidr: true, gateway: true, dnsServers: true } },
+          tenantNetworkMember: { select: { tenantNetwork: { select: { subnet: { select: { id: true } } } } } },
+        },
+      })
+      for (const r of subnetRows) {
+        if (!r.subnet) continue
+        subnetByPveName.set(r.pveName, {
+          // Shared pool of a stretched tenant network for its members (#901).
+          subnetId: r.tenantNetworkMember?.tenantNetwork.subnet?.id ?? r.subnet.id,
+          cidr: r.subnet.cidr,
+          gateway: r.subnet.gateway,
+          dnsServers: r.subnet.dnsServers
+            ? r.subnet.dnsServers.split(',').map(s => s.trim()).filter(Boolean)
+            : [],
+        })
+      }
+    }
+
+    type Choice =
+      | { kind: "vnet"; name: string; displayName: string; vdc: string; vdcId: string | null; zone: string; subnet: SubnetInfo | null }
+      | { kind: "shared"; name: string; label: string | null; vlanRanges: [number, number][] }
+      | { kind: "bridge"; name: string; type: string; mtu?: number }
+
+    const choices: Choice[] = []
+
+    if (scope === null) {
+      // Super admin or tenant without vDC - return all physical bridges + all VNets
+      const ifaces = await pveFetch<any[]>(pveConn, `/nodes/${encodeURIComponent(node)}/network`)
+      for (const ifc of ifaces || []) {
+        if (ifc.type !== "bridge" && ifc.type !== "OVSBridge") continue
+        // PVE only reports an MTU declared in /etc/network/interfaces (#1194).
+        const mtu = Number(ifc.mtu)
+        choices.push({ kind: "bridge", name: ifc.iface, type: ifc.type, ...(mtu > 0 ? { mtu } : {}) })
+      }
+      try {
+        const vnets = await pveFetch<any[]>(pveConn, "/cluster/sdn/vnets")
+        for (const v of vnets || []) {
+          // PVE returns alias when set (we set it to display_name on create);
+          // fall back to the bare ID for legacy/externally-managed VNets.
+          choices.push({
+            kind: "vnet",
+            name: v.vnet,
+            displayName: v.alias ?? v.vnet,
+            vdc: "*",
+            // Super-admin (no scope filter) sees PVE VNets directly —
+            // the matching ProxCenter vDC isn't always 1-to-1, so we
+            // leave vdcId null. Endpoints that need a specific vDC
+            // shouldn't be reachable via this path anyway.
+            vdcId: null,
+            zone: v.zone,
+            subnet: subnetByPveName.get(v.vnet) ?? null,
+          })
+        }
+      } catch {}
+    } else {
+      // Tenant with vDC(s) on this connection
+      const allowedVnets = scope.vnetsByConnection.get(connId) ?? new Set<string>()
+      const allowedShared = scope.sharedBridgesByConnection.get(connId) ?? new Set<string>()
+
+      // VNets with vdc slug + zone. `name` stays the pve_name (= what PVE
+      // expects in the NIC bridge field) but we expose displayName separately
+      // so the picker can render the user-friendly label.
+      const vnetRows = await prisma.vdcVnet.findMany({
+        where: { vdc: { tenantId, connectionId: connId } },
+        select: {
+          pveName: true,
+          displayName: true,
+          zoneName: true,
+          type: true,
+          vdc: { select: { id: true, slug: true, sdnZoneName: true } },
+        },
+      })
+      for (const v of vnetRows) {
+        if (allowedVnets.has(v.pveName)) {
+          choices.push({
+            kind: "vnet",
+            name: v.pveName,
+            displayName: v.displayName ?? v.pveName,
+            vdc: v.vdc.slug,
+            // Routes that hit /api/v1/vdcs/{id}/... need the UUID, not
+            // the slug. Surface it explicitly so the deploy wizard
+            // (and any future caller) doesn't have to do a second
+            // lookup to translate slug → id.
+            vdcId: v.vdc.id,
+            // A VLAN VNet lives in the shared per-(connection, bridge) zone,
+            // not the vDC's own VXLAN zone: read the VNet's zone first.
+            zone: v.zoneName ?? v.vdc.sdnZoneName ?? '',
+            subnet: subnetByPveName.get(v.pveName) ?? null,
+          })
+        }
+      }
+
+      // Shared bridges with labels and VLAN pools
+      if (allowedShared.size > 0) {
+        const sharedRows = await prisma.vdcSharedBridge.findMany({
+          where: { vdc: { tenantId, connectionId: connId } },
+          select: { bridge: true, label: true, vdcId: true },
+        })
+        const labelMap = new Map<string, string | null>()
+        const vdcIds = new Set<string>()
+        for (const r of sharedRows) { labelMap.set(r.bridge, r.label ?? null); vdcIds.add(r.vdcId) }
+        const vlanPools = vdcIds.size > 0
+          ? await prisma.vdcVlanPool.findMany({
+              where: { vdcId: { in: [...vdcIds] }, bridge: { in: [...allowedShared] } },
+              select: { bridge: true, rangeStart: true, rangeEnd: true },
+              orderBy: { rangeStart: 'asc' },
+            })
+          : []
+        const rangesByBridge = new Map<string, [number, number][]>()
+        for (const p of vlanPools) {
+          let arr = rangesByBridge.get(p.bridge)
+          if (!arr) { arr = []; rangesByBridge.set(p.bridge, arr) }
+          arr.push([p.rangeStart, p.rangeEnd])
+        }
+        for (const bridge of allowedShared) {
+          choices.push({ kind: "shared", name: bridge, label: labelMap.get(bridge) ?? null, vlanRanges: rangesByBridge.get(bridge) ?? [] })
+        }
+      }
+    }
+
+    return NextResponse.json({ data: choices })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

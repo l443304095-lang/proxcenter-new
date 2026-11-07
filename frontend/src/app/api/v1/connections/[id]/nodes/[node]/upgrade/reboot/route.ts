@@ -1,0 +1,65 @@
+import { NextResponse } from "next/server"
+import { licenseExcludedResponse } from "@/lib/api/response"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { resolveNodeSshEndpoint } from "@/lib/ssh/node-endpoint"
+import { executeSSH, type SSHResult } from "@/lib/ssh/exec"
+import { checkPermission, PERMISSIONS, buildNodeResourceId } from "@/lib/rbac"
+import { verifyNodeTarget, sshTargetError } from "@/lib/ssh/verify-node-target"
+import { withAudit } from "@/lib/audit/withAudit"
+import { denyIaasTenant } from "@/lib/tenant/iaasGuard"
+
+export const runtime = "nodejs"
+
+type Ctx = { params: Promise<{ id: string; node: string }> }
+
+/**
+ * POST — Reboot a node after upgrade.
+ */
+async function handlePost(_req: Request, ctx: Ctx) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  const { id, node } = await ctx.params
+
+  const denied = await checkPermission(
+    PERMISSIONS.NODE_MANAGE,
+    "node",
+    buildNodeResourceId(id, node)
+  )
+  if (denied) return denied
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  const nodeIp = await resolveNodeSshEndpoint(conn, node)
+
+  const check = await verifyNodeTarget(id, conn, node, nodeIp)
+  if (!check.ok) {
+    return NextResponse.json({ error: check.error }, { status: check.status })
+  }
+
+  // Use nohup so the SSH session returns before the reboot kills it
+  let result: SSHResult
+  try {
+    result = await executeSSH(id, nodeIp, "nohup bash -c 'sleep 1 && reboot' > /dev/null 2>&1 &")
+  } catch (e) {
+    // The cluster is outside the license: executeSSH refused the reboot
+    // itself (roadmap#58), with the code the UI recognises.
+    const excluded = licenseExcludedResponse(e)
+    if (excluded) return excluded
+    throw e
+  }
+
+  if (!result.success) {
+    return NextResponse.json(
+      { error: sshTargetError(node, nodeIp, result.error || "Failed to reboot node") },
+      { status: 500 }
+    )
+  }
+
+  return NextResponse.json({ rebooting: true })
+}
+
+export const POST = withAudit({ category: "nodes", resourceType: "node", resourceParam: "node", action: "reboot" }, handlePost)

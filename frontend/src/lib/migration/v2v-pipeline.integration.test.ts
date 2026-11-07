@@ -1,0 +1,822 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+
+/**
+ * Integration test for runV2vMigrationPipeline (#738).
+ *
+ * Drives the real pipeline end to end with every external dependency mocked:
+ * SSH commands are answered by a router keyed on the command shape, virt-v2v
+ * runs are scripted through queueV2vRuns(), the PVE API and the DB are fakes.
+ * The hyperv + diskPaths source is used on purpose: it needs no credentials,
+ * no SMB mount and no SOAP, so the run lands on the conversion phase (where
+ * the multi-boot behaviour lives) with a minimal harness.
+ *
+ * Everything runs under fake timers: the pipeline sleeps 5s per poll and the
+ * operator gate polls every 3s, so real timers would cost minutes.
+ */
+
+// The root-choice gate timeout is read from the env at module load, so it must
+// be set before ./v2v-pipeline is imported. 9s = three 3s gate polls.
+vi.hoisted(() => {
+  process.env.V2V_ROOT_CHOICE_TIMEOUT_MS = "9000"
+})
+
+vi.mock("@/lib/ssh/exec", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/ssh/exec")>()
+  return { ...actual, executeSSH: vi.fn() } // keep the real shellEscape
+})
+vi.mock("@/lib/proxmox/client", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/proxmox/client")>()
+  return { ...actual, pveFetch: vi.fn() }
+})
+vi.mock("@/lib/connections/getConnection", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/connections/getConnection")>()
+  return { ...actual, getConnectionById: vi.fn() }
+})
+vi.mock("@/lib/tenant", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/tenant")>()
+  return { ...actual, getTenantPrisma: vi.fn() }
+})
+vi.mock("@/lib/ssh/node-endpoint", async () => ({
+  ...(await import("@/lib/ssh/node-endpoint-core")),
+  resolveNodeSshEndpoint: vi.fn(),
+}))
+vi.mock("./job-heartbeat", () => ({ startJobHeartbeat: vi.fn() }))
+vi.mock("./pve-vm-config", () => ({ pveSetVmConfig: vi.fn(), destroyPveVm: vi.fn() }))
+vi.mock("@/lib/audit", () => ({ audit: vi.fn() }))
+// Per-disk target storage (#317, lot 2): the vCenter and esxi-direct paths read
+// the source disk list over SOAP, and the vCenter path downloads the disks over
+// NFC before virt-v2v runs; both are stubbed so a run reaches the import loop.
+vi.mock("@/lib/vmware/soap", async importOriginal => {
+  const actual = await importOriginal<typeof import("@/lib/vmware/soap")>()
+  return { ...actual, soapLogin: vi.fn(), soapLogout: vi.fn(), soapGetVmConfig: vi.fn(), parseVmConfig: vi.fn() }
+})
+vi.mock("@/lib/crypto/secret", () => ({ decryptSecret: vi.fn(() => "root:pw") }))
+vi.mock("./nfc-export", () => ({ runVcenterNfcExport: vi.fn() }))
+// Hyper-V source with credentials (#1255): the WinRM client answers from these fakes.
+const hypervFake = vi.hoisted(() => ({
+  getVmReadiness: async () => ({ state: "Off", checkpointCount: 0 }),
+  getVM: async (..._args: any[]): Promise<any> => ({}),
+}))
+vi.mock("@/lib/hyperv/client", () => ({
+  HyperVClient: class {
+    getVmReadiness(...args: any[]) { return (hypervFake.getVmReadiness as any)(...args) }
+    getVM(...args: any[]) { return hypervFake.getVM(...args) }
+  },
+}))
+
+import { executeSSH } from "@/lib/ssh/exec"
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { getTenantPrisma } from "@/lib/tenant"
+import { resolveNodeSshEndpoint } from "@/lib/ssh/node-endpoint"
+import { startJobHeartbeat } from "./job-heartbeat"
+import { pveSetVmConfig, destroyPveVm } from "./pve-vm-config"
+import { audit } from "@/lib/audit"
+import { soapLogin, soapLogout, soapGetVmConfig, parseVmConfig } from "@/lib/vmware/soap"
+import { runVcenterNfcExport } from "./nfc-export"
+import {
+  runV2vMigrationPipeline,
+  requestV2vRootChoice,
+  V2V_AWAITING_ROOT_CHOICE_STEP,
+  type V2vMigrationConfig,
+} from "./v2v-pipeline"
+
+// ── virt-v2v output fixtures ──
+// Real capture from discussion #738 (typographic quotes included): one real
+// root plus snapper snapshot subvolumes of the same system.
+const MULTIBOOT_PROMPT_SNAPPER = `[   3.8] Inspecting the source
+
+***
+Dual- or multi-boot operating system detected.  Choose the root filesystem
+that contains the main operating system from the list below:
+
+ [1] /dev/sda (13.3)
+ [2] btrfsvol:/dev/sda/.snapshots/1/snapshot (13.3)
+ [3] btrfsvol:/dev/sda/.snapshots/2/snapshot (13.3)
+
+Enter a number between 1 and 3, or ‘exit’: { "message": "exception: End_of_file", "type": "error" }
+virt-v2v: error: exception: End_of_file
+`
+
+// Same prompt with a second real root: a genuine dual boot, nothing to pick
+// automatically.
+const MULTIBOOT_PROMPT_DUAL = `[   3.8] Inspecting the source
+
+***
+Dual- or multi-boot operating system detected.  Choose the root filesystem
+that contains the main operating system from the list below:
+
+ [1] /dev/sda (13.3)
+ [2] btrfsvol:/dev/sda/.snapshots/1/snapshot (13.3)
+ [3] btrfsvol:/dev/sda/.snapshots/2/snapshot (13.3)
+ [4] /dev/sdb1 (Debian GNU/Linux 12)
+
+Enter a number between 1 and 4, or ‘exit’: { "message": "exception: End_of_file", "type": "error" }
+virt-v2v: error: exception: End_of_file
+`
+
+const SUCCESS_LOG = `[   0.0] Setting up the source: -i disk /mnt/hyperv/vm.vhdx
+[   1.5] Opening the source
+[   3.8] Inspecting the source
+[  12.9] Converting Ubuntu 22.04 to run on KVM
+[ 136.0] Copying disk 1/1
+[ 400.9] Creating output metadata
+[ 401.0] Finishing off
+`
+
+// A failure that has nothing to do with root selection.
+const PLAIN_FAILURE_LOG = `[   3.8] Inspecting the source
+virt-v2v: error: inspection could not detect the source guest (or physical machine).
+`
+
+// ── SSH command router ──
+
+interface ScriptedRun {
+  exit: number
+  log: string
+}
+
+const PVE_CONN = { id: "conn-target", baseUrl: "https://pve.example:8006", apiToken: "root@pam!t=x", insecureDev: true }
+
+let scriptedRuns: ScriptedRun[]
+let currentRun: ScriptedRun | null
+/** Inner virt-v2v commands, un-escaped, in launch order. */
+let v2vLaunches: string[]
+/** What Phase 6 "ls -1 <outputDir>" reports as converted disk files. */
+let diskListing: string
+/** Answer of the online-disks virt-customize run (Phase 4.5), null = the run fails. */
+let onlineDisksAnswer: string | null
+/**
+ * Output of the adoption attempt (#292: `mkdir -p images/<vmid> && stat && mv -n
+ * && echo ADOPT_OK`). Empty = rename refused, so the pipeline falls back to
+ * `qm disk import`, which is what every pre-#292 test exercised.
+ */
+let adoptAnswer: string
+
+function queueV2vRuns(runs: ScriptedRun[]) {
+  scriptedRuns.push(...runs)
+}
+
+function ok(output = "") {
+  return { success: true as const, output }
+}
+
+/** Reverse shellEscape's single-quote wrapping (one level). */
+function unescapeSingleQuoted(s: string): string {
+  const t = s.trim()
+  if (!t.startsWith("'") || !t.endsWith("'")) return t
+  return t.slice(1, -1).replaceAll("'\\''", "'")
+}
+
+// Target node reached through a shared public address with its own port, the
+// layout where only the per-node port tells the nodes apart.
+const NODE_SSH = { host: "203.0.113.10", port: 2202, source: "override" as const }
+
+async function sshRouter(_connId: string, _host: string, command: string) {
+  if (command.startsWith("nohup bash -c ")) {
+    const tail = " > /dev/null 2>&1 & echo $!"
+    const inner = unescapeSingleQuoted(command.slice("nohup bash -c ".length, command.lastIndexOf(tail)))
+    v2vLaunches.push(inner)
+    currentRun = scriptedRuns.shift() ?? { exit: 0, log: "" }
+    return ok("4242") // fake pid
+  }
+  if (command.startsWith("which ")) return ok("/usr/bin/virt-v2v")
+  if (command.startsWith("virt-v2v --help")) return ok("yes") // --block-driver probe
+  if (command.startsWith("cat ") && command.includes("/v2v.exit")) return ok(String(currentRun?.exit ?? 0))
+  if ((command.startsWith("tail -c 4000 ") || command.startsWith("cat ")) && command.includes("/v2v.log")) {
+    return ok(currentRun?.log ?? "")
+  }
+  if (command.startsWith("cat ") && command.includes("*.xml")) return ok("") // no domain XML: fallback VM config
+  if (command.startsWith("ls -1 ")) return ok(diskListing)
+  // Phase 4.5: the converted disks, then the online-disks script for a Windows with data disks.
+  if (command.startsWith("find ") && command.includes('-name "*-sd*"')) {
+    const dir = /^find '([^']+)'/.exec(command)?.[1]
+    return ok(diskListing.split("\n").filter(Boolean).map(f => `${dir}/${f}`).join("\n"))
+  }
+  if (command.includes("virt-customize --no-network")) {
+    return onlineDisksAnswer === null ? { success: false as const, output: "virt-customize: error: no operating systems were found" } : ok(onlineDisksAnswer)
+  }
+  if (command.startsWith("mkdir -p ") && command.includes("echo ADOPT_OK")) {
+    return ok(adoptAnswer)
+  }
+  if (command.startsWith("qm disk import ")) {
+    return ok("Successfully imported disk as 'unused0:local:120/vm-120-disk-0.qcow2'")
+  }
+  if (command.startsWith("du -sb ")) return ok("1073741824")
+  // Post-copy integrity check (roadmap#1): a clean qcow2 of the expected size.
+  if (command.startsWith("qemu-img check ")) return ok('{"corruptions": 0, "leaks": 0, "check-errors": 0}\nQEMU_IMG_CHECK_RC=0')
+  if (command.startsWith("qemu-img info ")) return ok('{"virtual-size": 1073741824, "format": "qcow2"}')
+  // Block target: the region hash script runs once per side and prints one
+  // `R<index> <sha256>` line per sampled region; identical hashes = clean copy.
+  if (command.includes("proxcenter-integrity.")) {
+    const tags = [...command.matchAll(/echo "R(\d+) \$\(sha256sum/g)].map(m => m[1])
+    return ok(tags.map(t => `R${t} ${"ab".repeat(32)}`).join("\n"))
+  }
+  // Per-disk target storage (#317, lot 2): a block storage named "thin" answers
+  // like LVM-thin, and the vCenter / esxi-direct paths find their tools in place.
+  if (command.startsWith("which nbdkit")) return ok("ok")
+  if (command.startsWith("stat -c %s ")) return ok("1073741824") // size of a converted image
+  if (command.startsWith("pvesm alloc ")) {
+    const m = /pvesm alloc '([^']+)' \d+ '([^']+)'/.exec(command)
+    return ok(`successfully created '${m?.[1]}:${m?.[2]}'`)
+  }
+  if (command.startsWith("pvesm path ")) {
+    const m = /pvesm path '[^:]+:([^']+)'/.exec(command)
+    return ok(`/dev/thin/${m?.[1]}`)
+  }
+  if (command.startsWith("ssh-agent -a ")) return ok("SSH_AGENT_PID=4343; export SSH_AGENT_PID;") // esxi-direct per-job agent
+  // mkdir -p, rm -f, rm -rf, find ... -delete, kill, umount: plain success
+  return ok("")
+}
+
+async function pveRouter(_conn: unknown, path: string, init?: { method?: string }) {
+  if (path === "/cluster/nextid") return "120"
+  // VM create accepted; falsy return skips the task-status polling
+  if (path.endsWith("/qemu") && init?.method === "POST") return ""
+  if (path.startsWith("/storage/")) return { type: "dir" }
+  // Node-level storage status: the direct-write gate (#292) requires the
+  // storage to be positively active before staging the conversion on it.
+  if (/^\/nodes\/[^/]+\/storage\/[^/]+\/status$/.test(path)) return { active: 1 }
+  return {}
+}
+
+// ── Job row fake ──
+
+function makeFakePrisma() {
+  const row: Record<string, any> = { config: {}, logs: [] as any[], progress: 0 }
+  const stepHistory: string[] = []
+  const update = vi.fn(async ({ data }: any) => {
+    if (data.currentStep !== undefined) stepHistory.push(data.currentStep)
+    Object.assign(row, data)
+    return row
+  })
+  return {
+    row,
+    stepHistory,
+    migrationJob: {
+      findUnique: vi.fn(async () => ({ ...row })),
+      update,
+    },
+    connection: {
+      // No apiTokenEnc: the hyperv SMB auto-mount phase is skipped entirely.
+      findUnique: vi.fn(async () => ({ baseUrl: "https://hyperv.local", apiTokenEnc: null, hypervShareName: null })),
+    },
+  }
+}
+
+let prisma: ReturnType<typeof makeFakePrisma>
+
+const messages = () => (prisma.row.logs as Array<{ msg: string }>).map(l => l.msg)
+
+function makeConfig(overrides: Partial<V2vMigrationConfig> = {}): V2vMigrationConfig {
+  return {
+    sourceConnectionId: "conn-src",
+    sourceVmId: "vm-1",
+    sourceVmName: "testvm",
+    sourceType: "hyperv",
+    targetConnectionId: "conn-target",
+    targetNode: "pve1",
+    targetStorage: "local",
+    networkBridge: "vmbr0",
+    startAfterMigration: false,
+    diskPaths: ["/mnt/hyperv/vm.vhdx"],
+    ...overrides,
+  }
+}
+
+/** Run the pipeline to completion under fake timers (the poll loops sleep 3-5s). */
+async function runPipelineToEnd(jobId: string, config: V2vMigrationConfig): Promise<void> {
+  let settled = false
+  const run = runV2vMigrationPipeline(jobId, config, "tenant-test").finally(() => {
+    settled = true
+  })
+  for (let i = 0; i < 600 && !settled; i++) {
+    await vi.advanceTimersByTimeAsync(1000)
+  }
+  if (!settled) throw new Error("pipeline did not settle within the fake-time budget")
+  await run
+}
+
+beforeEach(() => {
+  vi.useFakeTimers()
+  vi.clearAllMocks()
+  scriptedRuns = []
+  currentRun = null
+  v2vLaunches = []
+  diskListing = "testvm-sda\n"
+  onlineDisksAnswer = ""
+  adoptAnswer = ""
+  prisma = makeFakePrisma()
+  vi.mocked(getTenantPrisma).mockImplementation(() => prisma as any)
+  vi.mocked(getConnectionById).mockResolvedValue(PVE_CONN as any)
+  vi.mocked(resolveNodeSshEndpoint).mockResolvedValue(NODE_SSH)
+  vi.mocked(startJobHeartbeat).mockReturnValue(() => {})
+  vi.mocked(pveSetVmConfig).mockResolvedValue(undefined as any)
+  vi.mocked(destroyPveVm).mockResolvedValue(undefined as any)
+  vi.mocked(audit).mockResolvedValue("audit-1" as any)
+  vi.mocked(executeSSH).mockImplementation(sshRouter as any)
+  vi.mocked(pveFetch).mockImplementation(pveRouter as any)
+  vi.mocked(soapLogin).mockResolvedValue({} as any)
+  vi.mocked(soapLogout).mockResolvedValue(undefined)
+  vi.mocked(soapGetVmConfig).mockResolvedValue("<xml/>")
+  // One downloaded VMDK per source disk, in disk order, like the real export.
+  vi.mocked(runVcenterNfcExport).mockImplementation(async p =>
+    Array.from({ length: p.sourceVmwareConfig?.disks.length ?? 1 }, (_, i) => `${p.outputDir}/disk-${i}.vmdk`),
+  )
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe("runV2vMigrationPipeline multi-boot recovery (#738)", () => {
+  it("retries once with the only real root when the others are snapper snapshots", { timeout: 15000 }, async () => {
+    queueV2vRuns([
+      { exit: 1, log: MULTIBOOT_PROMPT_SNAPPER },
+      { exit: 0, log: SUCCESS_LOG },
+    ])
+
+    await runPipelineToEnd("v2v-it-auto", makeConfig())
+
+    expect(v2vLaunches).toHaveLength(2)
+    expect(v2vLaunches[0]).not.toContain("--root")
+    expect(v2vLaunches[1]).toContain("--root '/dev/sda'")
+    const logs = messages()
+    expect(logs.some(m => m.includes("Guest inspection found 3 candidate(s)"))).toBe(true)
+    expect(logs.some(m => m.includes("[1] /dev/sda (13.3)"))).toBe(true)
+    expect(logs.some(m => m.includes("Selecting /dev/sda"))).toBe(true)
+    // and the pipeline went on past the conversion, all the way to the end
+    expect(logs.some(m => m.includes("virt-v2v conversion completed"))).toBe(true)
+    expect(prisma.row.status).toBe("completed")
+    expect(destroyPveVm).not.toHaveBeenCalled()
+  })
+
+  it("parks the job for the operator when two real roots remain, then resumes with the pick", { timeout: 15000 }, async () => {
+    const jobId = "v2v-it-gate"
+    queueV2vRuns([
+      { exit: 1, log: MULTIBOOT_PROMPT_DUAL },
+      { exit: 0, log: SUCCESS_LOG },
+    ])
+    // Operator double: watches the row from a (fake) timer and answers as soon
+    // as the job parks. Answering earlier would be wiped by the gate's entry
+    // purge, exactly like a stale pick from a previous gate.
+    const answer = setInterval(() => {
+      if (prisma.row.currentStep === V2V_AWAITING_ROOT_CHOICE_STEP) {
+        clearInterval(answer)
+        requestV2vRootChoice(jobId, "/dev/sdb1")
+      }
+    }, 200)
+
+    try {
+      await runPipelineToEnd(jobId, makeConfig())
+    } finally {
+      clearInterval(answer)
+    }
+
+    expect(prisma.stepHistory).toContain(V2V_AWAITING_ROOT_CHOICE_STEP)
+    // Only the two real roots are offered, the snapshot subvolumes are not.
+    expect(prisma.row.config.v2vRootCandidates).toEqual([
+      { device: "/dev/sda", description: "13.3" },
+      { device: "/dev/sdb1", description: "Debian GNU/Linux 12" },
+    ])
+    expect(v2vLaunches).toHaveLength(2)
+    expect(v2vLaunches[1]).toContain("--root '/dev/sdb1'")
+    expect(messages().some(m => m.includes("Operator chose /dev/sdb1"))).toBe(true)
+    expect(prisma.row.status).toBe("completed")
+  })
+
+  it("fails with the candidate hint when nobody picks before the gate expires", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 1, log: MULTIBOOT_PROMPT_DUAL }])
+
+    await runPipelineToEnd("v2v-it-expiry", makeConfig())
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain("Root filesystem (advanced)")
+    expect(String(prisma.row.error)).toContain("/dev/sda")
+    expect(String(prisma.row.error)).toContain("/dev/sdb1")
+    expect(v2vLaunches).toHaveLength(1) // no pick, no retry
+    expect(destroyPveVm).not.toHaveBeenCalled()
+  })
+
+  it("puts a pinned config.v2vRoot on the first command and never enters the gate", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+
+    await runPipelineToEnd("v2v-it-pinned", makeConfig({ v2vRoot: "/dev/sda1" }))
+
+    expect(v2vLaunches).toHaveLength(1)
+    expect(v2vLaunches[0]).toContain("--root '/dev/sda1'")
+    expect(prisma.stepHistory).not.toContain(V2V_AWAITING_ROOT_CHOICE_STEP)
+    expect(prisma.row.status).toBe("completed")
+  })
+
+  it("rejects an unsafe config.v2vRoot before any virt-v2v launch", { timeout: 15000 }, async () => {
+    await runPipelineToEnd("v2v-it-badroot", makeConfig({ v2vRoot: "/dev/sda1; reboot" }))
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain('Invalid root filesystem "/dev/sda1; reboot"')
+    expect(v2vLaunches).toHaveLength(0)
+    expect(destroyPveVm).not.toHaveBeenCalled()
+  })
+})
+
+describe("runV2vMigrationPipeline target node SSH endpoint", () => {
+  it("runs every command on the target node's own address and port", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+
+    await runPipelineToEnd("v2v-it-endpoint", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    expect(resolveNodeSshEndpoint).toHaveBeenCalledWith(PVE_CONN, expect.any(String))
+    const targets = vi.mocked(executeSSH).mock.calls.map(c => c[1])
+    expect(targets.length).toBeGreaterThan(0)
+    expect(targets.every(t => t === NODE_SSH)).toBe(true)
+    expect(messages().some(m => m.includes("(203.0.113.10:2202)"))).toBe(true)
+  })
+})
+
+describe("runV2vMigrationPipeline cleanup guard (#738)", () => {
+  it("does not destroy anything when the conversion fails before the VM exists", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 1, log: PLAIN_FAILURE_LOG }])
+
+    await runPipelineToEnd("v2v-it-novm", makeConfig())
+
+    expect(prisma.row.status).toBe("failed")
+    // The VMID was only a reservation: nothing to destroy, nothing to advise.
+    expect(destroyPveVm).not.toHaveBeenCalled()
+    expect(messages().some(m => m.includes("qm destroy"))).toBe(false)
+  })
+
+  it("destroys the created VM when a step after the create fails", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "" // Phase 6 finds no converted disks and throws, after the create
+
+    await runPipelineToEnd("v2v-it-partial", makeConfig())
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain("produced no disk files")
+    expect(destroyPveVm).toHaveBeenCalledTimes(1)
+    expect(destroyPveVm).toHaveBeenCalledWith(expect.objectContaining({ id: "conn-target" }), "pve1", 120)
+    expect(messages().some(m => m.includes("Cleaned up partial VM 120"))).toBe(true)
+  })
+})
+
+describe("runV2vMigrationPipeline direct storage write (#292)", () => {
+  const sshCommands = () => vi.mocked(executeSSH).mock.calls.map(c => String(c[2]))
+
+  it("converts onto the storage and adopts the disk by rename, no qm disk import", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    adoptAnswer = "ADOPT_OK"
+    // A dir/NFS storage's path is arbitrary and comes from the storage config.
+    vi.mocked(pveFetch).mockImplementation((async (conn: unknown, path: string, init?: { method?: string }) => {
+      if (path.startsWith("/storage/")) return { type: "nfs", path: "/mnt/pve/nfs-vmstore" }
+      return pveRouter(conn, path, init)
+    }) as any)
+
+    await runPipelineToEnd("v2v-it-adopt", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    // virt-v2v was pointed at the staging dir ON the storage and asked for qcow2
+    expect(v2vLaunches).toHaveLength(1)
+    expect(v2vLaunches[0]).toContain("-of qcow2")
+    expect(v2vLaunches[0]).toContain("-os '/mnt/pve/nfs-vmstore/proxcenter-v2v/v2v-it-adopt'")
+    // the whole point: the disk is never copied a second time
+    const commands = sshCommands()
+    expect(commands.some(c => c.startsWith("qm disk import "))).toBe(false)
+    // the rename targeted the storage's own images/<vmid> directory
+    const adoptCmd = commands.find(c => c.includes("echo ADOPT_OK")) || ""
+    expect(adoptCmd).toContain("mkdir -p '/mnt/pve/nfs-vmstore/images/120'")
+    expect(adoptCmd).toContain(
+      "mv -n '/mnt/pve/nfs-vmstore/proxcenter-v2v/v2v-it-adopt/testvm-sda' '/mnt/pve/nfs-vmstore/images/120/vm-120-disk-0.qcow2'",
+    )
+    // the adopted volume is what got attached
+    const attach = vi.mocked(pveSetVmConfig).mock.calls.find(c => c[3].has("scsi0"))
+    expect(attach?.[3].get("scsi0")).toBe("local:120/vm-120-disk-0.qcow2,discard=on")
+    // both the staging dir on the storage AND the temp dir are cleaned up
+    expect(commands).toContain("rm -rf '/mnt/pve/nfs-vmstore/proxcenter-v2v/v2v-it-adopt'")
+    expect(commands).toContain("rm -rf '/tmp/v2v-v2v-it-adopt'")
+  })
+
+  it("falls back to qm disk import when the rename is refused, and still completes", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    // adoptAnswer stays "": the rename is refused, as on a cross-filesystem move
+
+    await runPipelineToEnd("v2v-it-fallback", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    // direct-write mode was still on (dir storage, path fallback /var/lib/vz)
+    expect(v2vLaunches[0]).toContain("-of qcow2")
+    expect(v2vLaunches[0]).toContain("-os '/var/lib/vz/proxcenter-v2v/v2v-it-fallback'")
+    // the fallback is the converting import, fed with the staged qcow2
+    const importCmd = sshCommands().find(c => c.startsWith("qm disk import ")) || ""
+    expect(importCmd).toContain(
+      "qm disk import 120 '/var/lib/vz/proxcenter-v2v/v2v-it-fallback/testvm-sda' 'local' --format qcow2",
+    )
+    expect(messages().some(m => m.includes("falling back to qm disk import"))).toBe(true)
+    const attach = vi.mocked(pveSetVmConfig).mock.calls.find(c => c[3].has("scsi0"))
+    expect(attach?.[3].get("scsi0")).toBe("local:120/vm-120-disk-0.qcow2,discard=on")
+  })
+
+  it("keeps the legacy temp staging when the storage is not reported active", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    // dead NFS mount: writing "onto the storage" would land under the mountpoint
+    vi.mocked(pveFetch).mockImplementation((async (conn: unknown, path: string, init?: { method?: string }) => {
+      if (/\/storage\/.+\/status$/.test(path)) return { active: 0 }
+      return pveRouter(conn, path, init)
+    }) as any)
+
+    await runPipelineToEnd("v2v-it-inactive", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    // no direct write: raw conversion into the temp dir, byte-for-byte legacy
+    expect(v2vLaunches[0]).not.toContain("-of qcow2")
+    expect(v2vLaunches[0]).toContain("-os '/tmp/v2v-v2v-it-inactive'")
+    // and the disk reaches the storage through the converting import
+    const importCmd = sshCommands().find(c => c.startsWith("qm disk import ")) || ""
+    expect(importCmd).toContain("qm disk import 120 '/tmp/v2v-v2v-it-inactive/testvm-sda' 'local' --format qcow2")
+  })
+})
+
+describe("runV2vMigrationPipeline per-disk target storage (#317, lot 2)", () => {
+  const sshCommands = () => vi.mocked(executeSSH).mock.calls.map(c => String(c[2]))
+  /** Every `slot=volid` the pipeline attached through the VM config API. */
+  const attachedSlots = () =>
+    Object.fromEntries(vi.mocked(pveSetVmConfig).mock.calls.flatMap(c => [...c[3].entries()])) as Record<string, string>
+
+  /** SOAP inspection of a source VM with `n` disks of 1 GiB, the size the qemu-img info stub reports. */
+  function vmwareSource(n: number) {
+    return {
+      name: "testvm", guestOS: "Ubuntu Linux (64-bit)", guestId: "ubuntu64Guest", numCPU: 2, numCoresPerSocket: 1, sockets: 2,
+      memoryMB: 2048, firmware: "bios", uuid: "u", vmxVersion: "vmx-19", vmPathName: "[ds1] testvm/testvm.vmx",
+      powerState: "poweredOff", committed: 0, snapshotCount: 0, hasVtpm: false, nics: [],
+      disks: Array.from({ length: n }, (_, i) => ({
+        label: `Hard disk ${i + 1}`, fileName: `[ds1] testvm/d${i}.vmdk`, capacityBytes: 1073741824,
+        thinProvisioned: true, datastoreName: "ds1", relativePath: `testvm/d${i}.vmdk`,
+      })),
+    }
+  }
+
+  /** A second storage, block (LVM-thin), next to the file-based default "local". */
+  async function withThinStorage(conn: unknown, path: string, init?: { method?: string }) {
+    if (path === "/storage/thin") return { type: "lvmthin" }
+    return pveRouter(conn, path, init)
+  }
+
+  function vcenterConfig(overrides: Partial<V2vMigrationConfig> = {}): V2vMigrationConfig {
+    return makeConfig({ sourceType: "vcenter", diskPaths: undefined, migrationType: "cold", ...overrides })
+  }
+
+  const VCENTER_CONN = { baseUrl: "https://vcsa.local", apiTokenEnc: "enc", insecureTLS: true, hypervShareName: null }
+
+  it("imports each disk of a vCenter VM onto its own storage: boot disk on the default, data disk on a block storage", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\n"
+    prisma.connection.findUnique.mockResolvedValue(VCENTER_CONN as any)
+    vi.mocked(parseVmConfig).mockReturnValue(vmwareSource(2) as any)
+    vi.mocked(pveFetch).mockImplementation(withThinStorage as any)
+
+    await runPipelineToEnd("v2v-it-perdisk", vcenterConfig({ disks: [{ index: 1, targetStorage: "thin" }] }))
+
+    expect(prisma.row.status).toBe("completed")
+    const logs = messages()
+    expect(logs).toContain("Per-disk choices: storage disk 1->local, disk 2->thin")
+    // the extra storage was resolved up front, before the download and the conversion
+    const pvePaths = vi.mocked(pveFetch).mock.calls.map(c => String(c[1]))
+    expect(pvePaths.indexOf("/storage/thin")).toBeLessThan(pvePaths.indexOf("/cluster/nextid"))
+    const commands = sshCommands()
+    // disk 1: file-based default storage, converting import (the rename stub refuses)
+    expect(commands.some(c => c.startsWith("qm disk import 120 ") && c.includes("testvm-sda") && c.includes("'local'"))).toBe(true)
+    // disk 2: raw volume allocated on the block storage and written there, never imported as a file
+    expect(commands).toContain("pvesm alloc 'thin' 120 'vm-120-disk-1' 1048576 --format raw 2>&1")
+    expect(commands.some(c => c.startsWith("qemu-img convert ") && c.includes("testvm-sdb") && c.includes("/dev/thin/vm-120-disk-1"))).toBe(true)
+    expect(commands.some(c => c.startsWith("qm disk import ") && c.includes("testvm-sdb"))).toBe(false)
+    expect(logs.some(m => m.includes('[Disk 2/2] Adding testvm-sdb to storage "thin"'))).toBe(true)
+    // attached in order, each from its own storage
+    const attached = attachedSlots()
+    expect(attached.scsi0).toBe("local:120/vm-120-disk-0.qcow2,discard=on")
+    expect(attached.scsi1).toBe("thin:vm-120-disk-1")
+    expect(attached.boot).toBe("order=scsi0")
+  })
+
+  it("skips an excluded disk: its file is neither imported nor attached, and the next disk takes the next slot", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\ntestvm-sdc\n"
+    prisma.connection.findUnique.mockResolvedValue(VCENTER_CONN as any)
+    vi.mocked(parseVmConfig).mockReturnValue(vmwareSource(3) as any)
+
+    await runPipelineToEnd("v2v-it-exclude", vcenterConfig({ disks: [{ index: 1, exclude: true }] }))
+
+    expect(prisma.row.status).toBe("completed")
+    const logs = messages()
+    expect(logs).toContain("Per-disk choices: excluded disk 2")
+    expect(logs.some(m => m.includes("[Disk 2/3] Excluded in the migration options: testvm-sdb is not imported"))).toBe(true)
+    const commands = sshCommands()
+    // all three disks were still converted (virt-v2v cannot skip one)...
+    expect(runVcenterNfcExport).toHaveBeenCalledTimes(1)
+    expect(commands.some(c => c.startsWith("qm disk import ") && c.includes("testvm-sdb"))).toBe(false)
+    expect(commands.some(c => c.includes("echo ADOPT_OK") && c.includes("testvm-sdb"))).toBe(false)
+    // ...but only the kept ones were imported, in source order, without a slot gap
+    const imported = commands.filter(c => c.startsWith("qm disk import ")).map(c => /testvm-sd[a-z]/.exec(c)?.[0])
+    expect(imported).toEqual(["testvm-sda", "testvm-sdc"])
+    const attached = attachedSlots()
+    expect(attached.scsi0).toBeDefined()
+    expect(attached.scsi1).toBeDefined()
+    expect(attached.scsi2).toBeUndefined()
+    expect(logs.some(m => m.includes("Disk 3 imported and attached as scsi1"))).toBe(true)
+    // the excluded file leaves with the output directory
+    expect(commands).toContain("rm -rf '/var/lib/vz/proxcenter-v2v/v2v-it-exclude'")
+  })
+
+  it("fails before importing anything when the converted disks do not match the source disk list", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\ntestvm-sdc\n" // one more file than the inspected VM has disks
+    prisma.connection.findUnique.mockResolvedValue(VCENTER_CONN as any)
+    vi.mocked(parseVmConfig).mockReturnValue(vmwareSource(2) as any)
+    vi.mocked(pveFetch).mockImplementation(withThinStorage as any)
+
+    await runPipelineToEnd("v2v-it-mismatch", vcenterConfig({ disks: [{ index: 1, targetStorage: "thin" }] }))
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain("the source VM has 2 disk(s) but virt-v2v produced 3 disk file(s)")
+    const commands = sshCommands()
+    expect(commands.some(c => c.startsWith("qm disk import ") || c.startsWith("pvesm alloc ") || c.startsWith("qemu-img convert "))).toBe(false)
+    const diskAttach = vi.mocked(pveSetVmConfig).mock.calls.some(c => [...c[3].keys()].some(k => /^(scsi|sata|virtio)\d+$/.test(k)))
+    expect(diskAttach).toBe(false)
+    // the shell VM created before the import is cleaned up as for any failure after the create
+    expect(destroyPveVm).toHaveBeenCalledWith(expect.objectContaining({ id: "conn-target" }), "pve1", 120)
+  })
+
+  it("fails up front when a chosen storage is unknown to the cluster, before any download", { timeout: 15000 }, async () => {
+    prisma.connection.findUnique.mockResolvedValue(VCENTER_CONN as any)
+    vi.mocked(parseVmConfig).mockReturnValue(vmwareSource(2) as any)
+    vi.mocked(pveFetch).mockImplementation((async (conn: unknown, path: string, init?: { method?: string }) => {
+      if (path === "/storage/gone") throw new Error("500 storage 'gone' does not exist")
+      return pveRouter(conn, path, init)
+    }) as any)
+
+    await runPipelineToEnd("v2v-it-badstorage", vcenterConfig({ disks: [{ index: 1, targetStorage: "gone" }] }))
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain('Target storage "gone" chosen for a disk in the migration options is not known to the cluster')
+    expect(runVcenterNfcExport).not.toHaveBeenCalled()
+    expect(v2vLaunches).toHaveLength(0)
+  })
+
+  it("keeps today's import without per-disk choices: every disk on the default storage, slots in order", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\n"
+
+    await runPipelineToEnd("v2v-it-default", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    expect(sshCommands().filter(c => c.startsWith("qm disk import "))).toEqual([
+      "qm disk import 120 '/var/lib/vz/proxcenter-v2v/v2v-it-default/testvm-sda' 'local' --format qcow2 2>&1",
+      "qm disk import 120 '/var/lib/vz/proxcenter-v2v/v2v-it-default/testvm-sdb' 'local' --format qcow2 2>&1",
+    ])
+    const attached = attachedSlots()
+    expect(attached.scsi0).toBe("local:120/vm-120-disk-0.qcow2,discard=on")
+    expect(attached.scsi1).toBe("local:120/vm-120-disk-0.qcow2,discard=on")
+    expect(messages().some(m => m.startsWith("Per-disk choices"))).toBe(false)
+    expect(soapLogin).not.toHaveBeenCalled()
+  })
+
+  it("reads the source disk list from the ESXi host on the esxi-direct path and honours the choices", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\n"
+    prisma.connection.findUnique.mockResolvedValue({
+      baseUrl: "https://esxi.local", apiTokenEnc: "enc", insecureTLS: true, hypervShareName: null,
+      sshEnabled: true, sshUser: "root", sshPort: 22, sshKeyEnc: "enc-key", sshPassEnc: null, sshAuthMethod: "key",
+    } as any)
+    vi.mocked(parseVmConfig).mockReturnValue(vmwareSource(2) as any)
+    vi.mocked(pveFetch).mockImplementation(withThinStorage as any)
+
+    await runPipelineToEnd("v2v-it-esxi", makeConfig({
+      sourceType: "esxi-direct", diskPaths: undefined, migrationType: "cold",
+      vmxPath: "/vmfs/volumes/ds1/testvm/testvm.vmx", esxiHost: "esxi.local",
+      disks: [{ index: 1, targetStorage: "thin" }],
+    }))
+
+    expect(prisma.row.status).toBe("completed")
+    // the lookup the dispatcher made, repeated here because the pipeline never had the list
+    expect(soapLogin).toHaveBeenCalledWith("https://esxi.local", "root", "pw", true)
+    expect(soapLogout).toHaveBeenCalledTimes(1)
+    expect(runVcenterNfcExport).not.toHaveBeenCalled()
+    expect(v2vLaunches[0]).toContain("-i vmx -it ssh")
+    expect(messages()).toContain("Per-disk choices: storage disk 1->local, disk 2->thin")
+    expect(sshCommands()).toContain("pvesm alloc 'thin' 120 'vm-120-disk-1' 1048576 --format raw 2>&1")
+    expect(attachedSlots().scsi1).toBe("thin:vm-120-disk-1")
+  })
+})
+
+describe("runV2vMigrationPipeline Windows data disks (lab 22/10)", () => {
+  const WINDOWS_LOG = SUCCESS_LOG.replace("Converting Ubuntu 22.04 to run on KVM", "Converting Windows Server 2025 Standard Evaluation to run on KVM")
+  const customizeRuns = () => vi.mocked(executeSSH).mock.calls.map(c => String(c[2])).filter(c => c.includes("virt-customize --no-network"))
+
+  it("has the data disks of a Windows brought online at first boot, its files kept out of the output dir", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: WINDOWS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\ntestvm-sdc\n"
+
+    await runPipelineToEnd("v2v-it-online-disks", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    const [run] = customizeRuns()
+    expect(run).toMatch(/ -a '[^']*\/testvm-sda' --mkdir /)
+    // Phase 6 attaches whatever lies in the output dir: the script is not there.
+    const outputDir = /-a '([^']*)\/testvm-sda'/.exec(run)?.[1]
+    expect(run).not.toContain(`${outputDir}/online-disks`)
+    expect(run).toMatch(/rm -f '[^']*online-disks-v2v-it-online-disks\.ps1'/)
+    expect(vi.mocked(executeSSH).mock.calls.find(c => String(c[2]).includes("virt-customize --no-network"))?.[3]).toBe(10 * 60 * 1000)
+    expect(messages()).toContain("Guest disks: Windows keeps the disks it finds on a new controller offline, so the 2 data disks are brought online at the first boot")
+  })
+
+  it("warns with the way out when the script cannot be scheduled, and still completes", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: WINDOWS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\n"
+    onlineDisksAnswer = null
+
+    await runPipelineToEnd("v2v-it-online-disks-ko", makeConfig())
+
+    expect(prisma.row.status).toBe("completed")
+    expect(messages()).toContain("Guest disks: the data disks could not be set to come online at the first boot (virt-customize: error: no operating systems were found); Windows keeps the disks it finds on a new controller offline, bring them online in Disk Management")
+  })
+
+  it("leaves a single-disk Windows and a Linux guest alone", { timeout: 15000 }, async () => {
+    queueV2vRuns([{ exit: 0, log: WINDOWS_LOG }])
+    await runPipelineToEnd("v2v-it-online-disks-one", makeConfig())
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+    diskListing = "testvm-sda\ntestvm-sdb\n"
+    await runPipelineToEnd("v2v-it-online-disks-linux", makeConfig())
+
+    expect(customizeRuns()).toHaveLength(0)
+    expect(messages().some(m => m.startsWith("Guest disks:"))).toBe(false)
+  })
+})
+
+describe("runV2vMigrationPipeline Hyper-V disks (#1255)", () => {
+  const ATTACHED = "/mnt/hyperv/TestVM01/Virtual Hard Disks/disk01.vhdx"
+  let getVmCalls: any[][]
+  let shareScans: string[]
+
+  /** Source connection with credentials, share already mounted, every path present on it. */
+  function hypervSource(getVM: (...args: any[]) => Promise<any>) {
+    getVmCalls = []
+    shareScans = []
+    hypervFake.getVM = async (...args: any[]) => { getVmCalls.push(args); return getVM(...args) }
+    prisma.connection.findUnique.mockResolvedValue({ baseUrl: "http://10.42.0.61", apiTokenEnc: "enc", hypervShareName: "VMs", insecureTLS: true } as any)
+    vi.mocked(executeSSH).mockImplementation((async (connId: string, host: string, command: string) => {
+      if (command.startsWith("mountpoint -q /mnt/hyperv")) return ok("mounted")
+      if (command.startsWith("test -f ")) return ok("yes")
+      if (command.startsWith("find /mnt/hyperv")) { shareScans.push(command); return ok("/mnt/hyperv/OtherVM/other-data.vhdx") }
+      return sshRouter(connId, host, command)
+    }) as any)
+  }
+
+  const vmWithDisks = (diskMountPaths: string[]) => async () => ({ cpuCount: 2, memoryMB: 4096, diskPaths: diskMountPaths, diskMountPaths, generation: 2 })
+  const config = (overrides: Partial<V2vMigrationConfig> = {}) => makeConfig({ sourceVmName: "TestVM01", diskPaths: undefined, ...overrides })
+
+  it("migrates the disks attached to the VM when the job carries none (bulk), with no scan of the share", { timeout: 15000 }, async () => {
+    hypervSource(vmWithDisks([ATTACHED]))
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+
+    await runPipelineToEnd("v2v-it-hyperv-attached", config())
+
+    expect(prisma.row.status).toBe("completed")
+    expect(getVmCalls[0]).toEqual(["vm-1", { shareName: "VMs" }])
+    expect(v2vLaunches).toHaveLength(1)
+    expect(v2vLaunches[0]).toContain(ATTACHED)
+    expect(v2vLaunches[0]).not.toContain("other-data.vhdx")
+    expect(shareScans).toEqual([])
+    expect(messages()).toContain(`Disks attached to the VM on the Hyper-V host: ${ATTACHED}`)
+  })
+
+  it("keeps the dialog's paths when the job carries some", { timeout: 15000 }, async () => {
+    hypervSource(vmWithDisks(["/mnt/hyperv/elsewhere.vhdx"]))
+    queueV2vRuns([{ exit: 0, log: SUCCESS_LOG }])
+
+    await runPipelineToEnd("v2v-it-hyperv-dialog", config({ diskPaths: [ATTACHED] }))
+
+    expect(prisma.row.status).toBe("completed")
+    expect(v2vLaunches[0]).toContain(ATTACHED)
+    expect(v2vLaunches[0]).not.toContain("elsewhere.vhdx")
+  })
+
+  it("fails with the way out when WinRM cannot tell which disks are attached", { timeout: 15000 }, async () => {
+    hypervSource(async () => { throw new Error("WinRM timeout") })
+
+    await runPipelineToEnd("v2v-it-hyperv-nowinrm", config())
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain("Could not read the disks attached to this VM from the Hyper-V host over WinRM")
+    expect(v2vLaunches).toHaveLength(0)
+    expect(shareScans).toEqual([])
+  })
+
+  it("fails plainly when the VM has no disk attached", { timeout: 15000 }, async () => {
+    hypervSource(vmWithDisks([]))
+
+    await runPipelineToEnd("v2v-it-hyperv-nodisk", config())
+
+    expect(prisma.row.status).toBe("failed")
+    expect(String(prisma.row.error)).toContain('Hyper-V VM "TestVM01" has no virtual hard disk attached.')
+    expect(v2vLaunches).toHaveLength(0)
+  })
+})

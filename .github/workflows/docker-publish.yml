@@ -1,0 +1,944 @@
+name: Build and Publish Docker Images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag for the images (staging: staging or X.Y.Z-staging)'
+        required: false
+        default: 'latest'
+      staging:
+        description: 'Staging build: staging license key, published under version only'
+        type: boolean
+        required: false
+        default: false
+      frontend_ref:
+        description: 'Staging only: proxcenter-ui branch or tag to build'
+        required: false
+        default: ''
+      backend_ref:
+        description: 'Staging only: proxcenter-backend branch or tag to build'
+        required: false
+        default: ''
+
+# Jobs that publish or release declare their own grants; the test jobs only
+# read the code.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/proxcenter-frontend
+  ORCHESTRATOR_IMAGE: ghcr.io/${{ github.repository_owner }}/proxcenter-orchestrator
+  WEASYPRINT_IMAGE: ghcr.io/${{ github.repository_owner }}/proxcenter-weasyprint
+
+jobs:
+  # ========================================
+  # Staging dispatch guard
+  # ========================================
+  # Runs the checker from the dispatched ref: a staging build checks out
+  # older sources (frontend_ref) that do not carry this script.
+  dispatch-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check staging inputs
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          GH_REF: ${{ github.ref }}
+          INPUT_STAGING: ${{ inputs.staging }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FRONTEND_REF: ${{ inputs.frontend_ref }}
+          INPUT_BACKEND_REF: ${{ inputs.backend_ref }}
+        run: bash .github/scripts/check-staging-inputs.sh
+
+  # ========================================
+  # Run Frontend Tests
+  # ========================================
+  test:
+    needs: [dispatch-guard]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    # The vDC test suite (step 2.7) talks to a real Postgres via the
+    # vitest globalSetup at src/__tests__/setup/postgres.ts.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: proxcenter
+          POSTGRES_PASSWORD: test-pass
+          POSTGRES_DB: proxcenter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U proxcenter -d proxcenter"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.staging && inputs.frontend_ref || '' }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          # No dependency cache in a workflow that publishes images: a
+          # poisoned cache entry would reach the release run.
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Generate Prisma client
+        # --ignore-scripts above skips the postinstall, and we don't have a
+        # postinstall that runs `prisma generate` anyway. Several test suites
+        # (alerts/visibility, vdc/scope, vdc/sdn, vdc/vnets, vdc/backupJobs,
+        # vdc/ipam*, db/vdcPbsBindings) import `@/lib/db/prisma` which loads
+        # `.prisma/client/default` at module load time. Without this step the
+        # suites fail with "Cannot find module .prisma/client/default".
+        # The URL value is only required for the config to load, `prisma
+        # generate` does not open a connection.
+        env:
+          DATABASE_URL: postgresql://proxcenter:test-pass@localhost:5432/proxcenter
+        run: npx prisma generate
+
+      - name: Install psql client
+        # The test globalSetup shells out to psql to create / drop the
+        # per-run schema; ubuntu-latest images ship without it.
+        run: sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Run tests
+        env:
+          POSTGRES_TEST_URL_BASE: postgresql://proxcenter:test-pass@localhost:5432/proxcenter
+        run: npx vitest run
+
+  # ========================================
+  # Build Frontend Image
+  # ========================================
+  build-frontend:
+    needs: [test, test-backend]
+    if: ${{ always() && needs.test.result == 'success' && (needs.test-backend.result == 'success' || github.event.pull_request.user.login == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.staging && inputs.frontend_ref || '' }}
+
+      - name: Record the built source
+        id: src
+        env:
+          STAGING: ${{ inputs.staging }}
+          FRONTEND_REF: ${{ inputs.frontend_ref }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$STAGING" = "true" ]; then
+            echo "### Staging frontend: $FRONTEND_REF at $sha" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GH_REF" == refs/tags/v* ]]; then
+            VERSION="$GH_REF_NAME"
+            echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "latest" ]]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata for Frontend
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=ref,event=branch,enable=${{ !inputs.staging }}
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ steps.resolve.outputs.version != 'dev' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !inputs.staging }}
+
+      - name: Build and push Frontend
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ steps.src.outputs.sha }}
+            APP_VERSION=${{ steps.resolve.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Make Frontend package public
+        if: github.event_name != 'pull_request'
+        run: |
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/user/packages/container/proxcenter-frontend \
+            -d '{"visibility":"public"}'
+
+      # Signed SLSA provenance (Sigstore, public transparency log) bound to the
+      # pushed digest: `gh attestation verify oci://<image>:<tag> --owner adminsyspro`.
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.FRONTEND_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # CycloneDX inventory of the published image (OS and npm packages),
+      # attested against the same digest and attached to the release.
+      - name: Generate the Frontend SBOM
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.FRONTEND_IMAGE }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx
+          output: proxcenter-frontend-${{ steps.resolve.outputs.version }}.cdx.json
+
+      - name: Attest the Frontend SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.FRONTEND_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: proxcenter-frontend-${{ steps.resolve.outputs.version }}.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Keep the Frontend SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-frontend
+          path: proxcenter-frontend-${{ steps.resolve.outputs.version }}.cdx.json
+          if-no-files-found: error
+
+  # ========================================
+  # Build Demo Image
+  # ========================================
+  build-demo:
+    needs: [test, test-backend]
+    if: ${{ always() && !inputs.staging && needs.test.result == 'success' && (needs.test-backend.result == 'success' || github.event.pull_request.user.login == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Demo
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ env.FRONTEND_IMAGE }}:demo
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=demo
+            DEMO_MODE=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # ========================================
+  # Build WeasyPrint Sidecar Image
+  # ========================================
+  # Tiny Flask service that turns the orchestrator's HTML report templates
+  # into PDF documents. Built from `weasyprint/Dockerfile`. Published so
+  # Enterprise deployments can pull a pinned image instead of rebuilding
+  # locally on every `docker-compose up`.
+  build-weasyprint:
+    needs: [test, test-backend]
+    if: ${{ always() && needs.test.result == 'success' && (needs.test-backend.result == 'success' || github.event.pull_request.user.login == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.staging && inputs.frontend_ref || '' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GH_REF" == refs/tags/v* ]]; then
+            VERSION="$GH_REF_NAME"
+            echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "latest" ]]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata for WeasyPrint
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.WEASYPRINT_IMAGE }}
+          tags: |
+            type=ref,event=branch,enable=${{ !inputs.staging }}
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ steps.resolve.outputs.version != 'dev' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !inputs.staging }}
+
+      - name: Build and push WeasyPrint
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./weasyprint
+          file: ./weasyprint/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      # Signed SLSA provenance (Sigstore, public transparency log) bound to the
+      # pushed digest: `gh attestation verify oci://<image>:<tag> --owner adminsyspro`.
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.WEASYPRINT_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # The proxcenter-weasyprint package stays PRIVATE on GHCR (Enterprise
+      # only). A previous version of this workflow PATCHed it back to
+      # public after every build, which silently reverted the operator's
+      # privacy setting and additionally tripped githubactions:S7636
+      # (secret expanded in a `run:` block). Keep the package's visibility
+      # to whatever it was set to on the registry; do not touch it here.
+
+  # ========================================
+  # Build HA Infrastructure Images
+  # ========================================
+  # Patroni (postgres:16-alpine + patroni[etcd3]) and Keepalived images for
+  # the 3-node HA control plane, built from config/ha/. Prebuilt and pulled
+  # from GHCR so the HA conversion never runs `docker build` on customer
+  # nodes: nodes need ghcr.io egress only. Both packages stay PRIVATE
+  # (Enterprise-only); nodes authenticate with GHCR_TOKEN from .env.
+  build-ha-images:
+    needs: [test, test-backend]
+    if: ${{ always() && !inputs.staging && needs.test.result == 'success' && (needs.test-backend.result == 'success' || github.event.pull_request.user.login == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: proxcenter-patroni
+            dockerfile: Dockerfile.patroni
+          - image: proxcenter-keepalived
+            dockerfile: Dockerfile.keepalived
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GH_REF" == refs/tags/v* ]]; then
+            VERSION="$GH_REF_NAME"
+            echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "latest" ]]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata for ${{ matrix.image }}
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ steps.resolve.outputs.version != 'dev' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./config/ha
+          file: ./config/ha/${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          platforms: linux/amd64
+
+  # ========================================
+  # Mirror upstream HA images to GHCR
+  # ========================================
+  # etcd and haproxy are re-hosted under ghcr.io/adminsyspro so converted
+  # nodes only ever need ghcr.io egress (no quay.io / docker.io at
+  # conversion time). Idempotent: a tag that already exists on GHCR is
+  # skipped, which also freezes the mirrored haproxy:2.9-alpine at the
+  # digest first copied (re-mirroring is a deliberate manual act: delete
+  # the GHCR tag, then re-run the workflow).
+  mirror-ha-images:
+    if: ${{ github.event_name != 'pull_request' && !inputs.staging }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror etcd and haproxy
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          mirror() {
+            src="$1"; dst="$2"
+            if docker manifest inspect "$dst" > /dev/null 2>&1; then
+              echo "mirror: $dst already present, skipping"
+              return 0
+            fi
+            docker pull "$src"
+            docker tag "$src" "$dst"
+            docker push "$dst"
+          }
+          mirror "quay.io/coreos/etcd:v3.5.17" "ghcr.io/${OWNER}/etcd:v3.5.17"
+          mirror "haproxy:2.9-alpine" "ghcr.io/${OWNER}/haproxy:2.9-alpine"
+
+  # ========================================
+  # Run Backend Tests
+  # Skipped for Dependabot PRs: they cannot access ORCHESTRATOR_PAT
+  # and don't modify backend code.
+  # ========================================
+  test-backend:
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: [dispatch-guard]
+    runs-on: ubuntu-latest
+    # Replication tests open a per-run schema on this Postgres via
+    # POSTGRES_TEST_URL (mirrors the vitest globalSetup pattern). Tests
+    # t.Skip when the env is absent so default `go test` works locally.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: proxcenter
+          POSTGRES_PASSWORD: test-pass
+          POSTGRES_DB: proxcenter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U proxcenter -d proxcenter"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve backend ref
+        id: backend-ref
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          PAT: ${{ secrets.ORCHESTRATOR_PAT }}
+          INPUT_STAGING: ${{ inputs.staging }}
+          INPUT_BACKEND_REF: ${{ inputs.backend_ref }}
+        run: |
+          REF="main"
+          if [[ "$INPUT_STAGING" == "true" ]]; then
+            REF="$INPUT_BACKEND_REF"
+          elif [[ "$GH_REF" == refs/tags/v* ]]; then
+            # A release tests and builds the orchestrator from its own tag,
+            # never from main. Ask the API with the PAT: checkouts persist no
+            # credentials, and GITHUB_TOKEN cannot see the private backend
+            # repository anyway.
+            STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${PAT}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/adminsyspro/proxcenter-backend/git/ref/tags/${GH_REF_NAME}")
+            if [[ "$STATUS" != "200" ]]; then
+              echo "::error::cannot find proxcenter-backend tag ${GH_REF_NAME} (HTTP ${STATUS}): push the orchestrator tag before the frontend tag, or check ORCHESTRATOR_PAT"
+              exit 1
+            fi
+            REF="$GH_REF_NAME"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout backend repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: adminsyspro/proxcenter-backend
+          ref: ${{ steps.backend-ref.outputs.ref }}
+          path: backend
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          # The Go build cache is kept for branch runs, where it saves minutes,
+          # and skipped on the tag runs that publish a release.
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Run backend tests
+        working-directory: ./backend
+        env:
+          POSTGRES_TEST_URL: postgres://proxcenter:test-pass@localhost:5432/proxcenter?sslmode=disable
+        run: go test ./internal/...
+
+  # ========================================
+  # Build Orchestrator Image
+  # ========================================
+  build-orchestrator:
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: [test, test-backend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve backend ref
+        id: backend-ref
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          PAT: ${{ secrets.ORCHESTRATOR_PAT }}
+          INPUT_STAGING: ${{ inputs.staging }}
+          INPUT_BACKEND_REF: ${{ inputs.backend_ref }}
+        run: |
+          REF="main"
+          if [[ "$INPUT_STAGING" == "true" ]]; then
+            REF="$INPUT_BACKEND_REF"
+          elif [[ "$GH_REF" == refs/tags/v* ]]; then
+            # Same check as test-backend: never build a release from main.
+            STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${PAT}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/adminsyspro/proxcenter-backend/git/ref/tags/${GH_REF_NAME}")
+            if [[ "$STATUS" != "200" ]]; then
+              echo "::error::cannot find proxcenter-backend tag ${GH_REF_NAME} (HTTP ${STATUS}): push the orchestrator tag before the frontend tag, or check ORCHESTRATOR_PAT"
+              exit 1
+            fi
+            REF="$GH_REF_NAME"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout backend repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: adminsyspro/proxcenter-backend
+          ref: ${{ steps.backend-ref.outputs.ref }}
+          path: backend
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+
+      - name: Swap in the staging license public key
+        if: ${{ inputs.staging }}
+        env:
+          STAGING_LICENSE_PUBLIC_KEY: ${{ secrets.STAGING_LICENSE_PUBLIC_KEY }}
+          BACKEND_REF: ${{ inputs.backend_ref }}
+        run: |
+          set -euo pipefail
+          # SHA-256 of the DER of internal/license/public_key.pem on backend
+          # main (RSA 4096, unchanged since cf64391). Pinned so a backend_ref
+          # that edits the pem cannot move the baseline of the check below.
+          PROD_LICENSE_KEY_SHA256=65443d6923c20081d06410c53da7e6f7b053012dd4e36537013d4f8875b514ea
+          key=backend/internal/license/public_key.pem
+          if [ -z "$STAGING_LICENSE_PUBLIC_KEY" ]; then
+            echo "::error::secret STAGING_LICENSE_PUBLIC_KEY is not set"
+            exit 1
+          fi
+          candidate=$(mktemp)
+          printf '%s\n' "$STAGING_LICENSE_PUBLIC_KEY" > "$candidate"
+          # The backend validator only accepts an RSA key; prod is RSA 4096.
+          if ! bits=$(openssl rsa -pubin -in "$candidate" -noout -text 2>/dev/null | sed -n 's/^Public-Key: (\([0-9]*\) bit)$/\1/p'); then
+            bits=""
+          fi
+          if [ "$bits" != "4096" ]; then
+            rm -f "$candidate"
+            if [ -n "$bits" ]; then got="RSA $bits"; else got="not an RSA public key"; fi
+            echo "::error::STAGING_LICENSE_PUBLIC_KEY must be an RSA 4096 public key in PEM, got: $got"
+            exit 1
+          fi
+          staging_fp=$(openssl pkey -pubin -in "$candidate" -outform DER | sha256sum | cut -d' ' -f1)
+          ref_fp=$(openssl pkey -pubin -in "$key" -outform DER | sha256sum | cut -d' ' -f1)
+          if [ "$staging_fp" = "$PROD_LICENSE_KEY_SHA256" ] || [ "$staging_fp" = "$ref_fp" ]; then
+            rm -f "$candidate"
+            echo "::error::STAGING_LICENSE_PUBLIC_KEY is the production key"
+            exit 1
+          fi
+          mv "$candidate" "$key"
+          chmod 644 "$key"
+          prod_fp=$ref_fp
+          echo "Production license key, replaced: $prod_fp"
+          echo "Staging license key, embedded:    $staging_fp"
+          {
+            echo "### Staging orchestrator"
+            echo "- backend $BACKEND_REF at $(git -C backend rev-parse HEAD)"
+            echo "- license public key sha256 (DER): $staging_fp"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GH_REF" == refs/tags/v* ]]; then
+            VERSION="$GH_REF_NAME"
+            echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "latest" ]]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata for Orchestrator
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.ORCHESTRATOR_IMAGE }}
+          tags: |
+            type=ref,event=branch,enable=${{ !inputs.staging }}
+            type=ref,event=pr
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ steps.resolve.outputs.version }},enable=${{ steps.resolve.outputs.version != 'dev' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !inputs.staging }}
+
+      - name: Build and push Orchestrator
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            VERSION=${{ steps.resolve.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      # Signed SLSA provenance (Sigstore, public transparency log) bound to the
+      # pushed digest: `gh attestation verify oci://<image>:<tag> --owner adminsyspro`.
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.ORCHESTRATOR_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+  # ========================================
+  # Create GitHub Release (on version tags)
+  # ========================================
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-frontend, build-demo, build-orchestrator, build-weasyprint, build-ha-images, mirror-ha-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Release notes are curated, never auto-generated from git log. Every
+      # tagged version must ship with a hand-written RELEASE_NOTES_<TAG>.md
+      # committed at the tagged SHA. The job hard-fails if the file is
+      # missing, so a tag-push without notes can never overwrite an existing
+      # release with a raw commit dump (regression observed on v1.4.0 after
+      # a hot-fix force-push).
+      - name: Build release body from curated notes
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          NOTES_FILE="RELEASE_NOTES_${TAG}.md"
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error file=${NOTES_FILE}::Curated release notes are missing."
+            echo "::error::Refusing to publish the GitHub release without ${NOTES_FILE}."
+            echo "::error::Commit RELEASE_NOTES_${TAG}.md at the tagged SHA, then re-push the tag."
+            exit 1
+          fi
+          # Built via echo (not heredoc) — a bash heredoc forces its body to
+          # column 0, which breaks the YAML literal block scalar that requires
+          # consistent indentation. Single-quoted strings hold the markdown
+          # code fences so bash never interprets the backticks.
+          cp "$NOTES_FILE" /tmp/release-body.md
+          {
+            printf '\n\n'
+            echo '## Docker Images'
+            echo ''
+            echo '```bash'
+            echo "docker pull ghcr.io/adminsyspro/proxcenter-frontend:${TAG}"
+            echo "docker pull ghcr.io/adminsyspro/proxcenter-orchestrator:${TAG}"
+            echo "docker pull ghcr.io/adminsyspro/proxcenter-weasyprint:${TAG}"
+            echo '```'
+            echo ''
+            echo '## Verify the images'
+            echo ''
+            echo '```bash'
+            echo "gh attestation verify oci://ghcr.io/adminsyspro/proxcenter-frontend:${TAG} --owner adminsyspro"
+            echo '```'
+            echo ''
+            echo "The CycloneDX SBOM of the frontend image is attached below."
+            echo ''
+            echo '## Air-gapped bundle'
+            echo ''
+            echo "Community: the \`proxcenter-community-${TAG#v}.tar.gz\` asset below. Enterprise: your account on proxcenter.io, Air-gapped tab. Guide: https://docs.proxcenter.io/getting-started/air-gapped-installation"
+          } >> /tmp/release-body.md
+          echo "body_path=/tmp/release-body.md" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the Frontend SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-frontend
+          path: sbom
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.body_path }}
+          files: sbom/*.cdx.json
+          draft: false
+          prerelease: false
+          make_latest: true
+
+  # ========================================
+  # Air-gapped bundles (on version tags)
+  # ========================================
+  # install-airgap.sh bundle saves the images the compose resolves to at this
+  # tag, with the compose, the script, a manifest and checksums (ui#956);
+  # Enterprise also packs the 3-node HA images of docker-compose.ha.yml
+  # (--ha-compose, ignored for Community) in the same images.tar. The
+  # Community bundle is a public release asset; the Enterprise one goes to the
+  # private R2 bucket the customer portal serves. The R2 step is skipped, with
+  # a warning, until the three R2_* secrets exist.
+  bundle:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [community, enterprise]
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the ${{ matrix.edition }} bundle
+        env:
+          EDITION: ${{ matrix.edition }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          chmod +x install-airgap.sh
+          ./install-airgap.sh bundle --edition "$EDITION" --version "$VERSION" --compose "docker-compose.$EDITION.yml" --ha-compose docker-compose.ha.yml --output dist
+          ls -la dist
+
+      - name: Attach the Community bundle to the release
+        if: matrix.edition == 'community'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/proxcenter-community-*.tar.gz dist/proxcenter-community-*.tar.gz.sha256 --clobber
+
+      - name: Upload the Enterprise bundle to R2
+        if: matrix.edition == 'enterprise' && env.R2_ACCESS_KEY_ID != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          DEST="s3://proxcenter-bundles/enterprise/${VERSION}"
+          SHA=$(cut -d' ' -f1 "dist/proxcenter-enterprise-${VERSION}.tar.gz.sha256")
+          aws s3 cp "dist/proxcenter-enterprise-${VERSION}.tar.gz" "${DEST}/proxcenter-enterprise-${VERSION}.tar.gz" --endpoint-url "$ENDPOINT" --metadata "sha256=${SHA}" --content-type application/gzip
+          aws s3 cp "dist/proxcenter-enterprise-${VERSION}.tar.gz.sha256" "${DEST}/proxcenter-enterprise-${VERSION}.tar.gz.sha256" --endpoint-url "$ENDPOINT" --content-type text/plain
+          mkdir -p x && tar xzf "dist/proxcenter-enterprise-${VERSION}.tar.gz" -C x
+          aws s3 cp "x/proxcenter-enterprise-${VERSION}/SHA256SUMS" "${DEST}/SHA256SUMS" --endpoint-url "$ENDPOINT" --content-type text/plain
+          aws s3 cp "x/proxcenter-enterprise-${VERSION}/manifest.json" "${DEST}/manifest.json" --endpoint-url "$ENDPOINT" --content-type application/json
+
+      - name: Enterprise bundle not uploaded
+        if: matrix.edition == 'enterprise' && env.R2_ACCESS_KEY_ID == ''
+        run: echo "::warning::R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_ACCOUNT_ID are not set; the Enterprise bundle was built but not uploaded."

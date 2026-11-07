@@ -1,0 +1,100 @@
+export const dynamic = "force-dynamic"
+import { NextResponse } from 'next/server'
+import { getSettingWithSource, setSetting } from '@/lib/db/settings'
+import { requireBrandingAdmin } from '@/lib/branding/guard'
+import { getCurrentTenantId } from '@/lib/tenant'
+import { scopedBrandingUrl, unscopedBrandingUrl } from '@/lib/branding/urls'
+import { normalizeHexColor } from '@/lib/theme/hexColor'
+import { withAudit } from '@/lib/audit/withAudit'
+
+
+const DEFAULT_BRANDING = {
+  enabled: false,
+  appName: 'ProxCenter',
+  logoUrl: '',
+  faviconUrl: '',
+  loginLogoUrl: '',
+  primaryColor: '',
+  footerText: '',
+  browserTitle: '',
+  poweredByVisible: true,
+  loginTagline: '',
+  loginHighlights: [] as Array<{ icon: string; text: string }>,
+  docsUrl: '',
+  supportUrl: '',
+  changelogUrl: '',
+  hideVersion: false,
+}
+
+export async function GET() {
+  try {
+    const denied = await requireBrandingAdmin()
+    if (denied) return denied
+
+    const tenantId = await getCurrentTenantId()
+    const resolved = await getSettingWithSource<Partial<typeof DEFAULT_BRANDING>>('branding', tenantId)
+    const settings = { ...DEFAULT_BRANDING, ...(resolved?.value ?? {}) }
+
+    // Migrate old static paths to API serving paths
+    const fixUrl = (url: string) =>
+      scopedBrandingUrl(url, resolved?.tenantId ?? tenantId, tenantId)
+    settings.logoUrl = fixUrl(settings.logoUrl)
+    settings.faviconUrl = fixUrl(settings.faviconUrl)
+    settings.loginLogoUrl = fixUrl(settings.loginLogoUrl)
+
+    // #754: a value stored before the colour was validated can be missing its
+    // '#'. Hand the settings form the colour the administrator meant, so saving
+    // once is enough to clean the row, and drop what cannot be repaired.
+    settings.primaryColor = settings.primaryColor ? (normalizeHexColor(settings.primaryColor) ?? '') : ''
+
+    return NextResponse.json(settings)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+async function handlePut(req: Request) {
+  try {
+    const denied = await requireBrandingAdmin()
+    if (denied) return denied
+
+    const body = await req.json()
+    const settings = { ...DEFAULT_BRANDING, ...body }
+
+    // #754: the primary colour reaches MUI's lighten()/darken() in the theme
+    // provider, which wraps the dashboard AND the login layout, so an
+    // unparseable value here takes the whole tenant down with a 500 and leaves
+    // no UI to undo it. An empty string means "no override" and stays allowed;
+    // anything else has to be a hex colour, and a missing '#' is added rather
+    // than refused.
+    if (settings.primaryColor) {
+      const primaryColor = normalizeHexColor(settings.primaryColor)
+
+      if (primaryColor === null) {
+        return NextResponse.json(
+          { error: 'Invalid primaryColor: expected a hex colour such as #00ECB2' },
+          { status: 400 }
+        )
+      }
+
+      settings.primaryColor = primaryColor
+    } else {
+      settings.primaryColor = ''
+    }
+
+    // The GET qualified the upload URLs for the reader (`tenant=`, `scope=`);
+    // persisting them would freeze another owner into this tenant's row.
+    for (const field of ['logoUrl', 'faviconUrl', 'loginLogoUrl'] as const) {
+      if (typeof settings[field] === 'string') settings[field] = unscopedBrandingUrl(settings[field])
+    }
+
+    const tenantId = await getCurrentTenantId()
+    await setSetting('branding', tenantId, settings)
+
+    return NextResponse.json({ success: true, ...settings })
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+}
+
+export const PUT = withAudit({ category: 'settings', resourceType: 'branding' }, handlePut)

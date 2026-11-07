@@ -1,0 +1,528 @@
+import { NextResponse } from "next/server"
+import { licenseExcludedResponse } from "@/lib/api/response"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { invalidateGuestDiskTotal } from "@/lib/inventory/guestDiskTotals"
+import { writeGuestConfig, type GuestConfigWriteResult } from "@/lib/proxmox/guestConfigWrite"
+import { mergeMemoryProperty } from "@/lib/proxmox/memoryProperty"
+import { enforceGuestTagAccess } from "@/lib/proxmox/tagAccessServer"
+import { isVmConfigNotFoundError, locateVmInCluster, type GuestType } from "@/lib/proxmox/locateVm"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, checkPermissions, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { sensitiveNicPermissions, hasNicMutation, hasNicRevert, NicConfigError } from "@/lib/rbac/nicPermissions"
+import { classifyConfigBody } from "@/lib/rbac/configClassifier"
+import { isOpticalDrive } from "@/lib/proxmox/cdrom"
+import { getCurrentTenantId } from "@/lib/tenant"
+import { resolveVdcForTenant, checkVdcQuota } from "@/lib/vdc/quota"
+import { checkTenantGuestScope } from "@/lib/vdc/guestScope"
+import { parseGuestTarget } from "@/lib/vdc/guestGuard"
+import { validateCpuAgainstPolicy, parseCpuProperty, loadCpuCapabilitiesIfNeeded } from "@/lib/vdc/computePolicy"
+import { enforceTenantDrives, meterImportRefs, DriveScopeError } from "@/lib/vdc/driveGuard"
+import { getAllowedNetworksForTenant, validateNetAgainstScope } from "@/lib/vdc/vnets"
+import { syncIpamForVmConfig, IpamHintUnavailableError, IpamExhaustedError } from "@/lib/vdc/ipamSync"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+const ALLOWED_TYPES = new Set(["qemu", "lxc"])
+
+// Champs autorisés pour la modification (QEMU)
+const ALLOWED_QEMU_FIELDS = new Set([
+  // Basic
+  'name', 'description', 'tags', 'onboot', 'protection', 'startup',
+
+  // CPU
+  'cores', 'sockets', 'cpu', 'vcpus', 'cpulimit', 'cpuunits', 'numa',
+
+  // Memory
+  'memory', 'balloon', 'shares',
+
+  // Boot
+  'boot', 'bootdisk', 'bios', 'machine',
+
+  // Agent
+  'agent',
+
+  // Hardware
+  'scsihw', 'vga',
+
+  // Options
+  'ostype', 'hotplug', 'tablet', 'localtime', 'freeze', 'kvm', 'acpi',
+
+  // Args
+  'args',
+
+  // Cloud-Init
+  'ciuser', 'cipassword', 'sshkeys', 'nameserver', 'searchdomain', 'citype', 'cicustom',
+
+  // Delete (pour supprimer des options)
+  'delete',
+
+  // Revert pending changes (comma-separated config keys to undo)
+  'revert',
+])
+
+// Champs autorisés pour LXC
+const ALLOWED_LXC_FIELDS = new Set([
+  'hostname', 'description', 'tags', 'onboot', 'protection', 'startup',
+  'cores', 'cpulimit', 'cpuunits',
+  'memory', 'swap',
+  'unprivileged', 'features',
+  'delete',
+  'revert',
+])
+
+/**
+ * Whether `key` is actually forwarded to PVE for this guest type. Type-aware
+ * on purpose: qemu keeps every field this route has ever forwarded (disks,
+ * PCI/USB passthrough, cloud-init IP configs, ...); lxc forwards only its
+ * own field set plus net/unused (rootfs and mpN are NOT in this route's
+ * forwarding set, matching this route's pre-existing lxc behaviour).
+ *
+ * This is the single source of truth the drive guard and the formData
+ * builder both consult, so the two can never drift again: a key the guard
+ * validates/meters but this route silently drops (or vice versa) is exactly
+ * the class of bug this predicate closes.
+ */
+function isForwardedConfigKey(key: string, type: 'qemu' | 'lxc'): boolean {
+  if (type === 'lxc') {
+    return ALLOWED_LXC_FIELDS.has(key) || /^net\d+$/.test(key) || /^unused\d+$/.test(key)
+  }
+  return ALLOWED_QEMU_FIELDS.has(key) ||
+    /^net\d+$/.test(key) ||        // net0, net1, etc.
+    /^(scsi|virtio|ide|sata)\d+$/.test(key) || // disques
+    /^unused\d+$/.test(key) ||     // unused disks
+    /^hostpci\d+$/.test(key) ||    // PCI passthrough
+    /^usb\d+$/.test(key) ||        // USB passthrough
+    /^ipconfig\d+$/.test(key) ||   // Cloud-Init IP configs
+    /^efidisk\d+$/.test(key) ||    // EFI disk
+    /^tpmstate\d+$/.test(key) ||   // TPM state
+    /^serial\d+$/.test(key) ||     // Serial ports
+    /^audio\d+$/.test(key) ||      // Audio device
+    key === 'rng0'                 // VirtIO RNG
+}
+
+// GET: Récupérer la configuration de la VM
+async function getHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    if (!ALLOWED_TYPES.has(type)) {
+      return NextResponse.json({ error: "Invalid type" }, { status: 400 })
+    }
+    // node and vmid are interpolated into the PVE path below: hostname and digits only.
+    const target = parseGuestTarget({ type, node, vmid })
+    if (!target.ok) return target.response
+
+    // RBAC: Check vm.view permission
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_VIEW, "vm", resourceId)
+
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+    const tenantId = await getCurrentTenantId()
+    const scopeDenied = await checkTenantGuestScope(tenantId, conn, id, type, node, vmid, true)
+    if (scopeDenied) return scopeDenied
+
+    // Resolve via the original node first; on "config does not exist"
+    // (post-intra-cluster-migration, source .conf already removed by PVE),
+    // re-resolve the VM's current node via /cluster/resources and retry.
+    let resolvedNode = node
+    let movedTo: string | null = null
+    let configEffective: any
+    try {
+      configEffective = await pveFetch<any>(
+        conn,
+        `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/config`,
+        { method: "GET" }
+      )
+    } catch (err: any) {
+      if (!isVmConfigNotFoundError(err)) throw err
+      const located = await locateVmInCluster(conn, vmid, type as GuestType)
+      if (!located || located.node === node) throw err
+      const destinationDenied = await checkPermission(PERMISSIONS.VM_VIEW, "vm", buildVmResourceId(id, located.node, type, vmid))
+      if (destinationDenied) return destinationDenied
+      const destinationScopeDenied = await checkTenantGuestScope(tenantId, conn, id, type, located.node, vmid)
+      if (destinationScopeDenied) return destinationScopeDenied
+      resolvedNode = located.node
+      movedTo = located.node
+      configEffective = await pveFetch<any>(
+        conn,
+        `/nodes/${encodeURIComponent(resolvedNode)}/${type}/${encodeURIComponent(vmid)}/config`,
+        { method: "GET" }
+      )
+    }
+    const configCurrent = await pveFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(resolvedNode)}/${type}/${encodeURIComponent(vmid)}/config?current=1`,
+      { method: "GET" }
+    ).catch(() => null)
+
+    // Calculer les pending changes (différence entre effective et current)
+    // = changements qui nécessitent un reboot pour prendre effet
+    const pending: Record<string, any> = {}
+
+    if (configCurrent) {
+      const skipKeys = new Set(['digest', 'pending'])
+
+      for (const key of Object.keys(configEffective)) {
+        if (skipKeys.has(key)) continue
+        if (configEffective[key] !== configCurrent[key] && configEffective[key] !== undefined) {
+          pending[key] = configEffective[key]
+        }
+      }
+    }
+
+    // Retourner la config effective (inclut les dernières modifications)
+    // avec les pending pour indiquer ce qui nécessite un reboot
+    const result = {
+      ...configEffective,
+      pending: Object.keys(pending).length > 0 ? pending : undefined
+    }
+
+    return NextResponse.json({ data: result, movedTo })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// PUT: Mettre à jour la configuration de la VM
+async function putHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    if (!ALLOWED_TYPES.has(type)) {
+      return NextResponse.json({ error: "Invalid type" }, { status: 400 })
+    }
+    const target = parseGuestTarget({ type, node, vmid })
+    if (!target.ok) return target.response
+
+    // Gate on vm.view before any PVE traffic so an unauthorized caller
+    // cannot probe guest existence through error responses.
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const viewDenied = await checkPermission(PERMISSIONS.VM_VIEW, "vm", resourceId)
+    if (viewDenied) return viewDenied
+
+    const body = await req.json().catch(() => null)
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 })
+    }
+
+    const requestedDigest = body.digest
+    const conn = await getConnectionById(id)
+    const tenantId = await getCurrentTenantId()
+    const scopeDenied = await checkTenantGuestScope(tenantId, conn, id, type, node, vmid)
+    if (scopeDenied) return scopeDenied
+
+    // Fetch current config once — reused by the classifier (NIC link-only
+    // detection), the quota check (CPU/RAM deltas) and the IPAM sync.
+    const currentConfig = await pveFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/config`
+    )
+
+    // Type-aware admission: drop any key this route will never forward to
+    // PVE BEFORE classification so non-forwarded keys don't inflate the
+    // required permission set.
+    for (const key of Object.keys(body)) {
+      if (!isForwardedConfigKey(key, type as 'qemu' | 'lxc')) delete body[key]
+    }
+
+    // ── Fine-grained RBAC ──
+    // Classify every body key into its sub-right (vm.config.media, .nic,
+    // .nic.link, .hardware, .boot) and check the union. Tenant MAC and VLAN
+    // changes add explicit rights that broad vm.config / vm.config.nic cannot grant.
+    let runningConfig: Record<string, unknown> | undefined
+    if (tenantId !== 'default' && hasNicRevert(body)) {
+      runningConfig = await pveFetch<Record<string, unknown>>(conn,
+        `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/config?current=1`)
+      if (currentConfig.digest && runningConfig.digest !== currentConfig.digest) {
+        return NextResponse.json({ error: 'VM configuration changed; reload before saving' }, { status: 409 })
+      }
+    }
+    const requiredPerms = classifyConfigBody(body, currentConfig)
+    if (tenantId !== 'default') {
+      for (const permission of sensitiveNicPermissions(body, currentConfig, runningConfig)) requiredPerms.add(permission)
+    }
+    let denied = requiredPerms.size > 0
+      ? await checkPermissions([...requiredPerms], "vm", resourceId)
+      : await checkPermission(PERMISSIONS.VM_CONFIG, "vm", resourceId)
+
+    // Hardware operators retain access to their existing optical drives;
+    // a media-only grant never satisfies any other required hardware right.
+    if (denied && requiredPerms.has(PERMISSIONS.VM_CONFIG_MEDIA)) {
+      const hardwarePerms = new Set(requiredPerms)
+      hardwarePerms.delete(PERMISSIONS.VM_CONFIG_MEDIA)
+      hardwarePerms.add(PERMISSIONS.VM_CONFIG_HARDWARE)
+      denied = await checkPermissions([...hardwarePerms], "vm", resourceId)
+    }
+    if (denied) return denied
+
+    // Datacenter User Tag Access / Registered Tags (#1208): PVE never applies
+    // them to the connection's own credentials, so they are checked here.
+    const deletesTags = typeof body.delete === 'string' && body.delete.split(',').some((k: string) => k.trim() === 'tags')
+    if (body.tags !== undefined || deletesTags) {
+      const tagDenied = await enforceGuestTagAccess({
+        connId: id, conn, oldTags: currentConfig?.tags, newTags: deletesTags ? '' : body.tags,
+      })
+      if (tagDenied) return tagDenied
+    }
+
+    // Only a slot that carries, or would carry, an optical drive is bound to
+    // the PVE digest: the media decision above was taken on that generation.
+    // Ordinary data disk edits keep their last-writer-wins behaviour.
+    const touchesOpticalDrive = (keys: string[]) => keys.some(key =>
+      /^(ide|sata|scsi)\d+$/.test(key) && (isOpticalDrive(currentConfig?.[key]) || isOpticalDrive(body[key])))
+    const hasOpticalDriveMutation = type === 'qemu' && (
+      touchesOpticalDrive(Object.keys(body)) ||
+      [body.delete, body.revert].some(value => typeof value === 'string' && touchesOpticalDrive(value.split(',').map((key: string) => key.trim())))
+    )
+    if (hasOpticalDriveMutation && requestedDigest !== undefined) {
+      if (typeof requestedDigest !== 'string' || !requestedDigest) {
+        return NextResponse.json({ error: 'Invalid configuration digest' }, { status: 400 })
+      }
+      if (currentConfig?.digest && requestedDigest !== currentConfig.digest) {
+        return NextResponse.json({ error: 'VM configuration changed; reload before saving' }, { status: 409 })
+      }
+    }
+
+    // ── vDC Quota Check (CPU/RAM increases) ──
+    let vdcInfo: Awaited<ReturnType<typeof resolveVdcForTenant>> = null
+    try {
+      vdcInfo = await resolveVdcForTenant(tenantId, id, node)
+
+      // vDC compute policy (#893): a tenant may only move the CPU model
+      // inside the allowed set and may not touch NUMA / flags / limit /
+      // units when the advanced switch is off. Keeping the current model
+      // (e.g. one a provider template shipped with) always passes.
+      if (vdcInfo && type === 'qemu') {
+        const verdict = validateCpuAgainstPolicy(vdcInfo.computePolicy, body, {
+          clusterCapabilities: await loadCpuCapabilitiesIfNeeded(vdcInfo.computePolicy, body, () =>
+            pveFetch<any[]>(conn, `/nodes/${encodeURIComponent(node)}/capabilities/qemu/cpu`),
+          ),
+          currentModel: parseCpuProperty(String(currentConfig?.cpu ?? '')).model || null,
+        })
+        if (verdict.ok === false) return NextResponse.json({ error: verdict.error }, { status: 400 })
+      }
+
+      if (vdcInfo && (body.cores || body.sockets || body.memory)) {
+        const currentVcpus = (currentConfig?.cores || 1) * (currentConfig?.sockets || 1)
+        const newCores = body.cores ? Number.parseInt(String(body.cores)) : (currentConfig?.cores || 1)
+        const newSockets = body.sockets ? Number.parseInt(String(body.sockets)) : (currentConfig?.sockets || 1)
+        const newVcpus = newCores * newSockets
+        const vcpuDelta = newVcpus - currentVcpus
+
+        const currentRamMb = currentConfig?.memory || 512
+        const newRamMb = body.memory ? Number.parseInt(String(body.memory)) : currentRamMb
+        const ramDelta = newRamMb - currentRamMb
+
+        // Only enforce quota when resources are INCREASING (decreases are always allowed)
+        if (vcpuDelta > 0 || ramDelta > 0) {
+          const quotaCheck = await checkVdcQuota(id, vdcInfo.poolName, vdcInfo.quota, {
+            type: 'config',
+            addVcpus: Math.max(0, vcpuDelta),
+            addRamMb: Math.max(0, ramDelta),
+            addVms: 0,
+          })
+
+          if (!quotaCheck.allowed) {
+            return NextResponse.json({
+              error: 'Quota exceeded',
+              violations: quotaCheck.violations,
+            }, { status: 409 })
+          }
+        }
+      }
+    } catch (e: any) {
+      if (e?.message === 'NODE_NOT_AUTHORIZED') {
+        return NextResponse.json({ error: 'This node is not authorized for your vDC' }, { status: 403 })
+      }
+      throw e
+    }
+
+    // Phase 4b: enforce the network allow-list (bridge name + VLAN tag/trunks)
+    const allowedNetworks = await getAllowedNetworksForTenant(tenantId, id)
+    const networkChanges = { ...body }
+    if (runningConfig && typeof body.revert === 'string') {
+      for (const key of body.revert.split(',').map((k: string) => k.trim())) {
+        if (/^net\d+$/.test(key) && runningConfig[key]) networkChanges[key] = runningConfig[key]
+      }
+    }
+    if (allowedNetworks !== null) {
+      for (const key of Object.keys(networkChanges)) {
+        if (!/^net\d+$/.test(key)) continue
+        const verdict = validateNetAgainstScope(String(networkChanges[key] || ""), allowedNetworks)
+        if (verdict.ok === false) return NextResponse.json({ error: verdict.error }, { status: 403 })
+      }
+    }
+
+    // Disk storage allow-list + storage-policy QoS stamping + quota metering
+    // (pre-existing hole: disk keys used to flow verbatim to PVE).
+    try {
+      const drives = await enforceTenantDrives({ tenantId, connectionId: id, type: type as 'qemu' | 'lxc', body })
+      if (drives && vdcInfo) {
+        // Import-from metering (Finding I2): PVE allocates a full-size
+        // volume for scsiN: "gold:0,import-from=gold:vm-100-disk-0", so meter
+        // the REAL source size rather than accept the tenant-declared zero.
+        if (drives.importRefs.length > 0) {
+          const imported = await meterImportRefs(conn, node, drives.importRefs)
+          for (const [storage, mb] of Object.entries(imported.addStorageMbByStorage)) {
+            drives.addStorageMbByStorage[storage] = (drives.addStorageMbByStorage[storage] ?? 0) + mb
+          }
+          drives.totalAddMb += imported.totalAddMb
+        }
+        if (drives.totalAddMb > 0) {
+          const quotaCheck = await checkVdcQuota(id, vdcInfo.poolName, vdcInfo.quota, {
+            type: 'config',
+            addStorageMb: drives.totalAddMb,
+            addStorageMbByStorage: drives.addStorageMbByStorage,
+          }, vdcInfo.storagePolicies, node)
+          if (!quotaCheck.allowed) {
+            return NextResponse.json({ error: 'Quota exceeded', violations: quotaCheck.violations }, { status: 409 })
+          }
+        }
+      }
+    } catch (e: any) {
+      if (e instanceof DriveScopeError) {
+        return NextResponse.json({ error: e.message }, { status: 403 })
+      }
+      throw e
+    }
+
+    // Sélectionner les champs autorisés selon le type
+    const allowedFields = type === 'qemu' ? ALLOWED_QEMU_FIELDS : ALLOWED_LXC_FIELDS
+
+    // Construire les données à envoyer à Proxmox
+    const formData = new URLSearchParams()
+    // Bind the authorization comparison to the exact PVE config generation.
+    if (hasNicMutation(body) && currentConfig.digest) formData.set('digest', String(currentConfig.digest))
+    
+    for (const [key, value] of Object.entries(body)) {
+      // body was already prefiltered to isForwardedConfigKey above; this
+      // re-check is a harmless double filter kept so the two never drift.
+      const isAllowed = isForwardedConfigKey(key, type as 'qemu' | 'lxc')
+
+      if (isAllowed && value !== undefined && value !== null) {
+        // PVE requires sshkeys to be URL-encoded inside the value (double-encoding)
+        if (key === 'sshkeys') {
+          formData.append(key, encodeURIComponent(String(value)))
+        } else {
+          formData.append(key, String(value))
+        }
+      }
+    }
+
+    if (formData.toString() === '') {
+      return NextResponse.json({ error: "No valid fields to update" }, { status: 400 })
+    }
+
+    // Bind the permission decision to the device generation inspected above.
+    // Keep a caller's matching digest; otherwise use PVE's current digest.
+    if (hasOpticalDriveMutation && (requestedDigest || currentConfig?.digest)) {
+      formData.set('digest', requestedDigest || String(currentConfig.digest))
+    }
+
+    // ── IPAM sync (qemu only) ──
+    // Reconcile our IPAM DB with the netN/ipconfigN changes the user is
+    // about to push. The helper handles the no-op case (no IPAM-managed
+    // bridge involved) cheaply, so this is safe to call unconditionally.
+    let ipamRollback: (() => Promise<void>) | null = null
+    if (type === 'qemu') {
+      const mergedMemory = mergeMemoryProperty(currentConfig?.memory, formData.get('memory'))
+
+      if (mergedMemory) formData.set('memory', mergedMemory)
+
+      const after = { ...currentConfig, ...body }
+      try {
+        const sync = await syncIpamForVmConfig({
+          before: currentConfig,
+          after,
+          conn,
+          connectionId: id,
+          vmid: Number(vmid),
+          hostname: typeof body.name === 'string' ? body.name : (currentConfig?.name ?? null),
+        })
+        ipamRollback = sync.rollback
+        // Patch the PVE PUT body with any ipconfigN corrections the
+        // allocator emitted (auto-pick, hint conflict resolution).
+        for (const [k, v] of Object.entries(sync.bodyOverrides)) {
+          formData.set(k, v)
+        }
+      } catch (err: any) {
+        if (err instanceof IpamHintUnavailableError) {
+          return NextResponse.json({ error: `IP unavailable: ${err.hint}` }, { status: 409 })
+        }
+        if (err instanceof IpamExhaustedError) {
+          return NextResponse.json({ error: `Subnet is full — no free IP available` }, { status: 409 })
+        }
+        throw err
+      }
+    }
+
+    // Proxmox: the write goes through PVE's asynchronous handler and we follow
+    // the task it spawns, so a slow apply (memory hotplug unplugs one DIMM at a
+    // time) can no longer abort on our side while PVE keeps working (#743).
+    let write: GuestConfigWriteResult
+    try {
+      write = await writeGuestConfig({
+        conn,
+        type,
+        node,
+        vmid,
+        body: formData.toString(),
+      })
+    } catch (err) {
+      // PVE rejected the write, or its task ended on an error: undo the IPAM
+      // mutations so the DB doesn't drift away from the unchanged qm config.
+      if (ipamRollback) {
+        try { await ipamRollback() } catch { /* tolerate */ }
+      }
+      throw err
+    }
+
+    // A disk may have been added, detached or removed: the next inventory
+    // fetch re-reads this guest's disk total instead of serving it cached (#938).
+    invalidateGuestDiskTotal(id, type, vmid)
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "update",
+      category: type === 'lxc' ? 'containers' : 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { node, connectionId: id, upid: write.upid, fields: Object.keys(body).filter(k => allowedFields.has(k) || /^net\d+$/.test(k) || /^(scsi|virtio|ide|sata)\d+$/.test(k) || /^efidisk\d+$/.test(k) || /^tpmstate\d+$/.test(k) || /^serial\d+$/.test(k) || /^hostpci\d+$/.test(k) || /^usb\d+$/.test(k) || /^audio\d+$/.test(k) || k === 'rng0') },
+    })
+
+    // The task outlived the budget we may hold the request for. Hand the caller
+    // the UPID so it keeps following it instead of reporting a failed save.
+    if (write.state === "running") {
+      return NextResponse.json(
+        { data: write.upid, success: true, pending: true, upid: write.upid, node: write.node },
+        { status: 202 },
+      )
+    }
+
+    return NextResponse.json({ data: write.upid, success: true })
+  } catch (e: any) {
+    if (e instanceof NicConfigError) return NextResponse.json({ error: e.message }, { status: 400 })
+    const excluded = licenseExcludedResponse(e)
+    if (excluded) return excluded
+    console.error("[PUT config] Error:", e)
+
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const GET = withPublicApiGuard("vm-config-get", getHandler)
+export const PUT = withAudit({ category: "vms", resourceType: "guest", resourceTypeParam: "type", resourceParam: "vmid" }, withPublicApiGuard("vm-config-update", putHandler))

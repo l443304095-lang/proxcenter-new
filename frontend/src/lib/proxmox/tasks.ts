@@ -1,0 +1,67 @@
+// src/lib/proxmox/tasks.ts
+//
+// Shared poller for asynchronous PVE operations. Used by every code path
+// that fires off a long-running PVE call (qemu create, qmrestore, qemu
+// clone, storage download-url, ...) and needs to wait for the actual
+// result before driving the next step.
+//
+// The endpoint /nodes/{node}/tasks/{upid}/status returns:
+//   - status === 'running'   → still in progress, retry after a delay
+//   - status === 'stopped'   → terminal; exitstatus tells us OK vs error
+
+import type { ProxmoxClientOptions } from './client'
+import { pveFetch } from './client'
+import { parseUpid } from './upid'
+
+export interface WaitForTaskOptions {
+  /** Total timeout in ms before we give up. Default 10 min. */
+  timeoutMs?: number
+  /** Polling interval in ms. Default 3 s. */
+  intervalMs?: number
+  /**
+   * Treat `WARNINGS: n` as success. PVE ends a task that did its job but
+   * logged warnings (e.g. pct clone on a Systemd 257 guest) this way.
+   */
+  acceptWarnings?: boolean
+}
+
+/**
+ * Poll a PVE task until it finishes. Throws on PVE-side failure or
+ * timeout, returns nothing on success.
+ *
+ * Caller convention: after a long-running POST/PUT/DELETE that returned
+ * a UPID string, await waitForTask(conn, node, upid) before assuming the
+ * action is complete on the cluster.
+ */
+export async function waitForTask(
+  conn: ProxmoxClientOptions,
+  node: string,
+  upid: string,
+  options: WaitForTaskOptions = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 600_000
+  const intervalMs = options.intervalMs ?? 3_000
+  const start = Date.now()
+  // The UPID names the node that runs the task. It is the only node that
+  // knows it: a clone with `target` runs on the source node and answers
+  // 400 "no such task" on the target (#1293). `node` is the fallback for a
+  // value that is not a UPID.
+  const taskNode = parseUpid(upid)?.node ?? node
+
+  while (Date.now() - start < timeoutMs) {
+    const status = await pveFetch<any>(
+      conn,
+      `/nodes/${encodeURIComponent(taskNode)}/tasks/${encodeURIComponent(upid)}/status`,
+    )
+
+    if (status?.status === 'stopped') {
+      if (status.exitstatus === 'OK') return
+      if (options.acceptWarnings && String(status.exitstatus).startsWith('WARNINGS')) return
+      throw new Error(`PVE task failed: ${status.exitstatus || 'unknown error'}`)
+    }
+
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
+
+  throw new Error(`PVE task timed out after ${Math.round(timeoutMs / 1000)}s`)
+}

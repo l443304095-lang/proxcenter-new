@@ -1,0 +1,497 @@
+import { NextResponse } from "next/server"
+import https from "node:https"
+import http from "node:http"
+import { randomUUID } from "node:crypto"
+
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { getPrincipal } from "@/lib/auth/principal"
+import { buildStorageResourceId, checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { guardTenantStorageWrite, tenantUploadFilename } from "@/lib/vdc/scope"
+import { setProgress, clearProgress } from "@/lib/upload-progress"
+import { UPLOAD_CHUNK_SIZE } from "@/lib/storage/uploadClient"
+import { licenseExcludedResponse } from "@/lib/api/response"
+import { isConnectionLicenseExcluded, licenseExcludedError } from "@/lib/license/exclusions"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+export const maxDuration = 600
+
+// Active streaming sessions: uploadId -> open connection to Proxmox
+const streamingSessions = new Map<string, {
+  proxyReq: http.ClientRequest
+  boundary: string
+  // Target filename of the first chunk: the finalize request carries no
+  // X-File-Name, and the write guard must judge the same name on both legs.
+  fileName: string
+  bytesSent: number
+  totalFormLength: number
+  // Index of the next chunk to write. A lower index was already written and
+  // is only acknowledged again (a retry after its reply was lost); a higher
+  // one means a chunk is missing.
+  nextChunk: number
+  // Writes to Proxmox, chained in chunk order.
+  writing: Promise<void>
+  // Set when a write failed and ended the session, to tell it from a stop.
+  failed?: boolean
+  // File bytes accepted so far (written or queued), against the size the
+  // first chunk announced.
+  receivedBytes: number
+  fileSize: number
+  // A chunk is queued or being written: the next one waits for it.
+  writeInFlight: boolean
+  resolve: (value: { statusCode: number; body: string }) => void
+  reject: (reason: any) => void
+  resultPromise: Promise<{ statusCode: number; body: string }>
+}>()
+
+type StreamingSession = NonNullable<ReturnType<typeof streamingSessions.get>>
+
+// How long a chunk request waits for its write to Proxmox before answering
+// 202. Well under the 60 s proxy_read_timeout of nginx/proxcenter-locations.conf:
+// past it the proxy answers 504 and the browser never learns the chunk is in.
+const CHUNK_ACK_WAIT_MS = 25_000
+
+class UploadCancelled extends Error {}
+
+// Read a chunk whole, but never more than `limit` bytes: it is held in
+// memory until Proxmox takes it. Null when the body runs past the limit.
+async function readChunkBody(body: ReadableStream<Uint8Array>, limit: number): Promise<Buffer | null> {
+  const reader = body.getReader()
+  const parts: Uint8Array[] = []
+  let size = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) return Buffer.concat(parts)
+    size += value.byteLength
+    if (size > limit) {
+      await reader.cancel().catch(() => { /* the body is dropped anyway */ })
+      return null
+    }
+    parts.push(value)
+  }
+}
+
+// Answer a chunk once its write (and every write before it) is through, or
+// 202 when that takes longer than CHUNK_ACK_WAIT_MS: the browser then asks
+// again without the body.
+async function acknowledgeChunk(uploadId: string, session: StreamingSession, chunkIndex: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const waited = new Promise<"pending">(resolve => { timer = setTimeout(() => resolve("pending"), CHUNK_ACK_WAIT_MS) })
+
+  try {
+    const outcome = await Promise.race([session.writing.then(() => "written" as const), waited])
+
+    if (outcome === "pending") {
+      return NextResponse.json({ pending: true, chunkIndex, uploadId }, { status: 202 })
+    }
+
+    return NextResponse.json({ ok: true, chunkIndex, bytesSent: session.bytesSent })
+  } catch (e: any) {
+    if (e instanceof UploadCancelled || (!session.failed && streamingSessions.get(uploadId) !== session)) {
+      return NextResponse.json({ cancelled: true, uploadId }, { status: 409 })
+    }
+
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// Build multipart form parts (without file data)
+function buildMultipartParts(boundary: string, contentType: string, fileName: string, mimeType: string) {
+  const contentField =
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="content"\r\n\r\n` +
+    `${contentType}\r\n`
+
+  const fileHeader =
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="filename"; filename="${fileName}"\r\n` +
+    `Content-Type: ${mimeType}\r\n\r\n`
+
+  const closing = `\r\n--${boundary}--\r\n`
+
+  return { contentField, fileHeader, closing }
+}
+
+// POST /api/v1/connections/{id}/nodes/{node}/storage/{storage}/upload
+// Modes (via headers):
+//   X-Chunk-Index: stream a chunk directly to Proxmox
+//   X-Finalize: close the multipart form and get the Proxmox response
+async function handlePost(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string; storage: string }> }
+) {
+  const uploadId = req.headers.get("x-upload-id") || randomUUID()
+  const isChunk = req.headers.has("x-chunk-index")
+  const isFinalize = req.headers.has("x-finalize")
+
+  if (isChunk) return handleChunk(req, ctx, uploadId)
+  if (isFinalize) return handleFinalize(req, ctx, uploadId)
+  return NextResponse.json({ error: "Missing X-Chunk-Index or X-Finalize header" }, { status: 400 })
+}
+
+// DELETE /api/v1/connections/{id}/nodes/{node}/storage/{storage}/upload
+//
+// Stop an upload in flight from its task row (#974). The browser stops sending
+// chunks on its own (it holds the AbortController), but the half-written
+// connection to Proxmox is ours: without this, it sits there until the 600 s
+// timeout with a Content-Length it will never satisfy. Destroying it makes
+// Proxmox drop the partial multipart body, and PVE only moves an upload into
+// place once it has received all of it, so nothing is left on the storage.
+async function handleDelete(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string; storage: string }> }
+) {
+  const uploadId = req.headers.get("x-upload-id")
+
+  try {
+    const { id, storage } = await ctx.params
+
+    const denied = await checkPermission(PERMISSIONS.STORAGE_UPLOAD, "storage", buildStorageResourceId(id, storage))
+    if (denied) return denied
+
+    if (!uploadId) {
+      return NextResponse.json({ error: "Missing X-Upload-Id header" }, { status: 400 })
+    }
+
+    const session = streamingSessions.get(uploadId)
+    if (!session) {
+      // Already finished, already cancelled, or the id belongs to nothing.
+      return NextResponse.json({ error: "No upload in flight for this id" }, { status: 404 })
+    }
+
+    streamingSessions.delete(uploadId)
+    session.proxyReq.destroy(new Error("Upload stopped by the operator"))
+    // A finalize leg already waiting is released here rather than left hanging
+    // on a Proxmox answer that is never coming. When none is waiting, the
+    // handler attached at session creation is what keeps this from surfacing
+    // as an unhandled rejection.
+    session.reject(new Error("Upload stopped by the operator"))
+    setProgress(uploadId, {
+      bytesSent: session.bytesSent,
+      totalBytes: session.totalFormLength,
+      status: "cancelled",
+    })
+    setTimeout(() => clearProgress(uploadId), 30_000)
+
+    console.log(`[upload] Cancelled uploadId=${uploadId} after ${session.bytesSent} bytes`)
+
+    return NextResponse.json({ success: true, uploadId, bytesSent: session.bytesSent })
+  } catch (e: any) {
+    console.error("Error cancelling upload:", e)
+
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// ── Chunk handler: open connection on first chunk, stream data directly ──
+async function handleChunk(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string; storage: string }> },
+  uploadId: string
+) {
+  try {
+    const { id, node, storage } = await ctx.params
+
+    const denied = await checkPermission(PERMISSIONS.STORAGE_UPLOAD, "storage", buildStorageResourceId(id, storage))
+    if (denied) return denied
+
+    // This write goes to Proxmox directly, not through pveFetch: the license
+    // guard of a cluster declared outside the license applies by hand
+    // (roadmap#58), before any byte is streamed.
+    if (await isConnectionLicenseExcluded(id)) {
+      return licenseExcludedResponse(await licenseExcludedError(id))!
+    }
+
+    const chunkIndex = Number.parseInt(req.headers.get("x-chunk-index") || "0", 10)
+    const totalSize = Number.parseInt(req.headers.get("x-total-size") || "0", 10)
+    // On an ISO library that allows uploads, a tenant's file is namespaced
+    // `custom-<slug>-*` server-side (the browser sends the raw name), and the
+    // guard then only lets the tenant write its own files (#894).
+    const contentType = req.headers.get("x-content-type") || "iso"
+    const fileName = await tenantUploadFilename(id, storage, req.headers.get("x-file-name") || "upload")
+    const storageBlock = await guardTenantStorageWrite(id, storage, { filename: fileName, content: contentType })
+    if (storageBlock) return storageBlock
+    const mimeType = req.headers.get("x-mime-type") || "application/octet-stream"
+
+    let session = streamingSessions.get(uploadId)
+
+    // Already written: a retry whose earlier reply was lost (a proxy 504), or
+    // the browser asking again after a 202. The body, if any, is not needed.
+    if (session && chunkIndex < session.nextChunk) {
+      return await acknowledgeChunk(uploadId, session, chunkIndex)
+    }
+
+    // Past the first chunk with no session: the session was dropped (failed
+    // write, stop, restart). Opening a new one here would stream the rest of
+    // the file under the full length, and Proxmox stores what it received as
+    // a complete, truncated file.
+    if (!session && chunkIndex > 0) {
+      return NextResponse.json(
+        { error: "The upload was interrupted on the server side. Start it again.", code: "UPLOAD_SESSION_LOST", uploadId },
+        { status: 409 }
+      )
+    }
+
+    if (session && chunkIndex > session.nextChunk) {
+      return NextResponse.json(
+        { error: `Chunk ${session.nextChunk} never arrived. Start the upload again.`, code: "UPLOAD_CHUNK_MISSING", uploadId },
+        { status: 409 }
+      )
+    }
+
+    if (!req.body) {
+      return NextResponse.json({ error: "Missing body" }, { status: 400 })
+    }
+
+    // One chunk in memory per upload: the browser waits for each chunk's
+    // answer (or asks again after a 202) before sending the next one.
+    if (session?.writeInFlight) {
+      return NextResponse.json({ error: `Chunk ${chunkIndex - 1} is still being written`, uploadId }, { status: 429 })
+    }
+
+    // Read the whole chunk before writing any of it. Streamed straight to
+    // Proxmox, its read followed Proxmox's pace: when the proxy gave up first,
+    // the read aborted half way and took the whole session down.
+    let data: Buffer | null
+    try {
+      data = await readChunkBody(req.body, UPLOAD_CHUNK_SIZE)
+    } catch {
+      return NextResponse.json({ error: `Chunk ${chunkIndex} was cut off in transit`, uploadId }, { status: 400 })
+    }
+    const announced = session ? session.fileSize : totalSize
+    if (!data || (session?.receivedBytes ?? 0) + data.byteLength > announced) {
+      return NextResponse.json({ error: `Chunk ${chunkIndex} is larger than the upload allows`, uploadId }, { status: 413 })
+    }
+
+    // First chunk: open connection to Proxmox
+    if (!session) {
+      const conn = await getConnectionById(id)
+      const baseUrl = conn.baseUrl.replace(/(?<!\/)\/+$/, "")
+      const targetUrl = new URL(
+        `${baseUrl}/api2/json/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/upload`
+      )
+
+      const boundary = `----ProxCenterUpload${randomUUID().replaceAll(/-/g, "")}`
+      const parts = buildMultipartParts(boundary, contentType, fileName, mimeType)
+
+      // Calculate total Content-Length: preamble + file data + closing
+      const preambleLength = Buffer.byteLength(parts.contentField + parts.fileHeader, "utf-8")
+      const closingLength = Buffer.byteLength(parts.closing, "utf-8")
+      const totalFormLength = preambleLength + totalSize + closingLength
+
+      const isHttps = targetUrl.protocol === "https:"
+      const transport = isHttps ? https : http
+      const agent = isHttps && conn.insecureDev
+        ? new https.Agent({ rejectUnauthorized: false })
+        : undefined
+
+      // Stamp the owner on the entry the first chunk creates: the progress
+      // route hands the counters back to that user and to nobody else (#699).
+      // Resolved here only, the per-chunk updates below inherit it.
+      const principalResult = await getPrincipal()
+      const ownerId = principalResult.ok ? principalResult.principal?.userId || null : null
+
+      setProgress(uploadId, { bytesSent: 0, totalBytes: totalSize, status: "transferring" }, ownerId)
+
+      let resolveResult: any
+      let rejectResult: any
+      const resultPromise = new Promise<{ statusCode: number; body: string }>((res, rej) => {
+        resolveResult = res
+        rejectResult = rej
+      })
+
+      // Only the finalize leg awaits this promise, and on a stopped or failed
+      // upload that leg never runs: the rejection would then reach the process
+      // as an unhandled one. This handler makes it handled without swallowing
+      // anything, since an awaiting finalize still sees the rejection through
+      // its own await.
+      resultPromise.catch(() => { /* nobody left to tell */ })
+
+      const proxyReq = transport.request(
+        {
+          hostname: targetUrl.hostname,
+          port: targetUrl.port || (isHttps ? 443 : 80),
+          path: targetUrl.pathname + targetUrl.search,
+          method: "POST",
+          agent,
+          headers: {
+            "Authorization": `PVEAPIToken=${conn.apiToken}`,
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": totalFormLength,
+          },
+          timeout: 600_000,
+        },
+        (res) => {
+          const chunks: Buffer[] = []
+          res.on("data", (chunk) => chunks.push(chunk))
+          res.on("end", () => {
+            resolveResult({
+              statusCode: res.statusCode || 500,
+              body: Buffer.concat(chunks).toString("utf-8"),
+            })
+          })
+          res.on("error", rejectResult)
+        }
+      )
+
+      proxyReq.on("error", rejectResult)
+
+      // Write the multipart preamble (content field + file headers)
+      proxyReq.write(parts.contentField + parts.fileHeader)
+
+      session = {
+        proxyReq,
+        boundary,
+        fileName,
+        bytesSent: 0,
+        totalFormLength,
+        nextChunk: 0,
+        writing: Promise.resolve(),
+        receivedBytes: 0,
+        fileSize: totalSize,
+        writeInFlight: false,
+        resolve: resolveResult,
+        reject: rejectResult,
+        resultPromise,
+      }
+      streamingSessions.set(uploadId, session)
+
+      console.log(`[upload] Streaming "${fileName.replaceAll(/[\r\n]/g, '')}" (${totalSize} bytes) directly to Proxmox, uploadId=${uploadId}`)
+    }
+
+    // Queue the write behind the previous chunks. The chunk counts as received
+    // from here on, so a retry of it is acknowledged instead of written twice.
+    const current = session
+    const bytes = data
+    current.nextChunk = chunkIndex + 1
+    current.receivedBytes += bytes.byteLength
+    current.writeInFlight = true
+    const write = current.writing.then(async () => {
+      // A stop (#974) drops the session. Write nothing more: progress would
+      // read "transferring" over the cancelled entry, and a browser that
+      // reloaded and is polling it would never learn the transfer was stopped.
+      if (streamingSessions.get(uploadId) !== current) throw new UploadCancelled()
+
+      await new Promise<void>((resolve, reject) => {
+        current.proxyReq.write(bytes, (err: any) => (err ? reject(err) : resolve()))
+      })
+      current.bytesSent += bytes.byteLength
+      setProgress(uploadId, { bytesSent: current.bytesSent, totalBytes: totalSize || current.totalFormLength, status: "transferring" })
+    })
+    current.writing = write
+    void write.finally(() => { current.writeInFlight = false }).catch(() => { /* reported below */ })
+    // A failed write ends the session, whether or not a request still waits
+    // on it: the next chunk then gets UPLOAD_SESSION_LOST.
+    write.catch((e) => {
+      if (e instanceof UploadCancelled || streamingSessions.get(uploadId) !== current) return
+      console.error("Error streaming chunk:", e)
+      current.failed = true
+      current.proxyReq.destroy()
+      streamingSessions.delete(uploadId)
+    })
+
+    return await acknowledgeChunk(uploadId, current, chunkIndex)
+  } catch (e: any) {
+    const session = streamingSessions.get(uploadId)
+
+    // No session left means a stop destroyed the request under this write
+    // ("Cannot call write after a stream was destroyed"). That is the outcome
+    // the operator asked for, not a server error to log and report as one.
+    if (!session) {
+      return NextResponse.json({ cancelled: true, uploadId }, { status: 409 })
+    }
+
+    console.error("Error streaming chunk:", e)
+    session.proxyReq.destroy()
+    streamingSessions.delete(uploadId)
+
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// ── Finalize handler: close multipart boundary, wait for Proxmox response ──
+async function handleFinalize(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string; storage: string }> },
+  uploadId: string
+) {
+  try {
+    const { id, node, storage } = await ctx.params
+
+    const denied = await checkPermission(PERMISSIONS.STORAGE_UPLOAD, "storage", buildStorageResourceId(id, storage))
+    if (denied) return denied
+
+    const finalizeName = req.headers.get("x-file-name")
+    const storageBlock = await guardTenantStorageWrite(id, storage, {
+      filename: finalizeName
+        ? await tenantUploadFilename(id, storage, finalizeName)
+        : (streamingSessions.get(uploadId)?.fileName || null),
+    })
+    if (storageBlock) return storageBlock
+
+    const session = streamingSessions.get(uploadId)
+    if (!session) {
+      return NextResponse.json({ error: "No streaming session found. Send chunks first." }, { status: 400 })
+    }
+
+    // Every chunk was acknowledged, so its write is through; this only holds
+    // back a finalize sent while a chunk was still pending.
+    await session.writing
+
+    // Write closing boundary
+    const closing = `\r\n--${session.boundary}--\r\n`
+    await new Promise<void>((resolve, reject) => {
+      session.proxyReq.write(closing, (err: any) => (err ? reject(err) : resolve()))
+    })
+    session.proxyReq.end()
+
+    // Wait for Proxmox response
+    const result = await session.resultPromise
+
+    console.log(`[upload] Proxmox responded ${result.statusCode}:`, result.body.substring(0, 500))
+
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      let errMsg = `Proxmox returned ${result.statusCode}`
+      try {
+        const json = JSON.parse(result.body)
+        errMsg = json.errors ? JSON.stringify(json.errors) : json.message || errMsg
+      } catch { /* use default */ }
+      setProgress(uploadId, { bytesSent: session.bytesSent, totalBytes: session.totalFormLength, status: "error", error: errMsg })
+      return NextResponse.json({ error: errMsg, uploadId }, { status: result.statusCode })
+    }
+
+    setProgress(uploadId, { bytesSent: session.bytesSent, totalBytes: session.bytesSent, status: "done" })
+
+    let data = null
+    try {
+      const json = JSON.parse(result.body)
+      data = json.data
+    } catch { /* ignore */ }
+
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "update" as any,
+      category: "storage",
+      resourceType: "storage",
+      resourceId: storage,
+      details: { node, connectionId: id, operation: "upload" },
+    })
+
+    // `filename` is the name the file was stored under: on an ISO library a
+    // tenant upload is namespaced server-side, so the caller cannot assume the
+    // name it sent (#894).
+    return NextResponse.json({ success: true, data, uploadId, filename: session.fileName })
+  } catch (e: any) {
+    console.error("Error finalizing upload:", e)
+    setProgress(uploadId, { bytesSent: 0, totalBytes: 0, status: "error", error: e?.message || String(e) })
+    return NextResponse.json({ error: e?.message || String(e), uploadId }, { status: 500 })
+  } finally {
+    streamingSessions.delete(uploadId)
+    setTimeout(() => clearProgress(uploadId), 30_000)
+  }
+}
+
+export const POST = withAudit({ category: "storage", resourceType: "storage", resourceParam: "storage", action: "import" }, handlePost)
+export const DELETE = withAudit({ category: "storage", resourceType: "storage", resourceParam: "storage", action: "import" }, handleDelete)

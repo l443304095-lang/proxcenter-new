@@ -1,0 +1,76 @@
+import { NextResponse } from "next/server"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { invalidateInventoryCache } from "@/lib/cache/inventoryCache"
+import { guardSessionGuest } from "@/lib/vdc/guestGuard"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+// POST /api/v1/connections/{id}/guests/{type}/{node}/{vmid}/template
+// Convert a VM to a template (irreversible, VM must be stopped)
+async function handler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> | { id: string; type: string; node: string; vmid: string } }
+) {
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const { id, type, node, vmid } = params as { id: string; type: string; node: string; vmid: string }
+
+    if (!id || !type || !node || !vmid) {
+      return NextResponse.json({ error: "Missing required parameters" }, { status: 400 })
+    }
+
+    if (type !== 'qemu' && type !== 'lxc') {
+      return NextResponse.json({ error: "Type must be 'qemu' or 'lxc'" }, { status: 400 })
+    }
+
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_CONFIG_HARDWARE, "vm", resourceId)
+
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+
+    // A vDC session may only convert a guest of its own pools.
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    // Proxmox endpoint: POST /nodes/{node}/{qemu|lxc}/{vmid}/template
+    const endpoint = `/nodes/${encodeURIComponent(node)}/${type}/${encodeURIComponent(vmid)}/template`
+
+    const result = await pveFetch<any>(conn, endpoint, {
+      method: "POST",
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    })
+
+    invalidateInventoryCache()
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "update",
+      category: type === 'lxc' ? 'containers' : 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { node, connectionId: id, action: 'convert_to_template' },
+    })
+
+    return NextResponse.json({
+      data: result,
+      message: "Convert to template operation started"
+    })
+  } catch (e: any) {
+    console.error('Error converting VM to template:', e)
+
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const POST = withAudit({ category: "vms", resourceType: "guest", resourceTypeParam: "type", resourceParam: "vmid", action: "update" }, withPublicApiGuard("vm-template", handler))

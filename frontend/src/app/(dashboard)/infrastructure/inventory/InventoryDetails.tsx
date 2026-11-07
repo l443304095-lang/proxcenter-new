@@ -1,0 +1,5056 @@
+'use client'
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import { isSharedStorage } from '@/lib/proxmox/storage'
+import { putGuestConfig } from '@/lib/proxmox/guestConfigClient'
+
+import { useProxCenterTasks } from '@/contexts/ProxCenterTasksContext'
+import { useHostsByConnection } from '@/hooks/useHosts'
+import { OPEN_BULK_BATCH_EVENT, type OpenBulkBatchDetail } from '@/lib/migration/bulkBatchOpen'
+import { emptyMigrationStats, sumMigrationStats, type MigrationStats } from '@/lib/migration/migration-stats'
+import { bulkBatchFromPayload, bulkLogOffsets, bulkRowsFromBatch, bulkSourceTypeLabel, fetchActiveBulkBatch, fetchBulkBatch, isBulkBatchFinished, shouldTrackBulkJob, type BatchPayload, type BulkMigBatch, type BulkMigJobRow } from './bulkJobList'
+import { mergeJobLogs } from '@/lib/migration/jobLogs'
+import { useFavorites } from './hooks/useFavorites'
+import { hypervDiskPathsFromScan, useMigrationOptions } from './hooks/useMigrationOptions'
+import { useSnapshots } from './hooks/useSnapshots'
+import { useTasks } from './hooks/useTasks'
+import { useNotes } from './hooks/useNotes'
+import { useHA } from './hooks/useHA'
+import { formatBytes } from '@/utils/format'
+import { getDateLocale } from '@/lib/i18n/date'
+import { useCopyToClipboard } from '@/lib/clipboard'
+import { useRBAC } from '@/contexts/RBACContext'
+import { useCephNoout } from '@/hooks/useCephNoout'
+import { waitForNodeMaintenance } from '@/lib/inventory/waitForNodeMaintenance'
+import CephNooutChip from '@/components/ceph/CephNooutChip'
+import CephNooutOption from '@/components/ceph/CephNooutOption'
+
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Alert,
+  Autocomplete,
+  Box,
+  Breadcrumbs,
+  Button,
+  ButtonBase,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  Grid,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  LinearProgress,
+  List,
+  ListItem,
+  ListItemButton,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
+  Popover,
+  Select,
+  Slider,
+  Stack,
+  Step,
+  StepLabel,
+  Stepper,
+  Switch,
+  Tab,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TablePagination,
+  TableRow,
+  TableSortLabel,
+  Tabs,
+  TextField,
+  ToggleButton,
+  ToggleButtonGroup,
+  Tooltip as MuiTooltip,
+  Typography,
+  useTheme,
+} from '@mui/material'
+import { lighten, alpha } from '@mui/material/styles'
+// RemixIcon replacements for @mui/icons-material
+import { AreaChart, Area, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, BarChart, Bar, CartesianGrid, Legend } from 'recharts'
+import ChartContainer from '@/components/ChartContainer'
+
+import VmsTable, { VmRow } from '@/components/VmsTable'
+import VmFirewallTab from '@/components/VmFirewallTab'
+import ClusterFirewallTab from '@/components/ClusterFirewallTab'
+import BackupJobsPanel from './BackupJobsPanel'
+import RollingUpdateWizard from '@/components/RollingUpdateWizard'
+import { useLicense, Features } from '@/contexts/LicenseContext'
+import { useToast } from '@/contexts/ToastContext'
+import { requireOk } from '@/lib/api/fetchJsonSafe'
+import { useTaskTracker } from '@/hooks/useTaskTracker'
+import type { Status, InventorySelection, Kpi, KV, UtilMetric, DetailsPayload, RrdTimeframe, SeriesPoint, ActiveDialog } from './types'
+import { humanizePveError, optionSaveBody, TAG_PALETTE, hashStringToInt, parseTags, formatBps, formatTime, formatUptime, parseMarkdown, parseNodeId, parseVmId, getMetricIcon, pickNumber, buildSeriesFromRrd, fetchRrd, fetchRrdRange, fetchDetails, proxmoxWebUiOrigin, proxmoxNodeWebUiOrigin } from './helpers'
+import { timeframeForWindow, type RrdRangeMeta, type RrdWindow } from '@/lib/metrics/rrdRange'
+import type { MetricsRangeValue } from '@/components/metrics/MetricsRangeSelector'
+import { useTagColors } from '@/contexts/TagColorContext'
+import { useTenant } from '@/contexts/TenantContext'
+import { useGuestSelection, GuestSelectionBar } from '@/components/GuestSelection'
+import { useMyVdcs } from '@/hooks/useMyVdcs'
+import { readVdcContextCookie } from '@/lib/vdc/contextCookie'
+import { blankVmVdcs } from '@/lib/vdc/blankVms'
+import { showRootGuestList } from './rootGuestList'
+import { useRouter } from 'next/navigation'
+import { getOsSvgIcon } from '@/lib/utils/osIcons'
+import GuestOsLogo from '@/components/ui/GuestOsLogo'
+import MigrationVmGlyph from '@/components/migration/MigrationVmGlyph'
+import RootInventoryView from './RootInventoryView'
+import StorageDashboard from './StorageDashboard'
+import NetworkDashboard from './NetworkDashboard'
+import BackupDashboard from './BackupDashboard'
+import MigrationDashboard from './MigrationDashboard'
+import { ViewMode, AllVmItem, HostItem, PoolItem, TagItem, NodeIcon, ClusterIcon, StatusIcon } from './InventoryTree'
+import NetworkDetailPanel from './components/NetworkDetailPanel'
+import TenantVnetDetailPanel from './TenantVnetDetailPanel'
+import TagManager from './components/TagManager'
+import EntityTagManager from './components/EntityTagManager'
+import VmActions from './components/VmActions'
+import NodeActions from './components/NodeActions'
+import WarmCutoverButton, { canRequestCutover, isAwaitingOperator } from './components/WarmCutoverButton'
+import MigrationLogLines from './components/MigrationLogLines'
+import LiveLogBox from '@/components/ui/LiveLogBox'
+import { migrationLogText } from './migrationLogText'
+import ForcePowerOffButton, { isAwaitingPowerOff } from './components/ForcePowerOffButton'
+import RootChoiceButton, { isAwaitingRootChoice } from './components/RootChoiceButton'
+import { statusChipLabelKey, waitIconClass, waitTitleKey, isWaitDisplayKey } from './components/migrationWaitDisplay'
+import UsageBar from './components/UsageBar'
+import ConsolePreview from './components/ConsolePreview'
+import StatusChip from './components/StatusChip'
+import { AreaPctChart, AreaBpsChart2 } from './components/RrdCharts'
+import GroupedVmsView from './components/GroupedVmsView'
+import InventorySummary from './components/InventorySummary'
+import { useNodeSensors } from './hooks/useNodeSensors'
+import StorageIntermediatePanel from './components/StorageIntermediatePanel'
+import StorageDetailPanel from './components/StorageDetailPanel'
+import ExpandableChart from './components/ExpandableChart'
+import StorageContentGroup from './components/StorageContentGroup'
+import PbsServerPanel, { type PbsServerPanelHandle } from './components/PbsServerPanel'
+import InventoryDialogs, { type NodeActionFailedVm } from './components/InventoryDialogs'
+import ExternalHypervisorDashboard from './components/ExternalHypervisorDashboard'
+import { useDetailData } from './hooks/useDetailData'
+import { useLiveVmStatus } from './hooks/useLiveVmStatus'
+import { useVmActions } from './hooks/useVmActions'
+import { useHardwareHandlers } from './hooks/useHardwareHandlers'
+import VmDetailTabs from './tabs/VmDetailTabs'
+import GreenScoreCard from '@/components/inventory/GreenScoreCard'
+import ClusterTabs from './tabs/ClusterTabs'
+import NodeTabs from './tabs/NodeTabs'
+import { UploadDialog } from '@/components/storage/StorageContentBrowser'
+import TemplateDownloadDialog from '@/components/storage/TemplateDownloadDialog'
+import { loadNodeAptUpdates } from '@/lib/proxmox/loadNodeAptUpdates'
+import { PAGE_SIZES } from '@/components/ui/PagedRows'
+import { countExtVmPower, filterExtVms, filteredSelectionState, toggleFilteredSelection, type ExtVmPowerFilter } from './extVmList'
+import { isNodeReachable } from './nodeStatusMeta'
+import { mergeVirtV2vSupport, type VirtV2vSupport } from '@/lib/migration/warm/virt-v2v-windows'
+import { useSelectionGuard } from '@/hooks/useSelectionGuard'
+
+/**
+ * Rang de l'onglet Sauvegardes d'une VM dans `VmDetailTabs` (Résumé, Matériel,
+ * Options, Historique, Sauvegardes...). À garder aligné sur l'ordre des `Tab`
+ * qui y sont déclarés, comme l'index 7 de la réplication plus bas.
+ */
+const VM_BACKUPS_TAB_INDEX = 4
+
+/* ------------------------------------------------------------------ */
+/* Main component                                                     */
+/* ------------------------------------------------------------------ */
+
+
+export default function InventoryDetails({
+  selection,
+  onSelect,
+  onBack,
+  viewMode = 'tree',
+  onViewModeChange,
+  allVms = [],
+  inventoryLoaded = false,
+  hosts = [],
+  pools = [],
+  tags = [],
+  pbsServers = [],
+  showIpSnap = false,
+  ipSnapLoading = false,
+  onLoadIpSnap,
+  onRefresh,
+  favorites: propFavorites,
+  onToggleFavorite: propToggleFavorite,
+  migratingVmIds,
+  pendingActionVmIds,
+  onVmActionStart,
+  onVmActionEnd,
+  onOptimisticVmStatus,
+  onVmTagsChange,
+  clusterStorages = [],
+  externalHypervisors = [],
+  externalDialogRequest,
+  onExternalDialogHandled,
+  nodeActionRequest,
+  onNodeActionHandled,
+}: {
+  selection: InventorySelection | null
+  onSelect?: (sel: InventorySelection) => void
+  onBack?: () => void
+  viewMode?: ViewMode
+  onViewModeChange?: (mode: ViewMode) => void
+  allVms?: AllVmItem[]
+  inventoryLoaded?: boolean  // the first inventory stream has ended (an empty allVms is then really empty)
+  hosts?: HostItem[]
+  pools?: PoolItem[]
+  tags?: TagItem[]
+  pbsServers?: import('./InventoryTree').TreePbsServer[]
+  showIpSnap?: boolean
+  ipSnapLoading?: boolean
+  onLoadIpSnap?: (vms: VmRow[]) => void
+  onRefresh?: () => Promise<void>  // Callback pour rafraîchir les données
+  favorites?: Set<string>  // Favoris partagés depuis le parent
+  onToggleFavorite?: (vm: { connId: string; node: string; type: string; vmid: string | number; name?: string }) => void
+  migratingVmIds?: Set<string>  // IDs des VMs en cours de migration
+  pendingActionVmIds?: Set<string>  // IDs des VMs avec action en cours
+  onVmActionStart?: (connId: string, vmid: string) => void
+  onVmActionEnd?: (connId: string, vmid: string) => void
+  onOptimisticVmStatus?: (connId: string, vmid: string, status: string) => void
+  onVmTagsChange?: (connId: string, vmid: string, tags: string[]) => void
+  clusterStorages?: import('./InventoryTree').TreeClusterStorage[]
+  externalHypervisors?: { id: string; name: string; type: string; vms?: { vmid: string; name: string; status: string }[] }[]
+  externalDialogRequest?: { type: 'createVm' | 'createLxc'; connId: string; node: string; ts: number } | null
+  onExternalDialogHandled?: () => void
+  nodeActionRequest?: { action: 'reboot' | 'shutdown'; connId: string; node: string; ts: number } | null
+  onNodeActionHandled?: () => void
+}) {
+  const t = useTranslations()
+  const dateLocale = getDateLocale(useLocale())
+  const theme = useTheme()
+  const detailConnId = selection?.type === 'cluster' ? selection.id : selection?.type === 'node' ? parseNodeId(selection.id).connId : selection?.type === 'vm' ? parseVmId(selection.id).connId : undefined
+  const { getColor: getTagColor, loadConnection } = useTagColors(detailConnId)
+
+  // Node temperatures, fetched once here and shared: the board reading sits in
+  // the header next to the host name, the per-role ones next to their usage bar
+  // in the summary. Only a node selection has anything to read.
+  const { sensors: nodeSensors } = useNodeSensors(
+    selection?.type === 'node' ? parseNodeId(selection.id).connId : undefined,
+    selection?.type === 'node' ? parseNodeId(selection.id).node : undefined,
+  )
+
+  // Load PVE tag color overrides for all connections present in allVms
+  React.useEffect(() => {
+    const connIds = new Set(allVms.map((vm: any) => vm.connId).filter(Boolean))
+    connIds.forEach(id => loadConnection(id))
+  }, [allVms, loadConnection])
+  const { hasFeature, isEnterprise, loading: licenseLoading } = useLicense()
+  const toast = useToast()
+  const logCopy = useCopyToClipboard()
+  // Migration panel cards (Transfer metrics, Migration logs): each collapses
+  // from its header so the other gets the room, the choice remembered per
+  // viewer; the logs can also open full size. Browser storage is a convenience
+  // only: a blocked or empty store just means both cards open.
+  const MIG_PANEL_KEY = 'proxcenter.migrationPanel'
+  const [migPanel, setMigPanel] = useState<{ metrics: boolean; logs: boolean }>(() => {
+    try {
+      const v = typeof window !== 'undefined' ? JSON.parse(window.localStorage.getItem(MIG_PANEL_KEY) || 'null') : null
+      if (v && typeof v.metrics === 'boolean' && typeof v.logs === 'boolean') return v
+    } catch { /* storage unavailable: defaults */ }
+    return { metrics: true, logs: true }
+  })
+  const toggleMigPanel = (card: 'metrics' | 'logs') => setMigPanel(prev => {
+    const next = { ...prev, [card]: !prev[card] }
+    try { window.localStorage.setItem(MIG_PANEL_KEY, JSON.stringify(next)) } catch { /* storage unavailable */ }
+    return next
+  })
+  const [migLogsFull, setMigLogsFull] = useState(false)
+  // LXC sharing the host kernel doesn't give strong-enough multi-tenant
+  // isolation. Tenants on a shared cluster see only "Create VM" — the
+  // provider keeps the LXC option for lightweight workloads on dedicated
+  // setups. Same gate is used to funnel tenants through the template
+  // catalogue instead of the bare-metal Create VM dialog.
+  const { currentTenant, loading: tenantLoading, isFullClusterView } = useTenant()
+  const { hasPermission } = useRBAC()
+  const canCreate = hasPermission('vm.create')
+  // connectionId → vDC name (tenant IaaS): powers the vDC chip and the vDC
+  // column. Bijective per the DB unique (tenant_id, connection_id).
+  const { vdcs: myVdcs } = useMyVdcs()
+  const vdcNameByConn = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const v of myVdcs) {
+      if (v.enabled !== false && v.connectionId) m.set(v.connectionId, v.name)
+    }
+    return m
+  }, [myVdcs])
+  // vDC column: tenant IaaS with several vDCs, union view only — in a
+  // precise vDC context the column is a constant, so it's hidden (§3.6).
+  // Only a cookie matching one of OUR active vDCs counts as a context: an
+  // invalid/foreign cookie fails open to the union server-side, and the
+  // column must not vanish precisely when it carries information.
+  const ctxCookie = readVdcContextCookie()
+  const ctxIsActiveVdc = !!ctxCookie && myVdcs.some((v) => v.id === ctxCookie && v.enabled !== false)
+  const showVdcColumn = !isFullClusterView && vdcNameByConn.size > 1 && !ctxIsActiveVdc
+  const allowLxc = !tenantLoading && (currentTenant === null || isFullClusterView)
+  // Blank VMs (#1171): the provider always; a vDC tenant when a vDC in view
+  // allows them, next to the template catalogue that stays its main path.
+  const tenantBlankVm = !tenantLoading && !allowLxc && blankVmVdcs(myVdcs, ctxCookie).length > 0
+  const allowBlankVm = allowLxc || tenantBlankVm
+  const router = useRouter()
+  const { trackTask } = useTaskTracker()
+  const { addTask: addPCTask, updateTask: updatePCTask, registerOnRestore, unregisterOnRestore } = useProxCenterTasks()
+  const primaryColor = theme.palette.primary.main
+  const primaryColorLight = lighten(primaryColor, 0.3)
+
+  // Check license features
+  const rollingUpdateAvailable = !licenseLoading && hasFeature(Features.ROLLING_UPDATES)
+  const crossClusterMigrationAvailable = !licenseLoading && hasFeature(Features.CROSS_CLUSTER_MIGRATION)
+  const cveAvailable = !licenseLoading && hasFeature(Features.CVE_SCANNER)
+  const vmwareMigrationAvailable = !licenseLoading && hasFeature(Features.VMWARE_MIGRATION)
+  const [upgradeDialogOpen, setUpgradeDialogOpen] = useState(false)
+
+  const {
+    data, setData,
+    loading, error,
+    localTags, setLocalTags,
+    refreshing,
+    refreshData,
+    loadVmTrendsBatch,
+  } = useDetailData(selection)
+
+  // The per-host Ceph noout of the selected node (ui#1164): the header chip
+  // while the flag is set, and the option of the exit-maintenance dialog.
+  // Reread when the node changes and when its maintenance state flips.
+  const nooutNode = selection?.type === 'node' ? parseNodeId(selection.id) : null
+  const nodeNoout = useCephNoout({
+    connId: nooutNode?.connId,
+    node: nooutNode?.node,
+    open: !!nooutNode && !!data && data.status !== 'crit',
+    mode: 'exit',
+    refreshKey: data?.hostInfo?.maintenance ?? null,
+  })
+
+  const [tf, setTf] = useState<RrdTimeframe>('hour')
+
+  // A custom window freezes the charts on a past slice instead of the rolling
+  // window every preset gives (they all end at now). `tf` stays the archive
+  // behind it, so every tick formatter keeps working unchanged. Issue #955.
+  const [rrdWindow, setRrdWindow] = useState<RrdWindow | null>(null)
+  const [rrdMeta, setRrdMeta] = useState<RrdRangeMeta | null>(null)
+
+  const onRrdRangeChange = useCallback((value: MetricsRangeValue) => {
+    setTf(value.timeframe)
+    setRrdWindow(value.window)
+  }, [])
+
+  const onRrdWindowSelect = useCallback((next: RrdWindow) => {
+    setTf(timeframeForWindow(next))
+    setRrdWindow(next)
+  }, [])
+  const [rrdLoading, setRrdLoading] = useState(false)
+  const [rrdError, setRrdError] = useState<string | null>(null)
+  const [series, setSeries] = useState<SeriesPoint[]>([])
+  
+  // État pour le mode tableau VMs étendu
+  const [expandedVmsTable, setExpandedVmsTable] = useState(false)
+
+  // États pour les sliders CPU et RAM (onglet Matériel)
+  const [cpuSockets, setCpuSockets] = useState(1)
+  const [cpuCores, setCpuCores] = useState(1)
+  const [cpuType, setCpuType] = useState('kvm64')
+  const [cpuFlags, setCpuFlags] = useState<Record<string, '+' | '-'>>({})
+  const [cpuLimit, setCpuLimit] = useState(0)
+  const [cpuLimitEnabled, setCpuLimitEnabled] = useState(false)
+  const [numaEnabled, setNumaEnabled] = useState(false)
+  const [memory, setMemory] = useState(2048) // en MB
+  const [balloon, setBalloon] = useState(0) // en MB
+  const [balloonEnabled, setBalloonEnabled] = useState(false)
+  const [swap, setSwap] = useState(512) // en MB (LXC only)
+  const [savingCpu, setSavingCpu] = useState(false)
+  const [savingMemory, setSavingMemory] = useState(false)
+  const [actionBusy, setActionBusy] = useState(false)
+  const [exitMaintenanceDialogOpen, setExitMaintenanceDialogOpen] = useState(false)
+  const [nodeActionDialog, setNodeActionDialog] = useState<{ action: 'reboot' | 'shutdown'; nodeName: string; connId?: string; node?: string } | null>(null)
+  const [nodeActionBusy, setNodeActionBusy] = useState(false)
+  const [nodeActionStep, setNodeActionStep] = useState<string | null>(null)
+  const [nodeActionMigrateTarget, setNodeActionMigrateTarget] = useState('')
+  const [nodeActionFailedVms, setNodeActionFailedVms] = useState<NodeActionFailedVm[]>([])
+  const [nodeActionShutdownFailed, setNodeActionShutdownFailed] = useState(false)
+  const [nodeActionLocalVms, setNodeActionLocalVms] = useState<Set<string>>(new Set())
+  const [nodeActionStorageLoading, setNodeActionStorageLoading] = useState(false)
+  const [nodeActionShutdownLocal, setNodeActionShutdownLocal] = useState(false)
+  const [esxiMigrateVm, setEsxiMigrateVm] = useState<{ vmid: string; name: string; connId: string; connName: string; cpu?: number; memoryMB?: number; committed?: number; guestOS?: string; licenseFull?: boolean; hostType?: string; connSubType?: string | null; diskPaths?: string[]; diskMountPaths?: string[]; vcenterDatacenter?: string; vcenterCluster?: string; vcenterHost?: string; status?: string; toolsStatus?: string; toolsRunningStatus?: string; restoreJobId?: string } | null>(null)
+  const [migTargetConn, setMigTargetConn] = useState('')
+  const [migTargetNode, setMigTargetNode] = useState('')
+  const [migTargetStorage, setMigTargetStorage] = useState('')
+  // Optional user-picked target VMID. Empty string = let PVE pick the next
+  // free id (default behavior). The dialog runs a debounced availability
+  // check and surfaces the result inline; the migration POST forwards the
+  // value as `targetVmid` when set.
+  const [migTargetVmid, setMigTargetVmid] = useState('')
+  const [migTargetVmidStatus, setMigTargetVmidStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle')
+  const [migBridges, setMigBridges] = useState<any[]>([])
+  const [migPveConnections, setMigPveConnections] = useState<any[]>([])
+  const [migNodes, setMigNodes] = useState<any[]>([])
+  const [migStorages, setMigStorages] = useState<any[]>([])
+  // Storage list load state. A slow PVE makes the storage read hit the API
+  // timeout and the route then answers 500 with { error }: without these two the
+  // Target Storage selector stayed empty and greyed out with no reason shown,
+  // and the operator read it as a locked field (#742).
+  const [migStoragesLoading, setMigStoragesLoading] = useState(false)
+  const [migStoragesError, setMigStoragesError] = useState<string | null>(null)
+  const [migSshfsAvailable, setMigSshfsAvailable] = useState<boolean | null>(null) // null = not checked yet
+  const [vcenterPreflight, setVcenterPreflight] = useState<{ checked: boolean; ok: boolean; installing: boolean; errors: string[]; virtV2vInstalled: boolean; virtioWinInstalled: boolean; nbdkitInstalled: boolean; nbdcopyInstalled: boolean; guestfsToolsInstalled: boolean; ovmfInstalled: boolean; ntfsCompressionPluginInstalled: boolean; detectedDisks: string[]; tempStorages: { path: string; availableBytes: number; totalBytes: number; filesystem: string }[]; installError?: { hintKey?: '401_enterprise'; output: string }; virtV2v?: VirtV2vSupport } | null>(null)
+  const [migStarting, setMigStarting] = useState(false)
+  const [migJobId, setMigJobId] = useState<string | null>(null)
+  const [migJob, setMigJob] = useState<any>(null)
+  const [vmMigJob, setVmMigJob] = useState<any>(null) // active migration job for current VM panel
+  // The polls below ask only for the log lines past the ones shown (?after=).
+  const migJobRef = useRef(migJob)
+  migJobRef.current = migJob
+  const vmMigJobRef = useRef(vmMigJob)
+  vmMigJobRef.current = vmMigJob
+  // Cancel from the VM panel. The migrate dialog owns the same control, but it
+  // only exists for a job started from that dialog in the same page session —
+  // a job started through the API (or after a reload) could be cut over from
+  // here and not cancelled, while the operator gate message tells the operator
+  // to do exactly that.
+  const [cancelMigConfirm, setCancelMigConfirm] = useState<string | null>(null)
+  const [cancelMigBusy, setCancelMigBusy] = useState(false)
+  // Resolves true once the orchestrator accepted the cancel. A refusal is
+  // shown, and the confirmation stays open: the migration is still running.
+  const cancelVmMigration = async (jobId: string): Promise<boolean> => {
+    setCancelMigBusy(true)
+    try {
+      const d = await requireOk<{ data?: any }>(`/api/v1/migrations/${jobId}/cancel`, { method: 'POST' })
+      if (d?.data) setVmMigJob(d.data)
+
+      return true
+    } catch (e) {
+      toast.error(`${t('inventoryPage.esxiMigration.cancelMigrationFailed')}: ${e instanceof Error ? e.message : String(e)}`)
+
+      return false
+    } finally {
+      setCancelMigBusy(false)
+    }
+  }
+  // Bulk migration state
+  const [bulkMigSelected, setBulkMigSelected] = useState<Set<string>>(new Set())
+  const [extVmSortCol, setExtVmSortCol] = useState<'name' | 'status' | 'guestOS' | 'usedSpace' | 'cpu' | 'ram'>('name')
+  const [extVmSortDir, setExtVmSortDir] = useState<'asc' | 'desc'>('asc')
+  // Source VM list (roadmap#53): search, power filter (so a bulk cold or warm
+  // migration is one click on the right set) and pagination.
+  const [extVmQuery, setExtVmQuery] = useState('')
+  const [extVmPower, setExtVmPower] = useState<ExtVmPowerFilter>('all')
+  const [extVmPage, setExtVmPage] = useState(0)
+  const [extVmRowsPerPage, setExtVmRowsPerPage] = useState(PAGE_SIZES[0])
+  const [bulkMigOpen, setBulkMigOpen] = useState(false)
+  const [bulkMigStarting, setBulkMigStarting] = useState(false)
+  // Per-migration options (start-after, VLAN, qcow2 conversion, ...) live in a
+  // dedicated hook that resets the whole family whenever the single-VM or the
+  // bulk dialog opens — see useMigrationOptions for the #443 background.
+  const {
+    migNetworkBridge, setMigNetworkBridge,
+    migVlanTag, setMigVlanTag,
+    migStartAfter, setMigStartAfter,
+    migDiskPaths, setMigDiskPaths,
+    migTempStorage, setMigTempStorage,
+    migV2vRoot, setMigV2vRoot,
+    migNfcConcurrency, setMigNfcConcurrency,
+    migType, setMigType,
+    migTransferMode, setMigTransferMode,
+    migConvertToQcow2, setMigConvertToQcow2,
+    migManualCutover, setMigManualCutover,
+    migConvertGuest, setMigConvertGuest, migEfiPreEnrolledKeys, setMigEfiPreEnrolledKeys,
+    migDowntimeBudget, setMigDowntimeBudget,
+    migZeroRateLimit, setMigZeroRateLimit,
+    migBulkConcurrency, setMigBulkConcurrency,
+    migCopyVmk, setMigCopyVmk,
+    migCpuType, setMigCpuType,
+    migStep, setMigStep, migHardware, setMigHardware, migNics, setMigNics,
+  } = useMigrationOptions({ esxiMigrateVm, bulkMigOpen })
+  // The bulk migration followed by the dialog (roadmap#53). Its queue lives on
+  // the server: the batch row and its jobs are created in one request and the
+  // server starts them `concurrency` at a time, so the browser only polls the
+  // batch below and mirrors its jobs into bulkMigJobs, one row per VM.
+  const [bulkMigBatch, setBulkMigBatch] = useState<BulkMigBatch | null>(null)
+  const bulkMigBatchRef = useRef(bulkMigBatch)
+  bulkMigBatchRef.current = bulkMigBatch
+  const [bulkMigJobs, setBulkMigJobs] = useState<BulkMigJobRow[]>([])
+  const [bulkMigProgressExpanded, setBulkMigProgressExpanded] = useState(true)
+  const [bulkMigLogsExpanded, setBulkMigLogsExpanded] = useState(false)
+  const [bulkMigLogsFilter, setBulkMigLogsFilter] = useState<string | null>(null)
+  const bulkMigJobsRef = useRef(bulkMigJobs)
+  bulkMigJobsRef.current = bulkMigJobs
+  // One poller tick at a time (roadmap#23): a slow batch read must not be
+  // stacked by the next interval. A ref, not a closure flag, because a state
+  // update restarts the effect and its interval while a tick is still in flight.
+  const bulkMigTickInFlightRef = useRef(false)
+  // Jobs of the batch that already have their task-bar entry.
+  const bulkMigTaskIdsRef = useRef<Set<string>>(new Set())
+  // Snapshot of host info when bulk dialog opens (avoids null data when selection changes)
+  const [bulkMigHostInfo, setBulkMigHostInfo] = useState<any>(null)
+  const bulkMigHostInfoRef = useRef(bulkMigHostInfo)
+  bulkMigHostInfoRef.current = bulkMigHostInfo
+  // Counters of the host page, over its whole history (the list above is the last 50 jobs).
+  const [extHostStats, setExtHostStats] = useState<MigrationStats>(emptyMigrationStats)
+  const [exitMaintenanceBusy, setExitMaintenanceBusy] = useState(false)
+  const [exitMaintenanceError, setExitMaintenanceError] = useState<string | null>(null)
+
+  // État pour le lock de la VM
+  const [vmLock, setVmLock] = useState<{ locked: boolean; lockType?: string }>({ locked: false })
+  const [unlocking, setUnlocking] = useState(false)
+  const [unlockErrorDialog, setUnlockErrorDialog] = useState<{
+    open: boolean
+    error: string
+    hint?: string
+    lockType?: string
+  }>({ open: false, error: '' })
+
+  // Consolidated dialog state — only one dialog open at a time
+  const [activeDialog, setActiveDialog] = useState<ActiveDialog>('none')
+  const createVmDialogOpen = activeDialog === 'createVm'
+  const createLxcDialogOpen = activeDialog === 'createLxc'
+  const addDiskDialogOpen = activeDialog === 'addDisk'
+  const addNetworkDialogOpen = activeDialog === 'addNetwork'
+  const editScsiControllerDialogOpen = activeDialog === 'editScsiController'
+  const editDiskDialogOpen = activeDialog === 'editDisk'
+  const editNetworkDialogOpen = activeDialog === 'editNetwork'
+  const migrateDialogOpen = activeDialog === 'migrate'
+  const cloneDialogOpen = activeDialog === 'clone'
+  const setCreateVmDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'createVm' : 'none'), [])
+  const setCreateLxcDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'createLxc' : 'none'), [])
+  const setAddDiskDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'addDisk' : 'none'), [])
+  const setAddNetworkDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'addNetwork' : 'none'), [])
+  const setEditScsiControllerDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'editScsiController' : 'none'), [])
+  const addOtherHardwareDialogOpen = activeDialog === 'addOtherHardware'
+  const setAddOtherHardwareDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'addOtherHardware' : 'none'), [])
+  const editOtherHardwareDialogOpen = activeDialog === 'editOtherHardware'
+  const setEditOtherHardwareDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'editOtherHardware' : 'none'), [])
+  const [selectedOtherHardware, setSelectedOtherHardware] = useState<any | null>(null)
+  const setEditDiskDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'editDisk' : 'none'), [])
+  const setEditNetworkDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'editNetwork' : 'none'), [])
+  const setMigrateDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'migrate' : 'none'), [])
+  const setCloneDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'clone' : 'none'), [])
+
+  // Compute default connId/node from current selection for Create dialogs
+  const createDefaults = useMemo(() => {
+    if (!selection) return {}
+    if (selection.type === 'node') {
+      const { connId, node } = parseNodeId(selection.id)
+      return { connId, node }
+    }
+    if (selection.type === 'cluster') {
+      return { connId: selection.id }
+    }
+    if (selection.type === 'vm') {
+      const { connId, node } = parseVmId(selection.id)
+      return { connId, node }
+    }
+    return {}
+  }, [selection])
+
+  // External dialog request (e.g. from tree context menu)
+  const [externalCreateDefaults, setExternalCreateDefaults] = useState<{ connId?: string; node?: string }>({})
+  const lastHandledTs = useRef(0)
+
+  useEffect(() => {
+    if (externalDialogRequest && externalDialogRequest.ts !== lastHandledTs.current) {
+      lastHandledTs.current = externalDialogRequest.ts
+      setExternalCreateDefaults({ connId: externalDialogRequest.connId, node: externalDialogRequest.node })
+      if (externalDialogRequest.type === 'createVm') {
+        setActiveDialog('createVm')
+      } else {
+        setActiveDialog('createLxc')
+      }
+      onExternalDialogHandled?.()
+    }
+  }, [externalDialogRequest, onExternalDialogHandled])
+
+  const lastNodeActionTs = useRef(0)
+  useEffect(() => {
+    if (nodeActionRequest && nodeActionRequest.ts !== lastNodeActionTs.current) {
+      lastNodeActionTs.current = nodeActionRequest.ts
+      setNodeActionMigrateTarget('')
+      setNodeActionFailedVms([])
+      setNodeActionShutdownFailed(false)
+      setNodeActionDialog({ action: nodeActionRequest.action, nodeName: nodeActionRequest.node, connId: nodeActionRequest.connId, node: nodeActionRequest.node })
+      onNodeActionHandled?.()
+    }
+  }, [nodeActionRequest, onNodeActionHandled])
+
+  // Check which running VMs are on local storage when node action dialog opens
+  const emptySet = useMemo(() => new Set<string>(), [])
+
+  const sortedExtVms = useMemo(() => {
+    const vms = data?.esxiHostInfo?.vms
+    if (!vms || vms.length === 0) return []
+    const sorted = [...vms].sort((a: any, b: any) => {
+      let cmp = 0
+      switch (extVmSortCol) {
+        case 'name': cmp = (a.name || a.vmid || '').localeCompare(b.name || b.vmid || ''); break
+        case 'status': cmp = (a.status || '').localeCompare(b.status || ''); break
+        case 'guestOS': cmp = (a.guest_OS || '').localeCompare(b.guest_OS || ''); break
+        case 'usedSpace': cmp = (a.committed || 0) - (b.committed || 0); break
+        case 'cpu': cmp = (a.cpu || 0) - (b.cpu || 0); break
+        case 'ram': cmp = (a.memory_size_MiB || 0) - (b.memory_size_MiB || 0); break
+      }
+      return extVmSortDir === 'asc' ? cmp : -cmp
+    })
+    return sorted
+  }, [data?.esxiHostInfo?.vms, extVmSortCol, extVmSortDir])
+  const filteredExtVms = useMemo(() => filterExtVms(sortedExtVms, extVmQuery, extVmPower), [sortedExtVms, extVmQuery, extVmPower])
+  const extVmCounts = useMemo(() => countExtVmPower(data?.esxiHostInfo?.vms || []), [data?.esxiHostInfo?.vms])
+  const extVmLastPage = Math.max(0, Math.ceil(filteredExtVms.length / extVmRowsPerPage) - 1)
+  const extVmCurrentPage = Math.min(extVmPage, extVmLastPage)
+  const pagedExtVms = filteredExtVms.slice(extVmCurrentPage * extVmRowsPerPage, (extVmCurrentPage + 1) * extVmRowsPerPage)
+  const extVmSelection = filteredSelectionState(bulkMigSelected, filteredExtVms)
+
+  useEffect(() => {
+    if (!nodeActionDialog) return
+    const connId = nodeActionDialog.connId || ''
+    const nodeName = nodeActionDialog.node || ''
+    if (!connId || !nodeName) return
+
+    // Only for cluster nodes
+    const hasOtherNodes = hosts.filter(h => h.connId === connId && h.node !== nodeName).length > 0
+    if (!hasOtherNodes) return
+
+    const runningVms = allVms.filter(vm =>
+      vm.connId === connId && vm.node === nodeName && vm.status === 'running' && !vm.template
+    )
+    if (runningVms.length === 0) return
+
+    // Build shared storage set from clusterStorages
+    const cs = clusterStorages.find(c => c.connId === connId)
+    const sharedSet = new Set<string>()
+    if (cs) {
+      for (const s of cs.sharedStorages) sharedSet.add(s.storage)
+      for (const n of cs.nodes) {
+        for (const s of n.storages) {
+          if (isSharedStorage(s)) sharedSet.add(s.storage)
+        }
+      }
+    }
+
+    let alive = true
+    setNodeActionStorageLoading(true)
+
+    void (async () => {
+      const localKeys = new Set<string>()
+      const batchSize = 5
+      for (let i = 0; i < runningVms.length; i += batchSize) {
+        const batch = runningVms.slice(i, i + batchSize)
+        await Promise.all(batch.map(async (vm) => {
+          try {
+            const res = await fetch(`/api/v1/connections/${encodeURIComponent(vm.connId)}/guests/${vm.type}/${encodeURIComponent(vm.node)}/${encodeURIComponent(vm.vmid)}/config`)
+            if (!res.ok) return
+            const json = await res.json()
+            const config = json.data || {}
+            for (const [key, val] of Object.entries(config)) {
+              if (/^(scsi|virtio|ide|sata|efidisk)\d+$/.test(key) && typeof val === 'string' && !val.includes('media=cdrom') && val !== 'none') {
+                const storageName = val.split(':')[0]
+                if (storageName && storageName !== 'none' && !sharedSet.has(storageName)) {
+                  localKeys.add(`${vm.connId}:${vm.vmid}`)
+                  break
+                }
+              }
+            }
+          } catch { /* ignore */ }
+        }))
+      }
+      if (!alive) return
+      setNodeActionLocalVms(localKeys)
+      setNodeActionStorageLoading(false)
+    })()
+
+    return () => { alive = false }
+  }, [nodeActionDialog?.connId, nodeActionDialog?.node, nodeActionDialog?.action])
+
+  // Merge createDefaults with external overrides
+  const effectiveCreateDefaults = useMemo(() => {
+    if (externalCreateDefaults.connId) return externalCreateDefaults
+    return createDefaults
+  }, [createDefaults, externalCreateDefaults])
+
+  // Clear external defaults when dialog closes
+  useEffect(() => {
+    if (activeDialog === 'none') setExternalCreateDefaults({})
+  }, [activeDialog])
+
+  const [selectedDisk, setSelectedDisk] = useState<any>(null)
+  const [editDiskInitialTab, setEditDiskInitialTab] = useState<number>(0)
+  const [selectedNetwork, setSelectedNetwork] = useState<any>(null)
+  
+  // État pour le dialog de confirmation d'action VM
+  const [confirmAction, setConfirmAction] = useState<{
+    action: string
+    title: string
+    message: string
+    vmName?: string
+    onConfirm: () => Promise<void>
+  } | null>(null)
+
+  const [confirmActionLoading, setConfirmActionLoading] = useState(false)
+
+  // VM action handlers extracted into a custom hook
+  const {
+    tableMigrateVm, setTableMigrateVm,
+    tableCloneVm, setTableCloneVm,
+    bulkActionDialog, setBulkActionDialog,
+    creationPending, setCreationPending,
+    highlightedVmId, setHighlightedVmId,
+    handleVmCreated, handleLxcCreated,
+    handleMigrateVm, handleCrossClusterMigrate, handleCloneVm,
+    handleTableMigrate, handleTableMigrateVm, handleTableCrossClusterMigrate, handleTableCloneVm,
+    handleNodeBulkAction, handleHostBulkAction, executeBulkAction,
+    handleVmAction, handleTableVmAction,
+    onStart, onShutdown, onStop, onPause,
+  } = useVmActions({
+    selection,
+    onSelect,
+    onRefresh,
+    toast,
+    t,
+    trackTask,
+    data,
+    setData,
+    setLocalTags,
+    allVms,
+    onVmActionStart,
+    onVmActionEnd,
+    onOptimisticVmStatus,
+    setConfirmAction,
+    setConfirmActionLoading,
+    setActionBusy,
+  })
+
+  const createBackupDialogOpen = activeDialog === 'createBackup'
+  const setCreateBackupDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'createBackup' : 'none'), [])
+  const [backupStorage, setBackupStorage] = useState('')
+  const [backupMode, setBackupMode] = useState<'snapshot' | 'suspend' | 'stop'>('snapshot')
+  const [backupCompress, setBackupCompress] = useState<'zstd' | 'lzo' | 'gzip' | 'none'>('zstd')
+  const [backupNote, setBackupNote] = useState('')
+  const [creatingBackup, setCreatingBackup] = useState(false)
+  const [backupStorages, setBackupStorages] = useState<any[]>([])
+  
+  const deleteVmDialogOpen = activeDialog === 'deleteVm'
+  const setDeleteVmDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'deleteVm' : 'none'), [])
+  const [deleteVmConfirmText, setDeleteVmConfirmText] = useState('')
+  const [deletingVm, setDeletingVm] = useState(false)
+  const [deleteVmPurge, setDeleteVmPurge] = useState(true) // Supprimer aussi les disques
+
+  // Convert to template
+  const convertTemplateDialogOpen = activeDialog === 'convertTemplate'
+  const setConvertTemplateDialogOpen = useCallback((v: boolean) => setActiveDialog(v ? 'convertTemplate' : 'none'), [])
+  const [convertingTemplate, setConvertingTemplate] = useState(false)
+
+  // État pour l'édition d'option VM
+  const [editOptionDialog, setEditOptionDialog] = useState<{ 
+    key: string; 
+    label: string; 
+    value: any; 
+    type: 'text' | 'boolean' | 'select' | 'vga' | 'hotplug' | 'features';
+    options?: { value: string; label: string }[];
+    unprivileged?: boolean;
+  } | null>(null)
+
+  const [editOptionValue, setEditOptionValue] = useState<any>('')
+  const [editOptionSaving, setEditOptionSaving] = useState(false)
+  const [editOptionError, setEditOptionError] = useState<string | null>(null)
+  
+  // PBS storage backup panel states (search/pagination for storage view)
+  const [pbsStorageSearch, setPbsStorageSearch] = useState('')
+  const [pbsStoragePage, setPbsStoragePage] = useState(0)
+  const [pbsStorageSort, setPbsStorageSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'ctime', dir: 'desc' })
+  const [expandedStorageBackupGroups, setExpandedStorageBackupGroups] = useState<Set<string>>(new Set())
+  // Ref to PbsServerPanel for calling restore/file-restore from storage panel
+  const pbsPanelRef = React.useRef<PbsServerPanelHandle>(null)
+  const [storageUploadOpen, setStorageUploadOpen] = useState(false)
+  const [templateDialogOpen, setTemplateDialogOpen] = useState(false)
+
+  // Initialiser la valeur quand le dialog d'édition d'option s'ouvre
+  useEffect(() => {
+    if (editOptionDialog) {
+      setEditOptionValue(editOptionDialog.value)
+      setEditOptionError(null)
+    }
+  }, [editOptionDialog])
+
+  // Handler pour sauvegarder une option VM
+  const handleSaveOption = useCallback(async () => {
+    if (!editOptionDialog || !selection || selection.type !== 'vm') return
+    
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    
+    setEditOptionSaving(true)
+
+    try {
+      const body = optionSaveBody(editOptionDialog.key, editOptionValue)
+      
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/config`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }
+      )
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+
+        throw new Error(err?.error || `HTTP ${res.status}`)
+      }
+      
+      // Recharger les données
+      const payload = await fetchDetails(selection)
+
+      setData(payload)
+      setEditOptionDialog(null)
+    } catch (e: any) {
+      console.error('Error saving option:', e)
+      // Shown inside the dialog, in the app theme, so the user can adjust and retry.
+      setEditOptionError(humanizePveError(e))
+    } finally {
+      setEditOptionSaving(false)
+    }
+  }, [editOptionDialog, editOptionValue, selection])
+
+  const { favorites, toggleFavorite } = useFavorites({ propFavorites, propToggleFavorite })
+
+  // Fetch PVE connections + all their nodes when migration dialog opens
+  // Builds a flat list of { connId, connName, isCluster, node, status, ip } for the unified selector
+  const [migNodeOptions, setMigNodeOptions] = useState<any[]>([])
+  useEffect(() => {
+    if (!esxiMigrateVm && !bulkMigOpen) return
+    setMigTargetConn(''); setMigTargetNode(''); setMigTargetStorage('')
+    setMigTargetVmid(''); setMigTargetVmidStatus('idle')
+    setMigNodes([]); setMigStorages([]); setMigNodeOptions([])
+    setMigStoragesLoading(false); setMigStoragesError(null)
+    // A dialog reopened from the taskbar is back on a run already started: keep
+    // showing that run. Clearing it here sent the operator to an empty form and
+    // took the "Cutover now" of a manual hold with it.
+    if (esxiMigrateVm?.restoreJobId) setMigJobId(esxiMigrateVm.restoreJobId)
+    else if (esxiMigrateVm) { setMigJobId(null); setMigJob(null) }
+    fetch('/api/v1/connections').then(r => r.json()).then(async (d) => {
+      const pveConns = (d.data || d || []).filter((c: any) => c.type === 'pve')
+      setMigPveConnections(pveConns)
+      // Fetch nodes for each connection in parallel
+      const allOptions: any[] = []
+      await Promise.all(pveConns.map(async (conn: any) => {
+        try {
+          const res = await fetch(`/api/v1/connections/${conn.id}/nodes`)
+          const nd = await res.json()
+          const nodes = nd.data || nd || []
+          const isCluster = (conn.hosts?.length || nodes.length) > 1
+          for (const n of nodes) {
+            allOptions.push({
+              connId: conn.id,
+              connName: conn.name,
+              isCluster,
+              sshEnabled: conn.sshEnabled,
+              node: n.node || n.name || n,
+              status: n.status,
+              ip: n.ip,
+              // Current load, for the bulk dialog's projection on the targets.
+              cpu: n.cpu, maxcpu: n.maxcpu, mem: n.mem, maxmem: n.maxmem,
+            })
+          }
+        } catch {}
+      }))
+      setMigNodeOptions(allOptions)
+      // Auto-select if only one node across all connections
+      if (allOptions.length === 1) {
+        setMigTargetConn(allOptions[0].connId)
+        setMigTargetNode(allOptions[0].node)
+        setMigNodes([allOptions[0]])
+      }
+    }).catch(() => {})
+  }, [esxiMigrateVm, bulkMigOpen])
+
+  // Storage list loader, shared by the node-selection effect below and the
+  // dialog's Retry action: the failure mode is a timeout on a busy node, so a
+  // second attempt has a real chance of succeeding.
+  const loadMigStorages = useCallback(async (connId: string, node: string) => {
+    // Clear first: on a failure the selector must not keep listing the storages
+    // of the node that was selected before.
+    setMigStorages([]); setMigTargetStorage('')
+    setMigStoragesLoading(true); setMigStoragesError(null)
+    try {
+      const r = await fetch(`/api/v1/connections/${connId}/nodes/${node}/storages?content=images`)
+      const d = await r.json().catch(() => null)
+      // A 500 (storage read timed out) and a 403 (RBAC) both answer { error }:
+      // that body must never reach .filter, it used to throw a TypeError the
+      // empty catch swallowed, leaving the previous node's list in place.
+      if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`)
+      const list = Array.isArray(d?.data) ? d.data : Array.isArray(d) ? d : null
+      if (!list) throw new Error(d?.error || 'Unexpected response from the storage list')
+      const storages = list.filter((s: any) => {
+        const content = s.content || ''
+        return content.includes('images')
+      })
+      setMigStorages(storages)
+      if (storages.length > 0) {
+        const localLvm = storages.find((s: any) => s.storage === 'local-lvm')
+        setMigTargetStorage(localLvm ? 'local-lvm' : storages[0].storage)
+      }
+    } catch (e: any) {
+      setMigStoragesError(e?.message || 'Failed to load the storage list')
+    } finally {
+      setMigStoragesLoading(false)
+    }
+  }, [])
+
+  // Retry handed to the migrate dialogs. It resolves the node the list is read
+  // from the same way the effect below does ("__auto__" reads the first node of
+  // the selected cluster), so the dialogs never have to know that rule.
+  const retryMigStorages = useCallback(() => {
+    if (!migTargetConn || !migTargetNode) return
+    const connNodes = migNodeOptions.filter((o: any) => o.connId === migTargetConn)
+    const fetchNode = migTargetNode === '__auto__' ? (connNodes[0]?.node || migTargetNode) : migTargetNode
+    if (!fetchNode || fetchNode === '__auto__') return
+    void loadMigStorages(migTargetConn, fetchNode)
+  }, [migTargetConn, migTargetNode, migNodeOptions, loadMigStorages])
+
+  // Fetch storages, bridges, and check sshfs when node is selected
+  useEffect(() => {
+    if (!migTargetConn || !migTargetNode) { setMigStorages([]); setMigTargetStorage(''); setMigStoragesLoading(false); setMigStoragesError(null); setMigBridges([]); setMigNetworkBridge(''); setMigSshfsAvailable(null); return }
+    const connNodes = migNodeOptions.filter((o: any) => o.connId === migTargetConn)
+    const fetchNode = migTargetNode === '__auto__' ? (connNodes[0]?.node || migTargetNode) : migTargetNode
+    if (!fetchNode || fetchNode === '__auto__') return
+    // Check sshfs availability on target node
+    setMigSshfsAvailable(null)
+    setVcenterPreflight(null)
+    fetch(`/api/v1/connections/${migTargetConn}/nodes/${fetchNode}/check-sshfs`).then(r => r.json()).then(d => {
+      setMigSshfsAvailable(d.data?.installed ?? false)
+    }).catch(() => setMigSshfsAvailable(false))
+    // Run the virt-v2v preflight across the relevant node(s) for the migration
+    // target. In Auto mode, the batch may land on ANY node of the cluster, so we
+    // must check deps on EVERY online node; if any single node is missing a tool,
+    // some VMs in the batch would silently fail after a multi-GB NFC download.
+    // We aggregate with AND semantics: a dep is shown as "installed" only when
+    // all targeted nodes have it; the Install button then pushes apt-get to all
+    // nodes in parallel.
+    const nodesToCheck = migTargetNode === '__auto__'
+      ? migNodeOptions.filter((o: any) => o.connId === migTargetConn && o.status === 'online').map((o: any) => o.node)
+      : [migTargetNode]
+    if (nodesToCheck.length === 0) {
+      setVcenterPreflight({ checked: true, ok: false, installing: false, errors: ['No online nodes in the selected cluster'], virtV2vInstalled: false, virtioWinInstalled: false, nbdkitInstalled: false, nbdcopyInstalled: false, guestfsToolsInstalled: false, ovmfInstalled: false, ntfsCompressionPluginInstalled: false, detectedDisks: [], tempStorages: [] })
+      return
+    }
+    Promise.all(nodesToCheck.map(async (node: string) => {
+      try {
+        const r = await fetch('/api/v1/migrations/preflight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetConnectionId: migTargetConn, targetNode: node, vmName: esxiMigrateVm?.name, sourceType: esxiMigrateVm?.hostType }),
+        })
+        const d = await r.json()
+        return { node, ...d }
+      } catch {
+        return { node, _error: true }
+      }
+    })).then((results: any[]) => {
+      const anyError = results.some(r => r._error)
+      const allVirtV2v = results.every(r => !!r.virtV2vInstalled)
+      const allNbdkit = results.every(r => !!r.nbdkitInstalled)
+      const allNbdcopy = results.every(r => !!r.nbdcopyInstalled)
+      const allGuestfsTools = results.every(r => !!r.guestfsToolsInstalled)
+      const allOvmf = results.every(r => !!r.ovmfInstalled)
+      const allNtfsPlugin = results.every(r => !!r.ntfsCompressionPluginInstalled)
+      const allVirtioWin = results.every(r => !!r.virtioWinInstalled)
+      // tempStorages: when targeting multiple nodes we take the INTERSECTION by
+      // path (a temp dir is only useful if it exists on every node the batch
+      // may land on — otherwise some jobs would fail at the SSHFS/mkdir step).
+      // Single-node mode simply takes the one node's list.
+      let aggregatedTempStorages: any[] = []
+      if (results.length === 1) {
+        aggregatedTempStorages = results[0].tempStorages || []
+      } else {
+        const pathCount = new Map<string, { count: number; sample: any }>()
+        for (const r of results) {
+          for (const ts of (r.tempStorages || [])) {
+            const existing = pathCount.get(ts.path)
+            if (existing) {
+              existing.count++
+              // Keep the smallest availableBytes across nodes (pessimistic
+              // estimate — the batch can only rely on space that every node has).
+              if (ts.availableBytes < existing.sample.availableBytes) existing.sample = ts
+            } else {
+              pathCount.set(ts.path, { count: 1, sample: ts })
+            }
+          }
+        }
+        aggregatedTempStorages = [...pathCount.values()]
+          .filter(v => v.count === results.length)
+          .map(v => v.sample)
+          .sort((a, b) => b.availableBytes - a.availableBytes)
+      }
+      // Union of errors across nodes, prefixed with the node name so the user
+      // can tell which node is the blocker.
+      const allErrors: string[] = []
+      for (const r of results) {
+        for (const err of (r.errors || [])) {
+          allErrors.push(results.length > 1 ? `[${r.node}] ${err}` : err)
+        }
+      }
+      // detectedDisks: only honour when single-node; in bulk auto we don't want
+      // to auto-populate a disk path based on one specific node's /mnt/hyperv view.
+      const detectedDisks = results.length === 1 ? (results[0].detectedDisks || []) : []
+      setVcenterPreflight({
+        checked: true,
+        ok: !anyError && allErrors.length === 0,
+        installing: false,
+        errors: anyError ? ['Preflight check failed on one or more nodes'] : allErrors,
+        virtV2vInstalled: allVirtV2v,
+        virtioWinInstalled: allVirtioWin,
+        nbdkitInstalled: allNbdkit,
+        nbdcopyInstalled: allNbdcopy,
+        guestfsToolsInstalled: allGuestfsTools,
+        ovmfInstalled: allOvmf,
+        ntfsCompressionPluginInstalled: allNtfsPlugin,
+        detectedDisks,
+        tempStorages: aggregatedTempStorages,
+        virtV2v: mergeVirtV2vSupport(results.map(r => r.virtV2v)),
+      })
+      const scanned = hypervDiskPathsFromScan(esxiMigrateVm, detectedDisks)
+      if (scanned !== null) setMigDiskPaths(scanned)
+    }).catch(() => setVcenterPreflight({ checked: true, ok: false, installing: false, errors: ['Preflight check failed'], virtV2vInstalled: false, virtioWinInstalled: false, nbdkitInstalled: false, nbdcopyInstalled: false, guestfsToolsInstalled: false, ovmfInstalled: false, ntfsCompressionPluginInstalled: false, detectedDisks: [], tempStorages: [] }))
+    void loadMigStorages(migTargetConn, fetchNode)
+    // Fetch classic Linux/OVS bridges (node-scoped) AND SDN VNets (cluster-scoped),
+    // merged into one selector list. A migrated NIC accepts a VNet name in its
+    // bridge= slot exactly like a vmbr, so nodes that use SDN are no longer stuck
+    // with an empty/limited dropdown.
+    Promise.all([
+      fetch(`/api/v1/connections/${migTargetConn}/nodes/${fetchNode}/network`).then(r => r.json()).catch(() => null),
+      fetch(`/api/v1/connections/${migTargetConn}/sdn/vnets`).then(r => r.json()).catch(() => null),
+    ]).then(([net, sdn]) => {
+      const bridges = ((net?.data || net || []) as any[]).filter((iface: any) => iface.type === 'bridge' || iface.type === 'OVSBridge')
+      const vnets = ((sdn?.data?.vnets || []) as any[])
+        .filter((v: any) => typeof v.vnet === 'string' && v.vnet.length > 0)
+        .map((v: any) => ({
+          iface: v.vnet,
+          type: 'vnet',
+          comments: v.alias && v.alias !== v.vnet ? `VNet · ${v.alias}` : `VNet${v.zone ? ' · ' + v.zone : ''}`,
+        }))
+      const merged = [...bridges, ...vnets]
+      setMigBridges(merged)
+      if (merged.length > 0) {
+        const vmbr0 = bridges.find((b: any) => b.iface === 'vmbr0')
+        setMigNetworkBridge(vmbr0 ? 'vmbr0' : merged[0].iface)
+      }
+    }).catch(() => {})
+  }, [migTargetConn, migTargetNode, migNodeOptions.length, loadMigStorages])
+
+  // Cleanup TasksBar restore callback on unmount
+  useEffect(() => {
+    if (!migJobId) return
+    const taskId = `migration-${migJobId}`
+    return () => { unregisterOnRestore(taskId) }
+  }, [migJobId, unregisterOnRestore])
+
+  // Refs to avoid stale closures in polling interval
+  const updatePCTaskRef = useRef(updatePCTask)
+  updatePCTaskRef.current = updatePCTask
+
+  // Poll migration job status + sync to TasksBar.
+  // Prefer j.currentStep when available — processV2vOutput updates it with
+  // the live virt-v2v phase name ("Inspecting the source", "Copying disk 1/2",
+  // etc.) which is far more descriptive than the pipeline-level j.status
+  // ("transferring"). The status-based fallback is kept for non-virt-v2v steps
+  // and for the brief moment before the first virt-v2v event arrives.
+  useEffect(() => {
+    if (!migJobId) return
+    const taskId = `migration-${migJobId}`
+    const interval = setInterval(() => {
+      // A hidden tab reads nothing; the first tick once it shows again catches up.
+      if (document.hidden) return
+      const shown = migJobRef.current
+      const after = shown?.id === migJobId ? (shown.logs?.length ?? 0) : 0
+      fetch(`/api/v1/migrations/${migJobId}?after=${after}`).then(r => r.json()).then(d => {
+        setMigJob(d.data ? { ...d.data, logs: mergeJobLogs(migJobRef.current, d.data) } : d.data)
+        if (d.data) {
+          const j = d.data
+          const speed = j.transferSpeed ? ` — ${j.transferSpeed}` : ''
+          const stepFallback = j.status === 'transferring' ? `Transferring${speed}`
+            : j.status === 'configuring' ? 'Configuring'
+            : j.status === 'creating_vm' ? 'Creating VM'
+            : j.status === 'preflight' ? 'Pre-flight checks'
+            : j.status === 'completed' ? 'Completed'
+            : j.status === 'failed' ? (j.error || 'Failed')
+            : j.status === 'cancelled' ? 'Cancelled'
+            : j.status
+          updatePCTaskRef.current(taskId, {
+            progress: j.progress || 0,
+            detail: j.currentStep || stepFallback,
+            status: j.status === 'completed' ? 'done' : j.status === 'failed' || j.status === 'cancelled' ? 'error' : 'running',
+            ...(j.status === 'failed' ? { error: j.error } : {}),
+          })
+        }
+        if (d.data?.status === 'completed' || d.data?.status === 'failed' || d.data?.status === 'cancelled') {
+          clearInterval(interval)
+        }
+      }).catch(() => {})
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [migJobId])
+
+  // Mirror one read of the bulk batch into the dialog rows and the task bar.
+  // A job gets its task-bar entry the first time it is seen started (see
+  // shouldTrackBulkJob), then follows its progress like a single migration.
+  const applyBulkMigSnapshot = (snap: BatchPayload) => {
+    const previous = new Map(bulkMigJobsRef.current.map(j => [j.jobId, j]))
+    setBulkMigBatch(bulkBatchFromPayload(snap))
+    setBulkMigJobs(bulkRowsFromBatch(snap.jobs, bulkMigJobsRef.current))
+    const sourceType = bulkSourceTypeLabel(bulkMigHostInfoRef.current?.hostType)
+    for (const j of snap.jobs) {
+      const prev = previous.get(j.id)
+      let added = false
+      if (!bulkMigTaskIdsRef.current.has(j.id)) {
+        if (!shouldTrackBulkJob(j, prev?.status)) continue
+        bulkMigTaskIdsRef.current.add(j.id)
+        added = true
+        addPCTask({
+          id: `migration-${j.id}`,
+          type: 'generic',
+          label: `${t('inventoryPage.esxiMigration.migrating')} ${j.sourceVmName || j.sourceVmId} (${sourceType} → Proxmox)`,
+          detail: t('inventoryPage.esxiMigration.preflight'),
+          progress: 0,
+          status: 'running',
+          createdAt: Date.now(),
+        })
+      }
+      // The read may carry only the new lines, from logOffset on.
+      const logsChanged = (j.logOffset ?? 0) + (j.logs?.length ?? 0) !== (prev?.logs?.length || 0)
+      if (!added && prev && (j.progress || 0) === prev.progress && j.status === prev.status && !logsChanged) continue
+      // Sync to PCTask: prefer j.currentStep (live virt-v2v phase)
+      const speed = j.transferSpeed ? ` — ${j.transferSpeed}` : ''
+      let stepFallback: string = j.status
+      if (j.status === 'transferring') stepFallback = `Transferring${speed}`
+      else if (j.status === 'completed') stepFallback = 'Completed'
+      else if (j.status === 'failed') stepFallback = j.error || 'Failed'
+      let taskStatus: 'done' | 'error' | 'running' = 'running'
+      if (j.status === 'completed') taskStatus = 'done'
+      else if (j.status === 'failed' || j.status === 'cancelled') taskStatus = 'error'
+      updatePCTaskRef.current(`migration-${j.id}`, {
+        progress: j.progress || 0,
+        detail: j.currentStep || stepFallback,
+        status: taskStatus,
+        ...(j.status === 'failed' ? { error: j.error || undefined } : {}),
+      })
+    }
+  }
+
+  // Load the newest batch still in flight from a source connection into the
+  // dialog. False when there is none, or when a batch got loaded meanwhile.
+  const loadActiveBulkBatch = async (sourceConnectionId: string, isStale: () => boolean = () => false): Promise<boolean> => {
+    const snap = await fetchActiveBulkBatch(sourceConnectionId)
+    if (!snap || isStale() || bulkMigBatchRef.current) return false
+    applyBulkMigSnapshot(snap)
+    return true
+  }
+
+  // Poll the bulk batch. The server starts the queued jobs itself; the browser
+  // only reads where the batch is, until nothing is left to start or to finish.
+  useEffect(() => {
+    if (!bulkMigBatch || isBulkBatchFinished(bulkMigBatch.status, bulkMigJobsRef.current)) return
+    const batchId = bulkMigBatch.id
+    // Resolves true once the batch is over.
+    const tick = async (): Promise<boolean> => {
+      const snap = await fetchBulkBatch(batchId, bulkLogOffsets(bulkMigJobsRef.current))
+      if (!snap) return false
+      // Closed or replaced while the read was in flight: drop it.
+      if (bulkMigBatchRef.current?.id !== batchId) return true
+      applyBulkMigSnapshot(snap)
+      return isBulkBatchFinished(snap.status, snap.jobs)
+    }
+    const interval = setInterval(async () => {
+      // Hidden tab: nothing to follow until it shows again.
+      if (document.hidden || bulkMigTickInFlightRef.current) return
+      bulkMigTickInFlightRef.current = true
+      try {
+        if (await tick()) clearInterval(interval)
+      } finally {
+        bulkMigTickInFlightRef.current = false
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [bulkMigBatch?.id, bulkMigBatch?.status])
+
+  // A batch reopened without going through "Migrate selected" (host page) takes
+  // the host info of the page when it is its source, for the logos of the dialog.
+  useEffect(() => {
+    if (!bulkMigBatch?.sourceConnectionId || bulkMigHostInfo) return
+    if (data?.esxiHostInfo?.connectionId === bulkMigBatch.sourceConnectionId) setBulkMigHostInfo(data.esxiHostInfo)
+  }, [bulkMigBatch?.sourceConnectionId, bulkMigHostInfo, data?.esxiHostInfo])
+
+  // Fetch active migration job for the currently selected ESXi VM
+  useEffect(() => {
+    if (selection?.type !== 'extvm') { setVmMigJob(null); return }
+    const sep = selection.id.indexOf(':')
+    const connId = selection.id.slice(0, sep)
+    const vmid = selection.id.slice(sep + 1)
+    if (sep < 0 || !vmid) return
+    let stopped = false
+
+    // Resolve the VM's latest job, then keep looking. Resolving once left the
+    // panel frozen on whatever job existed when the VM was selected: a run
+    // started afterwards (from the migrate dialog, or straight through the API)
+    // never appeared, so the panel kept showing the previous run's "Completed"
+    // chip and no cutover button, and only F5 fixed it.
+    // The list leaves the logs out and is filtered on this VM by the server.
+    const query = `sourceConnectionId=${encodeURIComponent(connId)}&sourceVmId=${encodeURIComponent(vmid)}`
+    const resolve = () => fetch(`/api/v1/migrations?${query}`).then(r => r.json()).then(d => {
+      if (stopped) return
+      const match = (d.data || []).find((j: any) => j.status !== 'cancelled')
+      // Same job: keep the object, so the detail poller below is not restarted
+      // on every resolution tick.
+      if (match?.id === vmMigJobRef.current?.id) return
+      if (!match) { setVmMigJob(null); return }
+      // A run not shown yet: its full record, logs included.
+      return fetch(`/api/v1/migrations/${match.id}`).then(r => r.json()).then(full => {
+        if (!stopped) setVmMigJob(full.data ?? match)
+      })
+    }).catch(() => {})
+
+    void resolve()
+    const iv = setInterval(() => { if (!document.hidden) void resolve() }, 10000)
+    return () => { stopped = true; clearInterval(iv) }
+    // migJobId: a migration started from the dialog resolves immediately here
+    // instead of waiting for the next tick.
+  }, [selection, migJobId])
+
+  // A bulk migration runs on the server (roadmap#53): opening its source host
+  // page reopens the follow-up of a batch still in flight there, even after the
+  // tab that launched it was closed. Skipped while a batch is already loaded.
+  // A taskbar entry that navigated here names its batch in the URL
+  // (?openBatch=, see lib/migration/bulkBatchOpen): that one is opened,
+  // otherwise the newest still in flight from this host.
+  useEffect(() => {
+    if (selection?.type !== 'ext' || bulkMigBatchRef.current) return
+    let stale = false
+    const wanted = new URLSearchParams(window.location.search).get('openBatch')
+    const load = wanted
+      ? fetchBulkBatch(wanted).then(snap => {
+        if (!snap || stale || bulkMigBatchRef.current) return false
+        applyBulkMigSnapshot(snap)
+        return true
+      })
+      : loadActiveBulkBatch(selection.id, () => stale)
+    void load.then(found => { if (found && !stale) setBulkMigOpen(true) })
+    return () => { stale = true }
+  }, [selection?.type, selection?.id])
+
+  // The taskbar entry of a bulk migration, clicked while this page is mounted:
+  // reopen its follow-up in place (lib/migration/bulkBatchOpen). The latest
+  // render's snapshot handler is read through a ref, the listener stays put.
+  const applyBulkMigSnapshotRef = useRef(applyBulkMigSnapshot)
+  applyBulkMigSnapshotRef.current = applyBulkMigSnapshot
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<OpenBulkBatchDetail>).detail
+      if (!detail?.batchId) return
+      detail.handled = true
+      if (bulkMigBatchRef.current?.id === detail.batchId) { setBulkMigOpen(true); return }
+      void fetchBulkBatch(detail.batchId).then(snap => {
+        if (!snap) return
+        applyBulkMigSnapshotRef.current(snap)
+        setBulkMigOpen(true)
+      })
+    }
+    window.addEventListener(OPEN_BULK_BATCH_EVENT, onOpen)
+    return () => window.removeEventListener(OPEN_BULK_BATCH_EVENT, onOpen)
+  }, [])
+
+  // Migration counters of the external host page
+  useEffect(() => {
+    if (selection?.type !== 'ext') { setExtHostStats(emptyMigrationStats()); return }
+    const connId = selection.id
+    fetch('/api/v1/migrations/stats').then(r => r.json()).then(d => {
+      setExtHostStats(sumMigrationStats(d?.data?.bySource, [connId]))
+    }).catch(() => {})
+  }, [selection])
+
+  // Poll active VM migration job
+  useEffect(() => {
+    if (!vmMigJob || ['completed', 'failed', 'cancelled'].includes(vmMigJob.status)) return
+    const jobId = vmMigJob.id
+    const interval = setInterval(() => {
+      if (document.hidden) return
+      const shown = vmMigJobRef.current
+      const after = shown?.id === jobId ? (shown.logs?.length ?? 0) : 0
+      fetch(`/api/v1/migrations/${jobId}?after=${after}`).then(r => r.json()).then(d => {
+        if (d.data) setVmMigJob({ ...d.data, logs: mergeJobLogs(vmMigJobRef.current, d.data) })
+        if (d.data?.status === 'completed' || d.data?.status === 'failed' || d.data?.status === 'cancelled') {
+          clearInterval(interval)
+        }
+      }).catch(() => {})
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [vmMigJob?.id, vmMigJob?.status])
+
+  // VMs sans templates (pour affichage dans les modes vms, tree, hosts, pools, tags)
+  const displayVms = useMemo(() => allVms.filter(vm => !vm.template), [allVms])
+
+  // #666: node status lookup for the VmsTable node column pastille, keyed
+  // like HostItem.key (`${connId}:${node}`).
+  const nodeStatuses = useMemo(() => new Map(hosts.map(h => [h.key, h.status])), [hosts])
+
+  // The guest selection (#1218, power actions roadmap#197) in the Guests, Nodes, Pools and Tags views:
+  // the rows of every table share the ids built here.
+  const selectableVms = useMemo(
+    () => displayVms.map(vm => ({ id: `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}`, connId: vm.connId, vmid: vm.vmid, template: vm.template, node: vm.node, type: vm.type, status: vm.status, name: vm.name })),
+    [displayVms],
+  )
+  const rootGuestSelection = useGuestSelection({
+    vms: selectableVms,
+    nodes: hosts,
+    migratingVmIds,
+    resetKey: `${selection?.type}:${selection?.id}:${viewMode}`,
+  })
+
+  // Mapping vmid → name pour affichage dans storage content
+  const vmNamesMap = useMemo(() => {
+    const map: Record<string, string> = {}
+    for (const vm of allVms) {
+      if (vm.name) map[String(vm.vmid)] = vm.name
+    }
+    return map
+  }, [allVms])
+
+  // ==================== HARDWARE HANDLERS (extracted to useHardwareHandlers) ====================
+  const {
+    // Disk handlers
+    handleSaveDisk,
+    handleSaveNetwork,
+    handleSaveScsiController,
+    handleEditDisk,
+    handleDetachDisk,
+    handleResizeDisk,
+    handleMoveDisk,
+    handleDeleteNetwork,
+
+    // Tabs
+    detailTab, setDetailTab,
+    clusterTab, setClusterTab,
+
+    // Replication VM
+    replicationJobs, setReplicationJobs,
+    replicationLoading, setReplicationLoading,
+    replicationLoaded, setReplicationLoaded,
+    availableTargetNodes, setAvailableTargetNodes,
+    deleteReplicationId, setDeleteReplicationId,
+
+    // Replication Ceph
+    sourceCephAvailable, setSourceCephAvailable,
+    cephClusters, setCephClusters,
+    cephClustersLoading, setCephClustersLoading,
+    addCephReplicationDialogOpen, setAddCephReplicationDialogOpen,
+    selectedCephCluster, setSelectedCephCluster,
+    cephReplicationSchedule, setCephReplicationSchedule,
+    cephReplicationJobs, setCephReplicationJobs,
+    expandedClusterNodes, setExpandedClusterNodes,
+    pbsTab, setPbsTab,
+    pbsServerTab, setPbsServerTab,
+    pbsBackupSearch, setPbsBackupSearch,
+    pbsBackupPage, setPbsBackupPage,
+    pbsTimeframe, setPbsTimeframe,
+    pbsRrdData, setPbsRrdData,
+    datastoreRrdData, setDatastoreRrdData,
+    expandedBackupGroups, setExpandedBackupGroups,
+    backups, setBackups,
+    backupsLoading, setBackupsLoading,
+    backupsError, setBackupsError,
+    backupsStats, setBackupsStats,
+    backupsWarnings, setBackupsWarnings,
+    backupsPbsConfigured, setBackupsPbsConfigured,
+    backupsVzdumpScanned, setBackupsVzdumpScanned,
+    backupsPreloaded, setBackupsPreloaded,
+    backupsLoadedForIdRef,
+    backupsScannedForIdRef,
+    selectedBackup, setSelectedBackup,
+
+    // Node tabs
+    nodeTab, setNodeTab,
+    nodeDisksSubTab, setNodeDisksSubTab,
+    subscriptionKeyDialogOpen, setSubscriptionKeyDialogOpen,
+    subscriptionKeyInput, setSubscriptionKeyInput,
+    subscriptionKeySaving, setSubscriptionKeySaving,
+    removeSubscriptionDialogOpen, setRemoveSubscriptionDialogOpen,
+    removeSubscriptionLoading, setRemoveSubscriptionLoading,
+    systemReportDialogOpen, setSystemReportDialogOpen,
+    systemReportData, setSystemReportData,
+    systemReportLoading, setSystemReportLoading,
+
+    // Replication dialog
+    editingReplicationJob, setEditingReplicationJob,
+    deleteReplicationDialogOpen, setDeleteReplicationDialogOpen,
+    deletingReplicationJob, setDeletingReplicationJob,
+    replicationDeleting, setReplicationDeleting,
+    replicationLogDialogOpen, setReplicationLogDialogOpen,
+    replicationLogData, setReplicationLogData,
+    replicationLogLoading, setReplicationLogLoading,
+    replicationLogJob, setReplicationLogJob,
+
+    // Node system
+    nodeSystemSubTab, setNodeSystemSubTab,
+    nodeSyslogLive, setNodeSyslogLive,
+    editDnsDialogOpen, setEditDnsDialogOpen,
+    editHostsDialogOpen, setEditHostsDialogOpen,
+    editTimeDialogOpen, setEditTimeDialogOpen,
+    systemSaving, setSystemSaving,
+    dnsFormData, setDnsFormData,
+    hostsFormData, setHostsFormData,
+    timeFormData, setTimeFormData,
+    timezonesList, setTimezonesList,
+
+    // Node notes
+    nodeNotesEditing, setNodeNotesEditing,
+    nodeNotesEditValue, setNodeNotesEditValue,
+    nodeNotesSaving, setNodeNotesSaving,
+
+    // Node Ceph
+    nodeCephSubTab, setNodeCephSubTab,
+    nodeCephLogLive, setNodeCephLogLive,
+
+    // Backup jobs
+    backupJobs, setBackupJobs,
+    backupJobsStorages, setBackupJobsStorages,
+    backupJobsNodes, setBackupJobsNodes,
+    backupJobsVms, setBackupJobsVms,
+    backupJobsLoading, setBackupJobsLoading,
+    backupJobsLoaded, setBackupJobsLoaded,
+    backupJobsError, setBackupJobsError,
+    backupJobDialogOpen, setBackupJobDialogOpen,
+    backupJobDialogMode, setBackupJobDialogMode,
+    editingBackupJob, setEditingBackupJob,
+    backupJobSaving, setBackupJobSaving,
+    deleteBackupJobDialog, setDeleteBackupJobDialog,
+    backupJobDeleting, setBackupJobDeleting,
+    backupJobFormData, setBackupJobFormData,
+
+    // Cluster HA
+    clusterHaResources, setClusterHaResources,
+    clusterHaGroups, setClusterHaGroups,
+    clusterHaRules, setClusterHaRules,
+    clusterHaStatus,
+    clusterPveMajorVersion, setClusterPveMajorVersion,
+    clusterPveVersion, setClusterPveVersion,
+    clusterHaLoading, setClusterHaLoading,
+    clusterHaLoaded, setClusterHaLoaded,
+    haGroupDialogOpen, setHaGroupDialogOpen,
+    editingHaGroup, setEditingHaGroup,
+    deleteHaGroupDialog, setDeleteHaGroupDialog,
+    haRuleDialogOpen, setHaRuleDialogOpen,
+    editingHaRule, setEditingHaRule,
+    deleteHaRuleDialog, setDeleteHaRuleDialog,
+    haRuleType, setHaRuleType,
+
+    // Cluster config
+    clusterConfig, setClusterConfig,
+    clusterConfigLoading, setClusterConfigLoading,
+    clusterConfigLoaded, setClusterConfigLoaded,
+    createClusterDialogOpen, setCreateClusterDialogOpen,
+    joinClusterDialogOpen, setJoinClusterDialogOpen,
+    joinInfoDialogOpen, setJoinInfoDialogOpen,
+    clusterActionLoading, setClusterActionLoading,
+    clusterActionError, setClusterActionError,
+    newClusterName, setNewClusterName,
+    newClusterLinks, setNewClusterLinks,
+    joinClusterInfo, setJoinClusterInfo,
+    joinClusterPassword, setJoinClusterPassword,
+
+    // Cluster notes
+    clusterNotesContent, setClusterNotesContent,
+    clusterNotesLoading, setClusterNotesLoading,
+    clusterNotesEditMode, setClusterNotesEditMode,
+    clusterNotesSaving, setClusterNotesSaving,
+    clusterNotesLoaded, setClusterNotesLoaded,
+
+    // Ceph
+    clusterCephData, setClusterCephData,
+    clusterCephLoading, setClusterCephLoading,
+    clusterCephLoaded, setClusterCephLoaded,
+    clusterCephTimeframe, setClusterCephTimeframe,
+
+    // Ceph perf
+    storageCephPerf, setStorageCephPerf,
+    storageCephPerfHistory, setStorageCephPerfHistory,
+
+    // Storage RRD
+    storageRrdHistory, setStorageRrdHistory,
+    storageRrdTimeframe, setStorageRrdTimeframe,
+
+    // Cluster storage
+    clusterStorageData, setClusterStorageData,
+    clusterStorageLoading, setClusterStorageLoading,
+    clusterStorageLoaded, setClusterStorageLoaded,
+
+    // Cluster firewall
+    clusterFirewallLoaded, setClusterFirewallLoaded,
+
+    // Rolling update
+    nodeUpdates, setNodeUpdates,
+    nodeLocalVms, setNodeLocalVms,
+    updatesDialogOpen, setUpdatesDialogOpen,
+    updatesDialogNode, setUpdatesDialogNode,
+    localVmsDialogOpen, setLocalVmsDialogOpen,
+    localVmsDialogNode, setLocalVmsDialogNode,
+    rollingUpdateWizardOpen, setRollingUpdateWizardOpen,
+
+    // Guest info
+    guestInfo, setGuestInfo,
+    guestInfoLoading, setGuestInfoLoading,
+
+    // File explorer
+    explorerLoading, setExplorerLoading,
+    explorerError, setExplorerError,
+    explorerFiles, setExplorerFiles,
+    explorerArchive, setExplorerArchive,
+    explorerPath, setExplorerPath,
+    explorerArchives, setExplorerArchives,
+    pveStorages, setPveStorages,
+    compatibleStorages, setCompatibleStorages,
+    selectedPveStorage, setSelectedPveStorage,
+    explorerMode, setExplorerMode,
+    explorerSearch, setExplorerSearch,
+    filteredExplorerFiles,
+
+    // Node data (from useNodeData)
+    nodeNotesData, nodeNotesLoading, nodeNotesLoaded, setNodeNotesData,
+    nodeDisksData, nodeDisksLoading, setNodeDisksData,
+    nodeSubscriptionData, nodeSubscriptionLoading, setNodeSubscriptionData,
+    nodeReplicationData, nodeReplicationLoading, setNodeReplicationData,
+    nodeSystemData, nodeSystemLoading, setNodeSystemData,
+    nodeSyslogData, nodeSyslogLoading, setNodeSyslogData,
+    nodeCephData, nodeCephLoading, setNodeCephData,
+    nodeShellData, nodeShellConnected, nodeShellLoading,
+    setNodeShellData, setNodeShellConnected, setNodeShellLoading,
+    setNodeReplicationLoaded, setNodeSystemLoaded, setNodeSyslogLoading,
+    setNodeDisksLoading, setNodeSubscriptionLoading,
+
+    // Ceph perf (from useCephPerf)
+    clusterCephPerf, clusterCephPerfFiltered, cephTrends,
+
+    // Load handlers
+    loadBackups,
+    loadClusterHa,
+    loadClusterConfig,
+    loadClusterNotes,
+    handleSaveClusterNotes,
+    loadClusterCeph,
+    loadClusterStorage,
+    handleCreateCluster,
+    handleJoinCluster,
+    loadBackupJobs,
+    loadBackupJobsVms,
+    handleCreateBackupJob,
+    handleEditBackupJob,
+    handleSaveBackupJob,
+    handleDeleteBackupJob,
+    loadPveStorages,
+    findAllCompatibleStorages,
+    exploreWithPveStorage,
+    loadBackupContentViaPbs,
+    loadBackupContent,
+    browseArchive,
+    navigateToFolder,
+    navigateUp,
+    navigateToBreadcrumb,
+    backToBackupsList,
+    backToArchives,
+    downloadFile,
+  } = useHardwareHandlers({
+    selection,
+    data,
+    setData,
+    t,
+    selectedDisk,
+    setSelectedDisk,
+    selectedNetwork,
+    setSelectedNetwork,
+    activeDialog,
+    setActiveDialog,
+  })
+
+  // ==================== SNAPSHOTS ====================
+  const {
+    snapshots, snapshotsLoading, snapshotsError, snapshotsLoaded,
+    snapshotActionBusy, showCreateSnapshot, setShowCreateSnapshot,
+    newSnapshotName, setNewSnapshotName, newSnapshotDesc, setNewSnapshotDesc,
+    newSnapshotRam, setNewSnapshotRam, snapshotFeatureAvailable,
+    loadSnapshots, createSnapshot, deleteSnapshot, deleteAllSnapshots, rollbackSnapshot,
+    resetSnapshots, deleteAllBusy, deleteAllProgress, snapshotRowTasks, snapshotTaskBusy,
+  } = useSnapshots({ selection, detailTab, t, toast, data, setConfirmAction, setConfirmActionLoading })
+
+  // ==================== TASKS (Historique des tâches) ====================
+  const {
+    tasks, tasksLoading, tasksError, tasksLoaded,
+    loadTasks, setTasksLoaded, resetTasks,
+  } = useTasks({ selection, detailTab, t })
+
+  // ==================== NOTES ====================
+  const {
+    vmNotes, setVmNotes, notesLoading, notesSaving, notesError,
+    notesEditing, setNotesEditing, loadNotes, saveNotes, resetNotes,
+  } = useNotes({ selection, detailTab, t })
+
+  // ==================== HIGH AVAILABILITY (HA) ====================
+  const {
+    haConfig, haGroups, haLoading, haSaving, haError, haLoaded, haEditing,
+    setHaEditing, haState, setHaState, haGroup, setHaGroup,
+    haMaxRestart, setHaMaxRestart, haMaxRelocate, setHaMaxRelocate,
+    haFailback, setHaFailback,
+    haComment, setHaComment, loadHaConfig, saveHaConfig, removeHaConfig, resetHA,
+  } = useHA({ selection, detailTab, t, data, setConfirmAction, setConfirmActionLoading })
+
+  // ==================== PREVIEW ====================
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [previewData, setPreviewData] = useState<any>(null)
+
+  const previewFile = useCallback(async (fileName: string) => {
+    if (!selectedBackup || !selection || !selectedPveStorage || !explorerArchive) return
+
+    const { connId } = parseVmId(selection.id)
+    
+    const fullPath = explorerPath === '/' 
+      ? `/${explorerArchive}${explorerPath}${fileName}`
+      : `/${explorerArchive}${explorerPath}/${fileName}`
+
+    setPreviewOpen(true)
+    setPreviewLoading(true)
+    setPreviewError(null)
+    setPreviewData(null)
+
+    try {
+      const params = new URLSearchParams({
+        storage: selectedPveStorage.storage,
+        volume: selectedBackup.backupPath,
+        filepath: fullPath,
+      })
+
+      const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/file-restore/preview?${params}`)
+      const json = await res.json()
+
+      if (json.error) {
+        setPreviewError(json.error)
+      } else {
+        setPreviewData(json.data)
+      }
+    } catch (e: any) {
+      setPreviewError(e.message || t('errors.loadingError'))
+    } finally {
+      setPreviewLoading(false)
+    }
+  }, [selectedBackup, selection, selectedPveStorage, explorerArchive, explorerPath])
+
+  // Extensions supportées pour la preview
+  const canPreview = useCallback((fileName: string) => {
+    const ext = ('.' + fileName.split('.').pop()?.toLowerCase()) || ''
+    const textExts = ['.txt', '.log', '.conf', '.cfg', '.ini', '.yaml', '.yml', '.json', '.xml', '.sh', '.py', '.js', '.md', '.csv', '.env', '.sql', '.html', '.css']
+    const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.ico']
+
+    
+return textExts.includes(ext) || imageExts.includes(ext) || fileName.startsWith('.')
+  }, [])
+
+
+  // Entity tags (cluster/node) - stored in ProxCenter DB
+  const [entityTags, setEntityTags] = useState<string[]>([])
+  // baseUrl of the selected connection + whether it sits behind a reverse proxy,
+  // used to link to the native Proxmox web UI (cluster, standalone host, or a
+  // specific cluster node via its own management IP)
+  const [proxmoxBaseUrl, setProxmoxBaseUrl] = useState<string | null>(null)
+  const [proxmoxBehindProxy, setProxmoxBehindProxy] = useState(false)
+  const [headerCollapsed, setHeaderCollapsed] = useState(false)
+
+  // Hosts data via shared SWR (dedup with NodeTabs)
+  const nodeConnId = selection?.type === 'node' ? parseNodeId(selection.id).connId : null
+  const { data: hostsData } = useHostsByConnection(nodeConnId)
+
+  // Selection generation for the per-selection loaders of this component: a
+  // late answer for the previous selection is aborted and never written.
+  const selectionGuard = useSelectionGuard(selection ? `${selection.type}:${selection.id}` : null)
+
+  useEffect(() => {
+    setEntityTags([])
+    setProxmoxBaseUrl(null)
+    setProxmoxBehindProxy(false)
+    if (!selection) return
+    const req = selectionGuard.beginCurrent()
+
+    if (selection.type === 'cluster') {
+      fetch(`/api/v1/connections/${encodeURIComponent(selection.id)}`, { signal: req.signal })
+        .then(r => r.ok ? r.json() : null)
+        .then(json => {
+          if (!req.isCurrent()) return
+          const tags = json?.data?.tags
+          setEntityTags(tags ? String(tags).split(';').filter(Boolean) : [])
+          setProxmoxBaseUrl(json?.data?.baseUrl ?? null)
+          setProxmoxBehindProxy(!!json?.data?.behindProxy)
+        })
+        .catch(() => {})
+    } else if (selection.type === 'node') {
+      const { connId, node } = parseNodeId(selection.id)
+      const hosts = hostsData?.data?.hosts || []
+      const host = hosts.find((h: any) => h.node === node)
+      const tags = host?.managedHost?.tags || host?.tags
+      setEntityTags(tags ? String(tags).split(';').filter(Boolean) : [])
+      // baseUrl + behindProxy let the node link to the native Proxmox web UI
+      // (cluster nodes deep-link to their own management IP via proxmoxNodeWebUiOrigin).
+      fetch(`/api/v1/connections/${encodeURIComponent(connId)}`, { signal: req.signal })
+        .then(r => r.ok ? r.json() : null)
+        .then(json => {
+          if (!req.isCurrent()) return
+          setProxmoxBaseUrl(json?.data?.baseUrl ?? null)
+          setProxmoxBehindProxy(!!json?.data?.behindProxy)
+        })
+        .catch(() => {})
+    }
+  }, [selection?.id, selection?.type, hostsData, selectionGuard])
+
+  // Reset non-data states when selection changes (data/loading/error/localTags are reset by useDetailData)
+  useEffect(() => {
+    setSeries([])
+    setRrdError(null)
+    setExpandedVmsTable(false)  // Réinitialiser le mode expanded
+
+    // Réinitialiser les états spécifiques aux VMs
+    resetTasks()
+    resetSnapshots()
+    resetNotes()
+    setBackups([])
+    setBackupsStats(null)
+    setBackupsError(null)
+    setBackupsWarnings([])
+    setBackupsPreloaded(false)
+    // Verdicts portés par la réponse précédente : sans ce nettoyage, l'état
+    // vide à trois branches de l'onglet pourrait décrire un balayage effectué
+    // pour un AUTRE guest — « aucune archive sur les stockages du cluster »
+    // alors qu'ils n'ont jamais été interrogés pour celui-ci.
+    setBackupsPbsConfigured(null)
+    setBackupsVzdumpScanned(false)
+    // Note: backupsLoadedForIdRef est géré dans l'effet de chargement des backups
+    // Le balayage vzdump, lui, est réarmé ici : son effet ne se redéclenche que
+    // sur changement d'onglet, il ne verrait donc jamais passer une sélection
+    // intermédiaire (nœud, cluster) et resterait muet au retour sur ce guest.
+    backupsScannedForIdRef.current = null
+    setGuestInfo(null)
+    setHeaderCollapsed(false)
+
+    // Réinitialiser les états HA
+    resetHA()
+
+    // Réinitialiser les états de réplication. Clearing the loading flag too lets
+    // the new selection start its own load while the previous one is aborted.
+    setReplicationLoaded(false)
+    setReplicationLoading(false)
+    setReplicationJobs([])
+    setAvailableTargetNodes([])
+    setSourceCephAvailable(false)
+    setCephClusters([])
+    setCephReplicationJobs([])
+  }, [selection?.type, selection?.id])
+
+  // Initialiser les sliders CPU et RAM quand les données sont chargées
+  useEffect(() => {
+    if (data?.cpuInfo) {
+      setCpuSockets(data.cpuInfo.sockets || 1)
+      setCpuCores(data.cpuInfo.cores || 1)
+      setCpuType(data.cpuInfo.type || 'kvm64')
+      setCpuFlags(data.cpuInfo.flags || {})
+      setCpuLimit(data.cpuInfo.cpulimit || 0)
+      setCpuLimitEnabled(!!data.cpuInfo.cpulimit)
+      setNumaEnabled(!!data.cpuInfo.numa)
+    }
+
+    if (data?.memoryInfo) {
+      setMemory(data.memoryInfo.memory || 2048)
+      setBalloon(data.memoryInfo.balloon || 0)
+      setBalloonEnabled(data.memoryInfo.balloon !== 0 && data.memoryInfo.balloon !== undefined)
+      setSwap(data.memoryInfo.swap ?? 512)
+    }
+  }, [data?.cpuInfo, data?.memoryInfo])
+
+  // Mémoriser maxMem pour éviter les re-renders inutiles
+  const maxMem = data?.metrics?.ram?.max
+  const maxMemRef = React.useRef<number | undefined>(undefined)
+  
+  // Mettre à jour la ref seulement si maxMem change vraiment
+  React.useEffect(() => {
+    if (maxMem !== undefined && maxMem !== maxMemRef.current) {
+      maxMemRef.current = maxMem
+    }
+  }, [maxMem])
+
+  useEffect(() => {
+    let alive = true
+    let intervalId: ReturnType<typeof setInterval> | null = null
+    let isFirstLoad = true
+
+    async function runRrd() {
+      if (!alive) return
+      if (!isFirstLoad) {
+        // Silent refresh: don't show loading spinner or clear errors
+      } else {
+        setRrdError(null)
+      }
+
+      if (!selection) return
+      if (selection.type !== 'node' && selection.type !== 'vm') return
+
+      try {
+        if (isFirstLoad) setRrdLoading(true)
+
+        let connectionId = ''
+        let path = ''
+
+        if (selection.type === 'node') {
+          const { connId, node } = parseNodeId(selection.id)
+
+          connectionId = connId
+          path = `/nodes/${node}`
+        } else {
+          const { connId, node, type, vmid } = parseVmId(selection.id)
+
+          connectionId = connId
+          path = `/nodes/${node}/${type}/${vmid}`
+        }
+
+        const { rows, meta } = await fetchRrdRange(connectionId, path, { timeframe: tf, window: rrdWindow })
+        const built = buildSeriesFromRrd(rows, maxMemRef.current)
+
+        if (!alive) return
+        setSeries(built)
+        setRrdMeta(meta)
+      } catch (e: any) {
+        if (!alive) return
+        if (isFirstLoad) setRrdError(e?.message || String(e))
+      } finally {
+        if (!alive) return
+        if (isFirstLoad) setRrdLoading(false)
+        isFirstLoad = false
+      }
+    }
+
+    // Petit délai pour laisser l'UI s'afficher d'abord
+    const timer = setTimeout(runRrd, 50)
+
+    // Auto-refresh every 30s with visibility pause. A custom window is a fixed
+    // slice of the past, so refreshing it would re-fetch the same points.
+    function startRefresh() {
+      if (rrdWindow) return
+      if (intervalId !== null) return
+      intervalId = setInterval(runRrd, 30000)
+    }
+
+    function stopRefresh() {
+      if (intervalId !== null) { clearInterval(intervalId); intervalId = null }
+    }
+
+    function onVis() {
+      if (document.visibilityState === 'visible') { void runRrd(); startRefresh() }
+      else stopRefresh()
+    }
+
+    document.addEventListener('visibilitychange', onVis)
+    // Start refresh interval after initial load delay
+    const refreshTimer = setTimeout(() => {
+      if (document.visibilityState === 'visible') startRefresh()
+    }, 30000)
+
+    return () => {
+      alive = false
+      clearTimeout(timer)
+      clearTimeout(refreshTimer)
+      stopRefresh()
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [selection?.type, selection?.id, tf, rrdWindow]) // Retirer data?.metrics?.ram?.max des dépendances
+
+  const progress = useMemo(() => (loading ? <LinearProgress /> : null), [loading])
+
+  const canShowRrd = selection && (selection.type === 'node' || selection.type === 'vm') && !data?.isTemplate
+
+  // Précharger les backups quand on sélectionne une VM. Snapshots PBS
+  // uniquement : le balayage des stockages PVE (archives vzdump) coûte
+  // 1 + 1 + N nœuds x M stockages appels à pveproxy, inacceptable à chaque clic
+  // dans l'arbre. Il n'a lieu qu'à l'ouverture de l'onglet Sauvegardes, juste
+  // en dessous.
+  useEffect(() => {
+    if (selection?.type !== 'vm') {
+      backupsLoadedForIdRef.current = null
+      return
+    }
+
+    const currentSelectionId = selection.id
+    if (backupsLoadedForIdRef.current === currentSelectionId) return
+
+    // Onglet Sauvegardes déjà ouvert : son propre effet charge la même VM avec
+    // le balayage. Précharger en plus lancerait deux requêtes concurrentes dont
+    // la plus lente écraserait l'autre.
+    if (detailTab === VM_BACKUPS_TAB_INDEX) return
+
+    backupsLoadedForIdRef.current = currentSelectionId
+
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    void loadBackups(vmid, type, connId, { node })
+    setBackupsPreloaded(true)
+  }, [selection?.type, selection?.id, detailTab, loadBackups])
+
+  // Recharger avec le balayage vzdump à l'ouverture de l'onglet Sauvegardes.
+  // Une fois par guest : le ref porte l'id de sélection et l'effet de
+  // réinitialisation le remet à null à chaque changement de sélection, y compris
+  // vers un nœud ou le cluster. Revenir sur l'onglet ne rebalaye donc pas, mais
+  // revenir sur le guest, si.
+  useEffect(() => {
+    if (selection?.type !== 'vm' || detailTab !== VM_BACKUPS_TAB_INDEX) return
+    if (backupsScannedForIdRef.current === selection.id) return
+
+    backupsScannedForIdRef.current = selection.id
+    backupsLoadedForIdRef.current = selection.id
+
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    void loadBackups(vmid, type, connId, { node, scanVzdump: true })
+    setBackupsPreloaded(true)
+  }, [selection?.type, selection?.id, detailTab, loadBackups])
+
+  // Note: snapshot preloading is handled inside useSnapshots hook
+
+  // Charger les infos guest (IP, uptime) quand une VM est sélectionnée
+  useEffect(() => {
+    if (selection?.type !== 'vm') {
+      setGuestInfo(null)
+      // The previous VM's load is aborted and no longer clears its own flag.
+      setGuestInfoLoading(false)
+
+      return
+    }
+
+    const req = selectionGuard.beginCurrent()
+
+    const loadGuestInfo = async () => {
+      const { connId, type, node, vmid } = parseVmId(selection.id)
+
+      setGuestInfoLoading(true)
+
+      try {
+        const res = await fetch(
+          `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/guest`,
+          { cache: 'no-store', signal: req.signal }
+        )
+
+        if (!req.isCurrent()) return
+
+        if (res.ok) {
+          const json = await res.json()
+          const data = json.data || {}
+
+          if (!req.isCurrent()) return
+
+          setGuestInfo({
+            ip: data.ip,
+            uptime: data.uptime,
+            pid: data.pid,
+            osInfo: data.osInfo,
+            diskUsage: data.diskUsage
+          })
+        } else {
+          setGuestInfo(null)
+        }
+      } catch (e) {
+        if (!req.isCurrent()) return
+        console.error('Error loading guest info:', e)
+        setGuestInfo(null)
+      } finally {
+        if (req.isCurrent()) setGuestInfoLoading(false)
+      }
+    }
+
+    void loadGuestInfo()
+  }, [selection?.type, selection?.id, selectionGuard])
+
+  // Charger le lock status quand une VM est sélectionnée
+  useEffect(() => {
+    if (selection?.type === 'vm') {
+      const { connId, node, type, vmid } = parseVmId(selection.id)
+      const req = selectionGuard.beginCurrent()
+
+      fetch(`/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/unlock`, {
+        cache: 'no-store',
+        signal: req.signal,
+      })
+        .then(res => res.ok ? res.json() : null)
+        .then(json => {
+          if (!req.isCurrent()) return
+          if (json?.data) {
+            setVmLock({
+              locked: json.data.locked || false,
+              lockType: json.data.lockType || undefined
+            })
+          } else {
+            setVmLock({ locked: false })
+          }
+        })
+        .catch(() => { if (req.isCurrent()) setVmLock({ locked: false }) })
+    } else {
+      setVmLock({ locked: false })
+    }
+  }, [selection?.type, selection?.id, selectionGuard])
+
+  // Charger les jobs de réplication quand on sélectionne l'onglet Réplication (index 7)
+  useEffect(() => {
+    if (detailTab === 7 && selection?.type === 'vm' && !replicationLoaded && !replicationLoading) {
+      setReplicationLoading(true)
+      const { connId, node, vmid } = parseVmId(selection.id)
+      // Not tied to this effect's cleanup: the effect re-runs when the loading
+      // flag flips, only a selection change may cancel the load.
+      const req = selectionGuard.beginCurrent()
+      const init = { cache: 'no-store' as const, signal: req.signal }
+
+      // Charger les jobs de réplication, les nœuds disponibles et vérifier Ceph
+      Promise.all([
+        fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/replication?guest=${vmid}`, init).catch(() => null),
+        fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes`, init).catch(() => null),
+        fetch(`/api/v1/connections/${encodeURIComponent(connId)}/ceph/status`, init).catch(() => null),
+      ]).then(async ([replicationRes, nodesRes, cephRes]) => {
+        if (!req.isCurrent()) return
+        let jobs: any[] = []
+        let nodes: string[] = []
+        let hasCeph = false
+        
+        if (replicationRes?.ok) {
+          try {
+            const json = await replicationRes.json()
+            jobs = (json.data?.jobs || []).filter((j: any) => String(j.guest) === String(vmid))
+          } catch {}
+        }
+        
+        if (nodesRes?.ok) {
+          try {
+            const json = await nodesRes.json()
+            const allNodes = json.data || json || []
+            nodes = allNodes
+              .filter((n: any) => n.node !== node && n.status === 'online')
+              .map((n: any) => n.node)
+          } catch {}
+        }
+        
+        // Vérifier si Ceph est disponible sur ce cluster
+        if (cephRes?.ok) {
+          try {
+            const json = await cephRes.json()
+            // Si on a un statut Ceph valide (health défini), Ceph est disponible
+            hasCeph = !!(json.data?.health || json.health)
+          } catch {}
+        }
+        
+        if (!req.isCurrent()) return
+        setReplicationJobs(jobs)
+        setAvailableTargetNodes(nodes)
+        setSourceCephAvailable(hasCeph)
+        setReplicationLoaded(true)
+        setReplicationLoading(false)
+      }).catch(() => {
+        if (!req.isCurrent()) return
+        setReplicationLoading(false)
+        setReplicationLoaded(true)
+      })
+    }
+  }, [detailTab, selection?.type, selection?.id, replicationLoaded, replicationLoading, selectionGuard])
+
+  // Charger les clusters Ceph disponibles quand on ouvre le dialog
+  useEffect(() => {
+    if (addCephReplicationDialogOpen && !cephClustersLoading && cephClusters.length === 0) {
+      setCephClustersLoading(true)
+      const { connId } = parseVmId(selection?.id || '')
+      
+      // Récupérer toutes les connexions et filtrer celles avec Ceph
+      fetch('/api/v1/connections', { cache: 'no-store' })
+        .then(async (res) => {
+          if (!res.ok) return
+          const json = await res.json()
+          const connections = json.data || json || []
+          
+          // Pour chaque connexion (sauf la source), vérifier si Ceph est disponible
+          const cephChecks = await Promise.all(
+            connections
+              .filter((c: any) => c.id !== connId && c.type === 'pve')
+              .map(async (c: any) => {
+                try {
+                  const cephRes = await fetch(`/api/v1/connections/${encodeURIComponent(c.id)}/ceph/status`, { cache: 'no-store' })
+                  if (cephRes.ok) {
+                    const cephJson = await cephRes.json()
+                    const healthData = cephJson.data?.health || cephJson.health
+                    const hasCeph = !!healthData
+                    if (hasCeph) {
+                      // S'assurer que cephHealth est une string
+                      let healthStatus = 'Unknown'
+                      if (typeof healthData === 'string') {
+                        healthStatus = healthData
+                      } else if (typeof healthData === 'object' && healthData.status) {
+                        healthStatus = healthData.status
+                      }
+                      return {
+                        id: c.id,
+                        name: c.name || c.id,
+                        host: c.host,
+                        cephHealth: healthStatus,
+                      }
+                    }
+                  }
+                } catch {}
+                return null
+              })
+          )
+          
+          setCephClusters(cephChecks.filter(Boolean))
+          setCephClustersLoading(false)
+        })
+        .catch(() => {
+          setCephClustersLoading(false)
+        })
+    }
+  }, [addCephReplicationDialogOpen, cephClustersLoading, cephClusters.length, selection?.id])
+
+  // Charger les données HA du cluster quand l'onglet HA est ouvert (lazy loading)
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 3 && !clusterHaLoaded && !clusterHaLoading) {
+      void loadClusterHa(selection.id)
+    }
+  }, [selection?.type, selection?.id, clusterTab, clusterHaLoaded, clusterHaLoading, loadClusterHa])
+
+  // Charger la config du cluster quand on sélectionne l'onglet Cluster
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 11 && !clusterConfigLoaded && !clusterConfigLoading) {
+      void loadClusterConfig(selection.id?.split(':')[0] || '')
+    }
+  }, [selection?.type, selection?.id, clusterTab, clusterConfigLoaded, clusterConfigLoading, loadClusterConfig])
+
+  // Charger les notes quand on sélectionne l'onglet Notes
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 6 && !clusterNotesLoaded && !clusterNotesLoading) {
+      void loadClusterNotes(selection.id?.split(':')[0] || '')
+    }
+  }, [selection?.type, selection?.id, clusterTab, clusterNotesLoaded, clusterNotesLoading, loadClusterNotes])
+
+  // Charger Ceph quand on sélectionne l'onglet Ceph
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 7 && !clusterCephLoaded && !clusterCephLoading) {
+      void loadClusterCeph(selection.id?.split(':')[0] || '')
+    }
+  }, [selection?.type, selection?.id, clusterTab, clusterCephLoaded, clusterCephLoading, loadClusterCeph])
+
+  // Composant icône de tendance
+  const TrendIcon = ({ trend }: { trend: 'up' | 'down' | 'stable' }) => {
+    if (trend === 'up') return <i className="ri-arrow-up-line" style={{ color: '#4caf50', fontSize: 14 }} />
+    if (trend === 'down') return <i className="ri-arrow-down-line" style={{ color: '#f44336', fontSize: 14 }} />
+    return <i className="ri-arrow-right-line" style={{ color: '#9e9e9e', fontSize: 14 }} />
+  }
+
+  // Charger la config du cluster pour les nodes standalone quand on sélectionne l'onglet Cluster
+  useEffect(() => {
+    if (selection?.type === 'node' && nodeTab === 9 && !clusterConfigLoaded && !clusterConfigLoading) {
+      void loadClusterConfig(parseNodeId(selection.id).connId)
+    }
+  }, [selection?.type, selection?.id, nodeTab, clusterConfigLoaded, clusterConfigLoading, loadClusterConfig])
+
+  // Reset node UI states when selection changes (data states are reset by useNodeData hook)
+  useEffect(() => {
+    setNodeNotesEditing(false)
+  }, [selection?.id])
+
+  // Charger Storage quand on sélectionne l'onglet Storage
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 8 && !clusterStorageLoaded && !clusterStorageLoading) {
+      void loadClusterStorage(selection.id?.split(':')[0] || '')
+    }
+  }, [selection?.type, selection?.id, clusterTab, clusterStorageLoaded, clusterStorageLoading, loadClusterStorage])
+
+  // Charger les mises à jour quand on sélectionne l'onglet Updates sur un node
+  useEffect(() => {
+    if (selection?.type !== 'node') return
+    const isInCluster = !!data?.clusterName
+    const updatesTabIndex = isInCluster ? 10 : 11
+    if (nodeTab !== updatesTabIndex) return
+
+    const { connId, node } = parseNodeId(selection.id)
+    if (nodeUpdates[node] !== undefined) return // Already loaded or loading
+
+    setNodeUpdates(prev => ({
+      ...prev,
+      [node]: { count: 0, updates: [], version: null, loading: true }
+    }))
+
+    void loadNodeAptUpdates({ connId, nodeName: node, setNodeUpdates })
+  }, [selection?.type, selection?.id, nodeTab, data?.clusterName, nodeUpdates])
+
+  // Charger les mises à jour quand on sélectionne l'onglet Rolling Update
+  useEffect(() => {
+    if (selection?.type === 'cluster' && clusterTab === 12 && data?.nodesData?.length > 0) {
+      const connId = selection.id || ''
+      // Charger les mises à jour et les VMs locales pour chaque nœud
+      data.nodesData.forEach((node: any) => {
+        // A node in HA maintenance (the one a rolling update is working on)
+        // still answers: only an offline node is skipped.
+        const reachable = isNodeReachable(node.status)
+
+        // Charger les mises à jour
+        if (reachable && !nodeUpdates[node.node]?.loading && nodeUpdates[node.node] === undefined) {
+          setNodeUpdates(prev => ({
+            ...prev,
+            [node.node]: { count: 0, updates: [], version: null, loading: true }
+          }))
+
+          void loadNodeAptUpdates({
+            connId,
+            nodeName: node.node,
+            setNodeUpdates,
+            versionFallback: node.pveversion || null,
+          })
+        }
+        
+        // Charger les VMs avec stockage local
+        if (reachable && !nodeLocalVms[node.node]?.loading && nodeLocalVms[node.node] === undefined) {
+          setNodeLocalVms(prev => ({
+            ...prev,
+            [node.node]: { total: 0, running: 0, blockingMigration: 0, withReplication: 0, canMigrate: true, vms: [], loading: true }
+          }))
+          
+          fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node.node)}/local-vms`)
+            .then(res => res.json())
+            .then(json => {
+              setNodeLocalVms(prev => ({
+                ...prev,
+                [node.node]: {
+                  total: json.data?.summary?.total || 0,
+                  running: json.data?.summary?.running || 0,
+                  blockingMigration: json.data?.summary?.blockingMigration || 0,
+                  withReplication: json.data?.summary?.withReplication || 0,
+                  canMigrate: json.data?.summary?.canMigrate ?? true,
+                  vms: json.data?.localVms || [],
+                  loading: false
+                }
+              }))
+            })
+            .catch(() => {
+              setNodeLocalVms(prev => ({
+                ...prev,
+                [node.node]: { total: 0, running: 0, blockingMigration: 0, withReplication: 0, canMigrate: true, vms: [], loading: false }
+              }))
+            })
+        }
+      })
+    }
+  }, [selection?.type, selection?.id, clusterTab, data?.nodesData, nodeUpdates, nodeLocalVms])
+
+  // Reset clusterTab et clusterHaLoaded quand la sélection change
+  useEffect(() => {
+    setClusterTab(0)
+    setNodeTab(0)
+    setClusterHaLoaded(false)
+    setClusterHaResources([])
+    setClusterHaGroups([])
+    setClusterHaRules([])
+    setClusterPveMajorVersion(8)
+    setClusterPveVersion('')
+    setClusterConfigLoaded(false)
+    setClusterConfig(null)
+    setClusterNotesLoaded(false)
+    setClusterNotesContent('')
+    setClusterNotesEditMode(false)
+    setClusterCephLoaded(false)
+    setClusterCephData(null)
+    setClusterStorageLoaded(false)
+    setClusterStorageData([])
+    setNodeCephSubTab(2)
+    setNodeCephLogLive(false)
+    setNodeUpdates({})
+    setNodeLocalVms({})
+    setClusterFirewallLoaded(false)
+  }, [selection?.id])
+
+  // Poll Ceph perf when viewing a Ceph (rbd/cephfs) storage
+  useEffect(() => {
+    const isCephStorage = selection?.type === 'storage' && data?.storageInfo && (data.storageInfo.type === 'rbd' || data.storageInfo.type === 'cephfs')
+    if (!isCephStorage) {
+      setStorageCephPerf(null)
+      setStorageCephPerfHistory([])
+      return
+    }
+    const connId = data.storageInfo.connId
+    // Aborted on cleanup (selection change or storageInfo refresh): a late read
+    // for the previous storage never lands in the current history.
+    const controller = new AbortController()
+    // One read in flight at most: a slow ceph status never stacks a second one.
+    let inFlight = false
+    const fetchPerf = async () => {
+      if (inFlight || controller.signal.aborted) return
+      inFlight = true
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/ceph/status`, { cache: 'no-store', signal: controller.signal })
+        const json = await res.json()
+        if (controller.signal.aborted) return
+        if (json.data?.pgmap) {
+          const now = Date.now()
+          const pt = {
+            time: now,
+            read_bytes_sec: json.data.pgmap.read_bytes_sec || 0,
+            write_bytes_sec: json.data.pgmap.write_bytes_sec || 0,
+            read_op_per_sec: json.data.pgmap.read_op_per_sec || 0,
+            write_op_per_sec: json.data.pgmap.write_op_per_sec || 0,
+          }
+          setStorageCephPerf(pt)
+          setStorageCephPerfHistory(prev => {
+            const cutoff = now - 300000 // 5 min
+            return [...prev, pt].filter(p => p.time > cutoff)
+          })
+        }
+      } catch { /* ignore */ } finally {
+        inFlight = false
+      }
+    }
+    void fetchPerf()
+
+    let iv: ReturnType<typeof setInterval> | null = null
+
+    function start() { if (iv !== null) return; iv = setInterval(fetchPerf, 3000) }
+    function stop() { if (iv !== null) { clearInterval(iv); iv = null } }
+    function onVis() { if (document.visibilityState === 'visible') { void fetchPerf(); start() } else { stop() } }
+
+    document.addEventListener('visibilitychange', onVis)
+    if (document.visibilityState === 'visible') start()
+
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVis)
+      controller.abort()
+    }
+  }, [selection?.type, selection?.id, data?.storageInfo])
+
+  // Fetch storage RRD history when viewing any storage
+  useEffect(() => {
+    if (selection?.type !== 'storage' || !data?.storageInfo) {
+      setStorageRrdHistory([])
+      return
+    }
+    const si = data.storageInfo
+    const path = `/nodes/${encodeURIComponent(si.node)}/storage/${encodeURIComponent(si.storage)}`
+    let cancelled = false
+
+    const load = async () => {
+      try {
+        const raw = await fetchRrd(si.connId, path, storageRrdTimeframe)
+        if (cancelled) return
+        const points = (Array.isArray(raw) ? raw : [])
+          .filter((p: any) => p.time || p.t || p.timestamp)
+          .map((p: any) => {
+            const t = Math.round(pickNumber(p, ['time', 't', 'timestamp']) || 0) * 1000
+            const total = pickNumber(p, ['total', 'maxdisk']) || 0
+            const used = pickNumber(p, ['used', 'disk']) || 0
+            return { time: t, used, total, usedPct: total > 0 ? Math.round((used / total) * 100) : 0 }
+          })
+          .filter((p: any) => p.time > 0 && p.total > 0)
+        setStorageRrdHistory(points)
+      } catch { setStorageRrdHistory([]) }
+    }
+    void load()
+
+    // Auto-refresh every 30s with visibility pause
+    let iv: ReturnType<typeof setInterval> | null = null
+
+    function start() { if (iv !== null) return; iv = setInterval(load, 30000) }
+    function stop() { if (iv !== null) { clearInterval(iv); iv = null } }
+    function onVis() { if (document.visibilityState === 'visible') { void load(); start() } else { stop() } }
+
+    document.addEventListener('visibilitychange', onVis)
+    const refreshTimer = setTimeout(() => { if (document.visibilityState === 'visible') start() }, 30000)
+
+    return () => { cancelled = true; clearTimeout(refreshTimer); stop(); document.removeEventListener('visibilitychange', onVis) }
+  }, [selection?.type, selection?.id, data?.storageInfo, storageRrdTimeframe])
+
+  // Détecter si les valeurs CPU ont été modifiées
+  const cpuModified = useMemo(() => {
+    if (!data?.cpuInfo) return false
+    const origFlags = data.cpuInfo.flags || {}
+    const flagsChanged = JSON.stringify(cpuFlags) !== JSON.stringify(origFlags)
+
+return (
+      cpuSockets !== (data.cpuInfo.sockets || 1) ||
+      cpuCores !== (data.cpuInfo.cores || 1) ||
+      cpuType !== (data.cpuInfo.type || 'kvm64') ||
+      flagsChanged ||
+      cpuLimit !== (data.cpuInfo.cpulimit || 0) ||
+      cpuLimitEnabled !== !!data.cpuInfo.cpulimit ||
+      numaEnabled !== !!data.cpuInfo.numa
+    )
+  }, [data?.cpuInfo, cpuSockets, cpuCores, cpuType, cpuFlags, cpuLimit, cpuLimitEnabled, numaEnabled])
+
+  // Détecter si les valeurs RAM ont été modifiées
+  const memoryModified = useMemo(() => {
+    if (!data?.memoryInfo) return false
+
+    const changed = memory !== (data.memoryInfo.memory || 2048) ||
+      balloon !== (data.memoryInfo.balloon || 0) ||
+      balloonEnabled !== (data.memoryInfo.balloon !== 0 && data.memoryInfo.balloon !== undefined)
+
+    if (data?.vmType === 'lxc') {
+      return changed || swap !== (data.memoryInfo.swap ?? 512)
+    }
+
+    return changed
+  }, [data?.memoryInfo, data?.vmType, memory, balloon, balloonEnabled, swap])
+
+  /**
+   * Pousse un patch de configuration du guest et attend que PVE l'ait appliqué.
+   * La route répond 202 + upid quand la tâche qmconfig dépasse le budget de la
+   * requête : le retrait de RAM débranche les barrettes une par une, plusieurs
+   * secondes chacune, et l'ancien appel synchrone expirait pendant que PVE
+   * appliquait quand même le changement (#743). On continue donc de suivre la
+   * tâche côté navigateur au lieu de crier à l'erreur.
+   */
+  const pushGuestConfig = (
+    connId: string,
+    type: string,
+    node: string,
+    vmid: string,
+    patch: Record<string, any>,
+  ) => putGuestConfig(connId, type, node, vmid, patch, {
+    onPending: () => toast.info(t('inventoryPage.configTaskStillApplying')),
+    failedMessage: t('inventoryPage.configTaskFailed'),
+    timeoutMessage: t('inventoryPage.configTaskTimeout'),
+  })
+
+  /**
+   * Recharge le panneau et dit si PVE liste encore une des clés qu'on vient
+   * d'écrire comme en attente. C'est la seule source de vérité pour savoir si
+   * le changement est déjà actif (hotplug) ou s'il attend un arrêt/relance :
+   * l'état d'alimentation de la VM, lui, ne le dit pas.
+   */
+  const reloadVmDetails = async (patch?: Record<string, any>) => {
+    if (!selection) return false
+
+    const payload = await fetchDetails(selection)
+
+    setData(payload)
+    setLocalTags(payload?.tags || [])
+
+    if (!patch) return false
+
+    const pendingKeys = new Set<string>((payload as any)?.pendingKeys || [])
+
+    return Object.keys(patch).some(key => pendingKeys.has(key))
+  }
+
+  // Sauvegarder la configuration CPU
+  const saveCpuConfig = async (opts?: { omitAdvanced?: boolean }) => {
+    if (!selection || selection.type !== 'vm') return
+
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    const vmTitle = data?.title
+    // The vDC compute policy can hide NUMA, CPU limit and flags from the
+    // tenant (#893). Those controls then keep whatever the guest already has,
+    // so the patch must leave them out (the server refuses truthy values) and
+    // only carry the model when the tenant actually changed it.
+    const omitAdvanced = !!(opts && typeof opts === 'object' && 'omitAdvanced' in opts && opts.omitAdvanced)
+
+    setSavingCpu(true)
+
+    try {
+      const configUpdate: any = {
+        sockets: cpuSockets,
+        cores: cpuCores,
+      }
+
+      if (omitAdvanced) {
+        if (cpuType !== (data?.cpuInfo?.type || 'kvm64')) configUpdate.cpu = cpuType
+      } else {
+        // Build cpu field with flags: "host,flags=+aes;-pcid"
+        const activeFlags = Object.entries(cpuFlags).filter(([, v]) => v === '+' || v === '-')
+        let cpuField = cpuType
+        if (activeFlags.length > 0) {
+          cpuField += ',flags=' + activeFlags.map(([k, v]) => `${v}${k}`).join(';')
+        }
+        configUpdate.cpu = cpuField
+        configUpdate.numa = numaEnabled ? 1 : 0
+        configUpdate.cpulimit = cpuLimitEnabled && cpuLimit > 0 ? cpuLimit : 0
+      }
+
+      await pushGuestConfig(connId, type, node, vmid, configUpdate)
+
+      const stillPending = await reloadVmDetails(configUpdate)
+
+      setConfirmAction({
+        action: 'info',
+        title: t('inventoryPage.cpuConfigSaved'),
+        message: stillPending
+          ? `⚠️ ${t('inventoryPage.vmRunningCpuRestartRequired')}`
+          : t('inventoryPage.changesAppliedSuccessfully'),
+        vmName: vmTitle,
+        onConfirm: () => { setConfirmAction(null); return Promise.resolve() }
+      })
+    } catch (e: any) {
+      // PVE a pu appliquer le changement même si on a perdu la main dessus :
+      // on rafraîchit avant de signaler, le panneau ne doit jamais mentir.
+      await reloadVmDetails().catch(() => {})
+      toast.error(`${t('inventoryPage.errorWhileSaving')}: ${e?.message || e}`)
+    } finally {
+      setSavingCpu(false)
+    }
+  }
+
+  // Sauvegarder la configuration RAM
+  const saveMemoryConfig = async () => {
+    if (!selection || selection.type !== 'vm') return
+
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    const vmTitle = data?.title
+
+    setSavingMemory(true)
+
+    try {
+      const configUpdate: any = {
+        memory: memory,
+      }
+
+      if (type === 'lxc') {
+        configUpdate.swap = swap
+      } else {
+        if (balloonEnabled) {
+          configUpdate.balloon = balloon
+        } else {
+          configUpdate.balloon = 0
+        }
+      }
+
+      await pushGuestConfig(connId, type, node, vmid, configUpdate)
+
+      const stillPending = await reloadVmDetails(configUpdate)
+
+      setConfirmAction({
+        action: 'info',
+        title: t('inventoryPage.ramConfigSaved'),
+        message: stillPending
+          ? `⚠️ ${t('inventoryPage.vmRunningRamRestartRequired')}`
+          : t('inventoryPage.changesAppliedSuccessfully'),
+        vmName: vmTitle,
+        onConfirm: () => { setConfirmAction(null); return Promise.resolve() }
+      })
+    } catch (e: any) {
+      await reloadVmDetails().catch(() => {})
+      toast.error(`${t('inventoryPage.errorWhileSaving')}: ${e?.message || e}`)
+    } finally {
+      setSavingMemory(false)
+    }
+  }
+
+  // Handler pour le clic sur une VM dans le tableau (pour afficher les détails)
+  const handleVmClick = useCallback((vm: VmRow) => {
+    // Ne pas ouvrir les détails pour les templates
+    if (vm.template) return
+    onSelect?.({ type: 'vm', id: vm.id })
+  }, [onSelect])
+
+  // Handler pour le clic sur un node dans le tableau
+  const handleNodeClick = useCallback((connId: string, node: string) => {
+    // Passer en vue "hosts" et sélectionner le node
+    onViewModeChange?.('hosts')
+    onSelect?.({ type: 'node', id: `${connId}:${node}` })
+  }, [onSelect, onViewModeChange])
+
+  // Actions placeholders
+  const handleNotImplemented = (action: string) => {
+    toast.warning(`${action}: ${t('common.notAvailable')}`)
+  }
+
+  const onUnlock = async () => {
+    if (!selection || selection.type !== 'vm') return
+    
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    
+    setUnlocking(true)
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/unlock`,
+        { method: 'POST' }
+      )
+      
+      if (res.ok) {
+        const json = await res.json()
+        if (json.data?.unlocked) {
+          setVmLock({ locked: false })
+          // Rafraîchir les données
+          if (onRefresh) {
+            await onRefresh()
+          }
+        }
+      } else {
+        const err = await res.json().catch(() => ({}))
+        setUnlockErrorDialog({
+          open: true,
+          error: err?.error || res.statusText,
+          hint: err?.hint,
+          lockType: err?.lockType
+        })
+      }
+    } catch (e: any) {
+      setUnlockErrorDialog({
+        open: true,
+        error: e.message || String(e)
+      })
+    } finally {
+      setUnlocking(false)
+    }
+  }
+
+  const onMigrate = () => {
+    // Ouvrir le dialog de migration (cross-cluster toujours disponible, même pour standalone)
+    setMigrateDialogOpen(true)
+  }
+
+  const onClone = () => setCloneDialogOpen(true)
+  const onConvertTemplate = () => {
+    const status = data?.vmRealStatus || data?.status
+    if (status === 'running') {
+      toast.warning(t('inventory.vmRunningWarning'))
+      return
+    }
+    setConvertTemplateDialogOpen(true)
+  }
+
+  const handleConvertTemplate = async () => {
+    if (!selection || selection.type !== 'vm') return
+
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+
+    setConvertingTemplate(true)
+
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}/template`,
+        { method: 'POST' }
+      )
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err?.error || `HTTP ${res.status}`)
+      }
+
+      const json = await res.json()
+      const upid = json.data
+
+      setConvertTemplateDialogOpen(false)
+
+      if (upid && typeof upid === 'string' && upid.startsWith('UPID:')) {
+        void trackTask({
+          upid,
+          connId,
+          node,
+          description: `${data?.title || `VM ${vmid}`}: ${t('templates.convertToTemplate')}`,
+          onSuccess: () => { void onRefresh?.() },
+        })
+      } else {
+        toast.success(t('templates.convertSuccess'))
+        void onRefresh?.()
+      }
+    } catch (e: any) {
+      toast.error(`${t('errors.genericError')}: ${humanizePveError(e)}`)
+    } finally {
+      setConvertingTemplate(false)
+    }
+  }
+
+  const onDelete = () => {
+    const status = data?.vmRealStatus || data?.status
+
+    // Short-circuit before opening the confirm dialog so the user does not
+    // have to type the VM name only to be rejected by the API.
+    if (vmLock.locked) {
+      setConfirmAction({
+        action: 'info',
+        title: t('errors.deleteError'),
+        message: t('inventory.deleteVmLockedError', { lock: vmLock.lockType || 'locked' }),
+        vmName: data?.title,
+        onConfirm: () => { setConfirmAction(null); return Promise.resolve() },
+      })
+
+      return
+    }
+
+    if (status === 'running') {
+      setConfirmAction({
+        action: 'info',
+        title: t('errors.deleteError'),
+        message: t('inventory.deleteVmRunningError'),
+        vmName: data?.title,
+        onConfirm: () => { setConfirmAction(null); return Promise.resolve() },
+      })
+
+      return
+    }
+
+    setDeleteVmConfirmText('')
+    setDeleteVmPurge(true)
+    setDeleteVmDialogOpen(true)
+  }
+
+  // Fonction de suppression effective de la VM
+  const handleDeleteVm = async () => {
+    if (!selection || selection.type !== 'vm') return
+    
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+    const vmName = data?.title || vmid
+    const confirmTarget = `${vmid}` // On peut aussi utiliser le nom
+    
+    // Vérifier que le texte de confirmation correspond
+    if (deleteVmConfirmText !== confirmTarget && deleteVmConfirmText !== vmName) {
+      return // Le bouton sera disabled de toute façon
+    }
+    
+    setDeletingVm(true)
+
+    try {
+      const params = new URLSearchParams()
+
+      if (deleteVmPurge) {
+        params.append('purge', '1')
+        params.append('destroy-unreferenced-disks', '1')
+      }
+      
+      const url = `/api/v1/connections/${encodeURIComponent(connId)}/guests/${type}/${encodeURIComponent(node)}/${encodeURIComponent(vmid)}?${params.toString()}`
+      const res = await fetch(url, { method: 'DELETE' })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        const error: any = new Error(err?.error || `HTTP ${res.status}`)
+
+        error.code = err?.code
+        error.lock = err?.lock
+        throw error
+      }
+
+      const json = await res.json()
+      const upid = json.data
+
+      setDeleteVmDialogOpen(false)
+
+      // Retourner à la vue globale
+      onSelect?.(null as any) // Désélectionner
+
+      if (upid && typeof upid === 'string' && upid.startsWith('UPID:')) {
+        void trackTask({
+          upid,
+          connId,
+          node,
+          description: `${vmName}: ${t('common.delete')}`,
+          onSuccess: () => { void onRefresh?.() },
+        })
+      } else {
+        void onRefresh?.()
+      }
+
+      // Afficher un message de succès
+      setConfirmAction({
+        action: 'info',
+        title: t('common.success'),
+        message: `${t('common.delete')} "${vmName}" ${t('common.success')}${json.warning ? ` (${json.warning})` : ''}`,
+        vmName: undefined,
+        onConfirm: () => {
+          setConfirmAction(null)
+          return Promise.resolve()
+        }
+      })
+    } catch (e: any) {
+      setDeleteVmDialogOpen(false)
+
+      let message: string
+
+      if (e?.code === 'vm_locked') {
+        message = t('inventory.deleteVmLockedError', { lock: e.lock || 'locked' })
+      } else if (e?.code === 'vm_running') {
+        message = t('inventory.deleteVmRunningError')
+      } else {
+        message = `${t('errors.deleteError')}: ${e?.message || e}`
+      }
+
+      setConfirmAction({
+        action: 'info',
+        title: t('errors.deleteError'),
+        message,
+        onConfirm: () => { setConfirmAction(null); return Promise.resolve() },
+      })
+    } finally {
+      setDeletingVm(false)
+    }
+  }
+
+  // Sync detail panel status from allVms (updated by tree optimistic updates / SSE)
+  const selectedVmFromList = useMemo(() => {
+    if (!selection || selection.type !== 'vm') return null
+    const { connId, vmid } = parseVmId(selection.id)
+    return allVms.find(v => v.connId === connId && String(v.vmid) === String(vmid)) || null
+  }, [selection, allVms])
+
+  useLiveVmStatus(selectedVmFromList?.status, data, setData)
+
+  // Status de la VM pour les actions et la console
+  const vmStatus = data?.vmRealStatus || data?.status
+  const vmState = data?.vmRealStatus || data?.status
+  const showConsole = selection?.type === 'vm' && !data?.isTemplate
+
+  // Vérifier si la VM sélectionnée est sur un cluster (pour HA)
+  const selectedVmIsCluster = useMemo(() => {
+    if (!selection || selection.type !== 'vm') return false
+    const { connId, node, type, vmid } = parseVmId(selection.id)
+
+    const vm = allVms.find(v => 
+      v.connId === connId && 
+      v.node === node && 
+      v.type === type && 
+      v.vmid === vmid
+    )
+
+    
+return vm?.isCluster ?? false
+  }, [selection, allVms])
+
+  // Root guest list (flat "vms" view). Its header carries "Deploy from template"
+  // and "Create VM", so an empty inventory still gets it once loaded: a new vDC
+  // tenant has no guest yet and nowhere else to create its first one (#1271).
+  const emptyGuestListReady = showRootGuestList(viewMode, displayVms.length, inventoryLoaded)
+  const renderRootGuestList = () => (
+    <Box sx={{ height: 'calc(100vh - 76px - var(--taskbar-height, 0px) - var(--top-banner-height, 0px))', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <Card variant="outlined" sx={{ width: '100%', borderRadius: 0, flex: 1, minHeight: 0, border: 'none', display: 'flex', flexDirection: 'column' }}>
+        <CardContent sx={{ p: 0, '&:last-child': { pb: 0 }, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <Box sx={{
+            px: 2,
+            py: 1.5,
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexShrink: 0
+          }}>
+            <Typography fontWeight={900} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              <i className="ri-computer-line" style={{ fontSize: 20, opacity: 0.7 }} />
+              {t('inventory.guests')} ({displayVms.length})
+            </Typography>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <GuestSelectionBar selection={rootGuestSelection} inline />
+              {canCreate && !allowLxc && (
+                <Button
+                  size="small"
+                  variant="contained"
+                  startIcon={<i className="ri-rocket-2-line" />}
+                  onClick={() => router.push('/automation/templates')}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {t('inventory.deployFromTemplate')}
+                </Button>
+              )}
+              {canCreate && allowBlankVm && (
+                <Button
+                  size="small"
+                  variant={allowLxc ? 'contained' : 'outlined'}
+                  startIcon={<i className="ri-add-line" />}
+                  onClick={() => setCreateVmDialogOpen(true)}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {t('common.create')} VM
+                </Button>
+              )}
+              {canCreate && allowLxc && (
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<i className="ri-add-line" />}
+                  onClick={() => setCreateLxcDialogOpen(true)}
+                  sx={{ textTransform: 'none' }}
+                >
+                  {t('common.create')} LXC
+                </Button>
+              )}
+            </Stack>
+          </Box>
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <VmsTable
+              vms={displayVms.map(vm => ({
+                id: `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}`,
+                connId: vm.connId,
+                node: vm.node,
+                vmid: vm.vmid,
+                name: vm.name,
+                type: vm.type,
+                status: vm.status || 'unknown',
+                cpu: vm.status === 'running' && vm.cpu !== undefined ? Math.min(100, vm.cpu * 100) : undefined,
+                maxcpu: vm.maxcpu,
+                ram: vm.status === 'running' && vm.mem !== undefined && vm.maxmem ? (vm.mem / vm.maxmem) * 100 : undefined,
+                mem: vm.mem,
+                maxmem: vm.maxmem,
+                disk: vm.disk,
+                maxdisk: vm.maxdisk,
+                diskTotal: vm.diskTotal,
+                uptime: vm.uptime,
+                ip: vm.ip,
+                snapshots: vm.snapshots,
+                tags: vm.tags,
+                template: vm.template,
+                hastate: vm.hastate,
+                hagroup: vm.hagroup,
+                isCluster: vm.isCluster,
+                osInfo: vm.osInfo,
+                lock: vm.lock,
+                vdcName: vdcNameByConn.get(vm.connId),
+              }))}
+              expanded
+              showNode
+              nodeStatuses={nodeStatuses}
+              showTrends
+              showActions
+              showIpSnap={showIpSnap}
+              ipSnapLoading={ipSnapLoading}
+              onLoadIpSnap={onLoadIpSnap}
+              onLoadTrendsBatch={loadVmTrendsBatch}
+              onVmClick={handleVmClick}
+              onVmAction={handleTableVmAction}
+              onMigrate={handleTableMigrate}
+              onNodeClick={handleNodeClick}
+              maxHeight="100%"
+              autoPageSize
+              showDensityToggle
+              highlightedId={highlightedVmId}
+              favorites={favorites}
+              onToggleFavorite={toggleFavorite}
+              migratingVmIds={migratingVmIds}
+              defaultHiddenColumns={['node', 'ha']}
+              showVdcColumn={showVdcColumn}
+              {...rootGuestSelection.tableProps}
+            />
+          </Box>
+        </CardContent>
+      </Card>
+    </Box>
+  )
+
+  return (
+    <Box sx={{ p: selection && selection.type !== 'root' && !selection.type.endsWith('-root') ? 2.5 : 0, width: '100%', height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column', fontSize: 13, '& .MuiTypography-body2': { fontSize: '13px !important', fontWeight: '400 !important' }, '& .MuiTypography-body1': { fontSize: '13px !important' }, '& .MuiTypography-caption': { fontSize: '11px !important' } }}>
+      {progress}
+
+      {error ? (
+        <Alert severity="error" sx={{ mb: 2, mx: selection && selection.type !== 'root' && !selection.type.endsWith('-root') ? 0 : 2 }}>
+          {t('common.errorWithMessage', { error })}
+        </Alert>
+      ) : null}
+
+      {/* Section dashboards */}
+      {selection?.type === 'storage-root' ? (
+        <Box sx={{ p: 2.5, height: '100%', overflow: 'auto' }}>
+          <StorageDashboard
+            clusterStorages={clusterStorages}
+            onStorageClick={(sel) => onSelect?.(sel)}
+          />
+        </Box>
+      ) : selection?.type === 'network-root' ? (
+        <Box sx={{ p: 2.5, height: '100%', overflow: 'auto' }}>
+          <NetworkDashboard
+            connectionIds={[...new Set(clusterStorages.map(cs => cs.connId))]}
+            connectionNames={Object.fromEntries(clusterStorages.map(cs => [cs.connId, cs.connName]))}
+            hosts={hosts}
+            onSelect={onSelect}
+          />
+        </Box>
+      ) : selection?.type === 'net-conn' || selection?.type === 'net-node' || selection?.type === 'net-vlan' || selection?.type === 'net-bridge' ? (
+        <NetworkDetailPanel selection={selection} onSelect={onSelect} />
+      ) : selection?.type === 'tvnet' ? (
+        <Box sx={{ p: 2.5, height: '100%', overflow: 'auto' }}>
+          <TenantVnetDetailPanel selectionId={selection.id} />
+        </Box>
+      ) : selection?.type === 'storage-cluster' || selection?.type === 'storage-node' ? (
+        <StorageIntermediatePanel selection={selection} clusterStorages={clusterStorages || []} onSelect={onSelect} />
+      ) : selection?.type === 'backup-root' ? (
+        <Box sx={{ p: 2.5, height: '100%', overflow: 'auto' }}>
+          <BackupDashboard
+            pbsServers={pbsServers}
+            onPbsClick={(sel) => onSelect?.(sel)}
+            onDatastoreClick={(sel) => onSelect?.(sel)}
+          />
+        </Box>
+      ) : selection?.type === 'migration-root' ? (
+        <Box sx={{ p: 2.5, height: '100%', overflow: 'auto' }}>
+          <MigrationDashboard
+            externalHypervisors={externalHypervisors}
+            onHostClick={(sel) => onSelect?.(sel)}
+          />
+        </Box>
+      ) :
+
+      /* Quand sélection root et mode tree: afficher vue hiérarchique collapsable */
+      selection?.type === 'root' && viewMode === 'tree' ? (
+        <RootInventoryView
+          allVms={displayVms}
+          hosts={hosts}
+          pbsServers={pbsServers?.map(pbs => ({
+            connId: pbs.connId,
+            name: pbs.name,
+            status: pbs.status,
+            backupCount: pbs.stats?.backupCount || 0
+          }))}
+          onVmClick={handleVmClick}
+          onVmAction={handleTableVmAction}
+          onMigrate={handleTableMigrate}
+          onNodeClick={handleNodeClick}
+          onSelect={onSelect}
+          favorites={favorites}
+          onToggleFavorite={toggleFavorite}
+          migratingVmIds={migratingVmIds}
+          onLoadTrendsBatch={loadVmTrendsBatch}
+          showIpSnap={showIpSnap}
+          ipSnapLoading={ipSnapLoading}
+          onLoadIpSnap={onLoadIpSnap}
+          onCreateVm={canCreate ? () => setCreateVmDialogOpen(true) : undefined}
+          onCreateLxc={canCreate ? () => setCreateLxcDialogOpen(true) : undefined}
+          onBulkAction={handleHostBulkAction}
+          clusterStorages={clusterStorages}
+          externalHypervisors={externalHypervisors}
+        />
+      ) : !selection || selection?.type === 'root' ? (
+        viewMode === 'vms' && displayVms.length > 0 ? (
+          renderRootGuestList()
+        ) : viewMode === 'hosts' && hosts.length > 0 ? (
+          <GroupedVmsView
+            title={t('inventory.nodes')}
+            icon="ri-server-line"
+            groups={hosts.map(h => ({
+              key: h.key,
+              label: h.node,
+              sublabel: h.connName,
+              icon: (
+                <Box sx={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: 16, height: 16, flexShrink: 0 }}>
+                  <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={16} height={16} style={{ opacity: h.status === 'online' ? 0.8 : 0.4 }} />
+                  <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 8, height: 8, borderRadius: '50%', bgcolor: h.status === 'online' ? '#4caf50' : '#f44336', border: '1.5px solid', borderColor: 'background.paper' }} />
+                </Box>
+              ),
+              vms: h.vms
+            }))}
+            allVms={displayVms}
+            onVmClick={handleVmClick}
+            onVmAction={handleTableVmAction}
+            onMigrate={handleTableMigrate}
+            onLoadTrendsBatch={loadVmTrendsBatch}
+            onSelect={onSelect}
+            favorites={favorites}
+            onToggleFavorite={toggleFavorite}
+            migratingVmIds={migratingVmIds}
+            showVdcColumn={showVdcColumn}
+            vdcNameByConn={vdcNameByConn}
+            nodeStatuses={nodeStatuses}
+            guestSelection={rootGuestSelection}
+          />
+        ) : viewMode === 'pools' && pools.length > 0 ? (
+          <GroupedVmsView
+            title={t('inventory.byPool')}
+            icon="ri-folder-line"
+            groups={pools.map(p => ({
+              key: p.pool,
+              label: p.pool,
+              description: p.comment,
+              vms: p.vms
+            }))}
+            allVms={displayVms}
+            onVmClick={handleVmClick}
+            onVmAction={handleTableVmAction}
+            onMigrate={handleTableMigrate}
+            onLoadTrendsBatch={loadVmTrendsBatch}
+            onSelect={onSelect}
+            favorites={favorites}
+            onToggleFavorite={toggleFavorite}
+            migratingVmIds={migratingVmIds}
+            showVdcColumn={showVdcColumn}
+            vdcNameByConn={vdcNameByConn}
+            nodeStatuses={nodeStatuses}
+            guestSelection={rootGuestSelection}
+          />
+        ) : viewMode === 'tags' && tags.length > 0 ? (
+          <GroupedVmsView
+            title={t('inventory.byTag')}
+            icon="ri-price-tag-3-line"
+            groups={tags.map(t => ({
+              key: t.tag,
+              label: t.tag,
+              color: getTagColor(t.tag, t.vms[0]?.connId).bg,
+              vms: t.vms
+            }))}
+            allVms={displayVms}
+            onVmClick={handleVmClick}
+            onVmAction={handleTableVmAction}
+            onMigrate={handleTableMigrate}
+            onLoadTrendsBatch={loadVmTrendsBatch}
+            onSelect={onSelect}
+            favorites={favorites}
+            onToggleFavorite={toggleFavorite}
+            migratingVmIds={migratingVmIds}
+            showVdcColumn={showVdcColumn}
+            vdcNameByConn={vdcNameByConn}
+            nodeStatuses={nodeStatuses}
+            guestSelection={rootGuestSelection}
+          />
+        ) : viewMode === 'templates' ? (
+
+          /* Mode Templates */
+          <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+            <Card variant="outlined" sx={{ flex: 1, display: 'flex', flexDirection: 'column', borderRadius: 2 }}>
+              <CardContent sx={{ flex: 1, display: 'flex', flexDirection: 'column', p: 0, '&:last-child': { pb: 0 } }}>
+                {/* Header */}
+                <Box sx={{ 
+                  px: 2, 
+                  py: 1.5, 
+                  borderBottom: '1px solid', 
+                  borderColor: 'divider',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 2
+                }}>
+                  <Stack direction="row" spacing={1.5} alignItems="center">
+                    <i className="ri-file-copy-line" style={{ fontSize: 20, opacity: 0.7 }} />
+                    <Typography variant="h6" fontWeight={700}>
+                      {t('inventory.templatesCount', { count: allVms.filter(vm => vm.template).length })}
+                    </Typography>
+                  </Stack>
+                </Box>
+                <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                  <VmsTable
+                    vms={allVms.filter(vm => vm.template).map(vm => ({
+                      id: `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}`,
+                      connId: vm.connId,
+                      node: vm.node,
+                      vmid: vm.vmid,
+                      name: vm.name,
+                      type: vm.type,
+                      status: vm.status || 'unknown',
+                      cpu: vm.status === 'running' && vm.cpu !== undefined ? Math.min(100, vm.cpu * 100) : undefined,
+                      maxcpu: vm.maxcpu,
+                      ram: vm.status === 'running' && vm.mem !== undefined && vm.maxmem ? (vm.mem / vm.maxmem) * 100 : undefined,
+                      mem: vm.mem,
+                      maxmem: vm.maxmem,
+                      disk: vm.disk,
+                      maxdisk: vm.maxdisk,
+                      diskTotal: vm.diskTotal,
+                      uptime: vm.uptime,
+                      ip: vm.ip,
+                      snapshots: vm.snapshots,
+                      tags: vm.tags,
+                      template: vm.template,
+                      isCluster: vm.isCluster,
+                      osInfo: vm.osInfo,
+                      lock: vm.lock,
+                    }))}
+                    expanded
+                    showNode
+                    nodeStatuses={nodeStatuses}
+                    showActions
+                    onVmAction={handleTableVmAction}
+                    onNodeClick={handleNodeClick}
+                    maxHeight="100%"
+                    autoPageSize
+                    showDensityToggle
+                    favorites={favorites}
+                    onToggleFavorite={toggleFavorite}
+                    migratingVmIds={migratingVmIds}
+                  />
+                </Box>
+              </CardContent>
+            </Card>
+          </Box>
+        ) : (
+          <>
+            {emptyGuestListReady && renderRootGuestList()}
+            {!emptyGuestListReady && (
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flex: 1,
+                  minHeight: 0,
+                  opacity: 0.35,
+                  gap: 2
+                }}
+              >
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                  <svg 
+                    width={48} 
+                    height={37} 
+                    viewBox="0 0 220 170" 
+                    fill="none" 
+                    xmlns="http://www.w3.org/2000/svg"
+                  >
+                    <path 
+                      d="M 174.30 158.91 C160.99,140.34 155.81,133.18 151.52,127.42 C149.04,124.08 147.00,120.78 147.00,120.10 C147.00,119.42 148.91,116.47 151.25,113.55 C153.59,110.63 157.44,105.71 159.81,102.62 C162.18,99.53 164.71,97.00 165.44,97.00 C166.58,97.00 182.93,119.09 200.79,144.77 C203.71,148.95 208.32,155.38 211.04,159.06 C213.77,162.74 216.00,166.03 216.00,166.37 C216.00,166.72 207.92,167.00 198.05,167.00 L 180.10 167.00 Z M 164.11 69.62 C161.87,67.24 159.22,63.61 151.44,52.29 L 147.85 47.07 L 153.79 39.29 C157.05,35.00 161.25,29.62 163.11,27.32 C164.98,25.02 169.65,19.08 173.50,14.11 L 180.50 5.08 L 199.25 5.04 C209.56,5.02 218.00,5.23 218.00,5.51 C218.00,5.79 214.51,10.42 210.25,15.81 C205.99,21.19 199.80,29.11 196.50,33.41 C193.20,37.71 189.15,42.92 187.50,44.98 C183.18,50.39 169.32,68.18 167.76,70.30 C166.52,72.01 166.33,71.98 164.11,69.62 Z" 
+                      fill="currentColor"
+                    />
+                    <path 
+                      d="M 0.03 164.75 C0.05,162.18 2.00,159.04 9.28,149.83 C19.92,136.37 45.56,103.43 54.84,91.32 L 61.17 83.05 L 58.87 79.77 C49.32,66.18 11.10,12.77 8.83,9.86 C7.28,7.85 6.00,5.94 6.00,5.61 C6.00,5.27 14.21,5.01 24.25,5.03 L 42.50 5.06 L 53.50 20.63 C59.55,29.20 65.44,37.40 66.58,38.85 C72.16,45.97 97.33,81.69 97.70,83.02 C98.13,84.59 95.40,88.27 63.50,129.06 C53.05,142.42 42.77,155.64 40.66,158.43 C32.84,168.76 34.77,168.00 16.33,168.00 L 0.00 168.00 L 0.03 164.75 Z M 55.56 167.09 C55.25,166.59 56.95,163.78 59.33,160.84 C61.71,157.90 66.10,152.33 69.08,148.46 C72.06,144.59 81.47,132.50 90.00,121.60 C98.53,110.69 106.38,100.58 107.46,99.13 C108.54,97.69 111.81,93.49 114.72,89.80 L 120.00 83.10 L 115.25 76.47 C112.64,72.82 109.82,68.83 109.00,67.61 C108.18,66.38 105.73,62.93 103.57,59.94 C101.41,56.95 96.88,50.67 93.51,46.00 C77.15,23.36 65.00,6.12 65.00,5.57 C65.00,5.23 73.21,5.08 83.24,5.23 L 101.49 5.50 L 124.77 38.00 C137.58,55.88 150.09,73.37 152.58,76.88 C155.08,80.39 156.91,83.79 156.66,84.44 C156.41,85.09 153.55,88.97 150.30,93.06 C147.06,97.15 137.93,108.82 130.02,119.00 C122.12,129.18 110.29,144.36 103.75,152.75 L 91.85 168.00 L 73.98 168.00 C64.16,168.00 55.87,167.59 55.56,167.09 Z" 
+                      fill="currentColor"
+                      opacity="0.5"
+                    />
+                  </svg>
+                  <Typography 
+                    variant="h4" 
+                    fontWeight={900} 
+                    sx={{ 
+                      letterSpacing: -1,
+                      color: 'text.secondary'
+                    }}
+                  >
+                    ProxCenter
+                  </Typography>
+                </Box>
+                <Typography 
+                  variant="body2" 
+                  sx={{ 
+                    color: 'text.secondary',
+                    textAlign: 'center',
+                    maxWidth: 300
+                  }}
+                >
+                  {t('common.select')}
+                </Typography>
+              </Box>
+            )}
+          </>
+        )
+      ) : null}
+
+      {selection && data ? (
+        <Stack spacing={2} sx={{ width: '100%', flex: 1, overflow: 'hidden', minHeight: 0 }}>
+          {/* Collapsible header zone for VMs and Nodes */}
+          <Collapse in={!((selection?.type === 'vm' || selection?.type === 'node') && headerCollapsed)} timeout={200} sx={{ flexShrink: 0 }}>
+          {/* Header title + tags (VM only) + ACTIONS TOP RIGHT */}
+          {selection?.type === 'vm' ? (
+
+            /* Format VM — single row: back | icon | name · meta · status | tags | actions */
+            (() => {
+              const { connId, node, type, vmid } = parseVmId(selection.id)
+              const isLxc = data.vmType === 'lxc'
+              const iconColor = theme.palette.text.secondary
+
+              return (
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+                  {/* Back */}
+                  {onBack && (
+                    <IconButton
+                      onClick={onBack}
+                      size="small"
+                      sx={{
+                        bgcolor: 'action.hover',
+                        '&:hover': { bgcolor: 'action.selected' },
+                        flexShrink: 0,
+                      }}
+                    >
+                      <i className="ri-arrow-left-line" style={{ fontSize: 18 }} />
+                    </IconButton>
+                  )}
+
+                  <StatusIcon
+                    status={vmState}
+                    type="vm"
+                    template={data.isTemplate}
+                    vmType={data.vmType}
+                    isMigrating={migratingVmIds?.has(`${connId}:${vmid}`)}
+                    isPendingAction={pendingActionVmIds?.has(`${connId}:${vmid}`)}
+                    size={22}
+                  />
+
+                  {/* Nom + meta inline */}
+                  <Typography variant="subtitle1" fontWeight={900} noWrap sx={{ minWidth: 0, flexShrink: 1 }}>
+                    {data.title} <Typography component="span" variant="body2" sx={{ color: 'text.disabled', fontWeight: 400 }}>({vmid})</Typography>
+                  </Typography>
+                  {/* Favorite star */}
+                  {(() => {
+                    const vmKey = `${connId}:${node}:${isLxc ? 'lxc' : 'qemu'}:${vmid}`
+                    const isFav = favorites.has(vmKey)
+
+                    return (
+                      <IconButton
+                        size="small"
+                        onClick={() => toggleFavorite({ id: vmKey, connId, node, type: isLxc ? 'lxc' : 'qemu', vmid, name: data.title })}
+                        sx={{ p: 0.25, flexShrink: 0, color: isFav ? '#ffc107' : 'text.disabled', '&:hover': { color: '#ffc107' } }}
+                      >
+                        <i className={isFav ? 'ri-star-fill' : 'ri-star-line'} style={{ fontSize: 16 }} />
+                      </IconButton>
+                    )
+                  })()}
+                  {pendingActionVmIds?.has(`${connId}:${vmid}`) && (
+                    <CircularProgress size={16} thickness={5} sx={{ flexShrink: 0 }} />
+                  )}
+                  {vmLock.locked && (
+                    <MuiTooltip title={`Lock: ${vmLock.lockType || 'unknown'}`}>
+                      <Chip
+                        size="small"
+                        icon={<i className="ri-lock-line" style={{ fontSize: 12, marginLeft: 6 }} />}
+                        label={vmLock.lockType || 'locked'}
+                        color="warning"
+                        variant="outlined"
+                        sx={{ height: 20, fontSize: '0.7rem', flexShrink: 0 }}
+                      />
+                    </MuiTooltip>
+                  )}
+                  {/* vDC chip — tenant mirror of the provider node chip:
+                      the vDC is the only placement info a tenant sees. */}
+                  {!isFullClusterView && vdcNameByConn.get(connId) && (
+                    <Chip
+                      size="small"
+                      icon={<i className="ri-cloud-line" style={{ fontSize: 12, marginLeft: 6 }} />}
+                      label={vdcNameByConn.get(connId)}
+                      color="primary"
+                      variant="outlined"
+                      sx={{ height: 20, fontSize: '0.7rem', flexShrink: 0 }}
+                    />
+                  )}
+                  {/* Node chip — provider/MSP only. vDC tenants see a vDC
+                      abstraction where the underlying PVE node is an
+                      implementation detail they don't manage; exposing it
+                      would also make the host view clickable from a tenant
+                      admin (we hide /hosts for them). The cluster icon link
+                      goes away with it. */}
+                  {isFullClusterView && (
+                    <Typography variant="body2" noWrap sx={{ color: 'text.secondary', flexShrink: 0 }}>
+                      {'- '}
+                      <span style={{ position: 'relative', display: 'inline-block', verticalAlign: 'text-bottom', marginRight: 4, width: 14, height: 14 }}>
+                        <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={14} height={14} style={{ opacity: 0.7, display: 'block' }} />
+                        <span style={{ position: 'absolute', bottom: -1, right: -1, width: 6, height: 6, borderRadius: '50%', backgroundColor: '#4caf50', border: '1.5px solid var(--mui-palette-background-paper)' }} />
+                      </span>
+                      <Typography
+                        component="span"
+                        variant="body2"
+                        sx={{
+                          color: 'primary.main',
+                          cursor: 'pointer',
+                          fontWeight: 600,
+                          '&:hover': { textDecoration: 'underline' }
+                        }}
+                        onClick={() => {
+                          onViewModeChange?.('hosts')
+                          onSelect?.({ type: 'node', id: `${connId}:${node}` })
+                        }}
+                      >
+                        {node}
+                      </Typography>
+                    </Typography>
+                  )}
+
+                  {/* Tags */}
+                  <TagManager
+                    tags={localTags}
+                    connId={connId}
+                    node={node}
+                    type={type}
+                    vmid={vmid}
+                    onTagsChange={(newTags) => {
+                      setLocalTags(newTags)
+                      onVmTagsChange?.(connId, vmid, newTags)
+                    }}
+                  />
+
+                  {/* Green Score — Enterprise only, hidden for templates */}
+                  {isEnterprise && !data.isTemplate && connId && node && vmid && (
+                    <Box sx={{ flexShrink: 1, minWidth: 0, overflow: 'hidden' }}>
+                      <GreenScoreCard
+                        inline
+                        connId={connId}
+                        node={node}
+                        type={isLxc ? 'lxc' : 'qemu'}
+                        vmid={vmid}
+                      />
+                    </Box>
+                  )}
+
+                  {/* Refresh + Actions — poussées à droite */}
+                  <Box sx={{ ml: 'auto', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                    <MuiTooltip title={t('common.refresh')}>
+                      <IconButton size="small" onClick={refreshData} disabled={refreshing} sx={{ bgcolor: 'action.hover', '&:hover': { bgcolor: 'action.selected' }, '@keyframes spin': { '0%': { transform: 'rotate(0deg)' }, '100%': { transform: 'rotate(360deg)' } }, ...(refreshing && { '& i': { animation: 'spin 1s linear infinite' } }) }}>
+                        <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+                      </IconButton>
+                    </MuiTooltip>
+                    {data.isTemplate ? (
+                      <>
+                        <MuiTooltip title={t('hardware.clone')}>
+                          <IconButton size="small" onClick={onClone} sx={{ bgcolor: 'action.hover', '&:hover': { bgcolor: 'action.selected' } }}>
+                            <i className="ri-file-copy-line" style={{ fontSize: 18 }} />
+                          </IconButton>
+                        </MuiTooltip>
+                        <MuiTooltip title={t('common.delete')}>
+                          <IconButton size="small" onClick={onDelete} color="error" sx={{ bgcolor: 'action.hover', '&:hover': { bgcolor: 'error.main', color: 'white' } }}>
+                            <i className="ri-delete-bin-line" style={{ fontSize: 18 }} />
+                          </IconButton>
+                        </MuiTooltip>
+                      </>
+                    ) : (
+                      <VmActions
+                        disabled={actionBusy || unlocking}
+                        vmStatus={vmStatus}
+                        isCluster={data.isCluster}
+                        isLocked={vmLock.locked}
+                        lockType={vmLock.lockType}
+                        canMigrate={!tenantLoading && isFullClusterView}
+                        onStart={onStart}
+                        onShutdown={onShutdown}
+                        onStop={onStop}
+                        onPause={onPause}
+                        onMigrate={onMigrate}
+                        onClone={onClone}
+                        onConvertTemplate={onConvertTemplate}
+                        onDelete={onDelete}
+                        onUnlock={onUnlock}
+                      />
+                    )}
+                  </Box>
+                </Box>
+              )
+            })()
+          ) : (
+
+            /* Format non-VM (Host, Cluster, Storage) */
+            <Box sx={{ display: 'flex', gap: 1.25, alignItems: 'center', flexWrap: 'wrap' }}>
+              {/* Bouton retour */}
+              {onBack && (
+                <IconButton
+                  onClick={onBack}
+                  size="small"
+                  sx={{
+                    mr: 0.5,
+                    bgcolor: 'action.hover',
+                    '&:hover': { bgcolor: 'action.selected' }
+                  }}
+                >
+                  <i className="ri-arrow-left-line" style={{ fontSize: 18 }} />
+                </IconButton>
+              )}
+              
+              {data.kindLabel === 'HOST' ? (
+                <NodeIcon status={data.status === 'crit' ? 'offline' : 'online'} maintenance={data.hostInfo?.maintenance} size={22} />
+              ) : data.kindLabel === 'CLUSTER' ? (
+                <ClusterIcon nodes={data.nodesData?.map((n: any) => ({ status: n.status })) || []} size={22} />
+              ) : selection?.type === 'extvm' ? (
+                <img src={
+                  data.esxiVmInfo?.hostType === 'hyperv' ? '/images/hyperv-logo.svg'
+                  : data.esxiVmInfo?.hostType === 'nutanix' ? '/images/nutanix-logo.svg'
+                  : data.esxiVmInfo?.hostType === 'xcpng' ? '/images/xcpng-logo.svg'
+                  : '/images/esxi-logo.svg'
+                } alt="" width={22} height={22} />
+              ) : data.kindLabel === 'PBS' ? (
+                <Box component="span" sx={{ position: 'relative', display: 'inline-flex', width: 22, height: 22, flexShrink: 0, alignItems: 'center', justifyContent: 'center' }}>
+                  <i className="ri-hard-drive-2-fill" style={{ opacity: 0.8, fontSize: 22 }} />
+                  <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 10, height: 10, borderRadius: '50%', bgcolor: data.status === 'ok' ? '#4caf50' : '#f44336', border: '2px solid', borderColor: 'background.paper' }} />
+                </Box>
+              ) : data.kindLabel ? (
+                <Chip
+                  size="small"
+                  label={data.kindLabel}
+                  variant="filled"
+                  icon={
+                    data.kindLabel === 'VMWARE ESXI' || data.kindLabel === 'VMWARE VM' || data.kindLabel === 'VCENTER' ? (
+                      <img src="/images/esxi-logo.svg" alt="" style={{ width: 14, height: 14, marginLeft: 8 }} />
+                    ) : data.kindLabel === 'XCP-NG' || data.kindLabel === 'XCP-NG VM' ? (
+                      <img src="/images/xcpng-logo.svg" alt="" style={{ width: 14, height: 14, marginLeft: 8 }} />
+                    ) : undefined
+                  }
+                />
+              ) : null}
+
+              <Typography variant="subtitle1" fontWeight={900}>
+                {data.title}
+              </Typography>
+
+              {/* Open the native Proxmox web UI, right next to the cluster/node name.
+                  Clusters and standalone hosts use the connection origin; a cluster
+                  node deep-links to its own management IP. */}
+              {(selection?.type === 'cluster' || selection?.type === 'node') && (() => {
+                const proxmoxUiUrl = selection?.type === 'node'
+                  ? proxmoxNodeWebUiOrigin(proxmoxBaseUrl, data?.nodeIp, proxmoxBehindProxy)
+                  : proxmoxWebUiOrigin(proxmoxBaseUrl)
+                if (!proxmoxUiUrl) return null
+                return (
+                  <MuiTooltip title={t('inventory.openProxmoxUi')}>
+                    <IconButton
+                      size="small"
+                      component="a"
+                      href={proxmoxUiUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      sx={{ color: 'text.secondary', '&:hover': { color: 'primary.main', bgcolor: 'action.hover' } }}
+                    >
+                      <i className="ri-external-link-line" style={{ fontSize: 16 }} />
+                    </IconButton>
+                  </MuiTooltip>
+                )
+              })()}
+
+              {/* Entity tags (cluster/node) */}
+              {(selection?.type === 'cluster' || selection?.type === 'node') && (
+                <EntityTagManager
+                  tags={entityTags}
+                  entityType={selection.type === 'cluster' ? 'connection' : 'host'}
+                  entityId={selection.type === 'cluster' ? selection.id : ''}
+                  connectionId={selection.type === 'node' ? parseNodeId(selection.id).connId : undefined}
+                  nodeName={selection.type === 'node' ? parseNodeId(selection.id).node : undefined}
+                  onTagsChange={setEntityTags}
+                />
+              )}
+
+              {/* The per-host Ceph noout left set outside maintenance (ui#1164);
+                  during maintenance it shows inside the banner below */}
+              {selection?.type === 'node' && !(data.hostInfo?.maintenance && data.status !== 'crit') && (
+                <CephNooutChip state={nodeNoout} canManage={hasPermission('node.manage')} />
+              )}
+
+              {/* Warning Ceph */}
+              {data.cephHealth && data.cephHealth !== 'HEALTH_OK' && (
+                <MuiTooltip title={`Ceph: ${data.cephHealth === 'HEALTH_WARN' ? t('common.warning') : t('common.error')}`}>
+                  <Box component="span" sx={{ display: 'flex', alignItems: 'center', ml: 0.5, color: data.cephHealth === 'HEALTH_ERR' ? 'error.main' : 'warning.main' }}>
+                    <i
+                      className={data.cephHealth === 'HEALTH_ERR' ? 'ri-close-circle-fill' : 'ri-alert-fill'}
+                      style={{ fontSize: 16 }}
+                    />
+                  </Box>
+                </MuiTooltip>
+              )}
+
+              {/* HA maintenance banner, on the title line between the node's
+                  name and its actions; the exit button sits with the actions */}
+              {selection?.type === 'node' && data.hostInfo?.maintenance && data.status !== 'crit' && (
+                <Alert
+                  severity="warning"
+                  icon={<i className="ri-tools-fill" style={{ fontSize: 18 }} />}
+                  sx={{
+                    flex: 1, minWidth: 0, py: 0, px: 1.25, borderRadius: 2,
+                    '& .MuiAlert-icon': { py: 0.5, mr: 1 },
+                    '& .MuiAlert-message': { py: 0.5, minWidth: 0, display: 'flex', alignItems: 'center', gap: 2.5, overflow: 'hidden' },
+                  }}
+                  data-testid="node-maintenance-banner"
+                >
+                  <Typography variant="body2" fontWeight={600} noWrap sx={{ flexShrink: 0 }}>
+                    {t('inventory.maintenanceInline')}
+                  </Typography>
+                  <CephNooutChip state={nodeNoout} canManage={hasPermission('node.manage')} inline />
+                </Alert>
+              )}
+
+              {/* Refresh button for storage */}
+              {selection?.type === 'storage' && (
+                <Box sx={{ ml: 'auto' }}>
+                  <MuiTooltip title={t('common.refresh')}>
+                    <IconButton size="small" onClick={refreshData} disabled={refreshing} sx={{ bgcolor: 'action.hover', '&:hover': { bgcolor: 'action.selected' }, '@keyframes spin': { '0%': { transform: 'rotate(0deg)' }, '100%': { transform: 'rotate(360deg)' } }, ...(refreshing && { '& i': { animation: 'spin 1s linear infinite' } }) }}>
+                      <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+                    </IconButton>
+                  </MuiTooltip>
+                </Box>
+              )}
+
+              {/* Refresh + Boutons Create VM/LXC pour clusters et hosts (hidden when node offline) */}
+              {(selection?.type === 'cluster' || (selection?.type === 'node' && data.status !== 'crit')) && (
+                <Stack direction="row" spacing={1} alignItems="center" sx={{ ml: 'auto' }}>
+                  <MuiTooltip title={t('common.refresh')}>
+                    <IconButton size="small" onClick={refreshData} disabled={refreshing} sx={{ bgcolor: 'action.hover', '&:hover': { bgcolor: 'action.selected' }, '@keyframes spin': { '0%': { transform: 'rotate(0deg)' }, '100%': { transform: 'rotate(360deg)' } }, ...(refreshing && { '& i': { animation: 'spin 1s linear infinite' } }) }}>
+                      <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+                    </IconButton>
+                  </MuiTooltip>
+                  {selection?.type === 'node' && data.hostInfo?.maintenance && (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="warning"
+                      startIcon={<i className="ri-play-circle-line" />}
+                      sx={{ textTransform: 'none', whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        // The OSDs may have gone down since the chip was read:
+                        // the dialog has to warn before the flag is kept.
+                        void nodeNoout.refresh()
+                        setExitMaintenanceDialogOpen(true)
+                      }}
+                    >
+                      {t('inventory.exitMaintenance')}
+                    </Button>
+                  )}
+                  {/* Create VM / LXC as one icon-only split button, to keep the
+                      title line room for the node's state (maintenance, Ceph) */}
+                  {/* One outlined block split in two, drawn here rather than with
+                      ButtonGroup: the theme rounds every Button on its own, so
+                      the group never joined, and it came out shorter than the
+                      neighbouring small buttons. */}
+                  <Box
+                    role="group"
+                    sx={{
+                      display: 'flex', alignItems: 'stretch', height: 30, flexShrink: 0,
+                      bgcolor: 'primary.main', borderRadius: '6px', overflow: 'hidden',
+                      boxShadow: 'var(--mui-customShadows-xs)',
+                    }}
+                  >
+                    {[
+                      ...(allowLxc ? [] : [{ key: 'tpl', label: t('inventory.deployFromTemplate'), icon: 'ri-rocket-2-line', plus: false, onClick: () => router.push('/automation/templates') }]),
+                      ...(allowBlankVm ? [{ key: 'vm', label: `${t('common.create')} VM`, icon: 'ri-computer-line', plus: true, onClick: () => setCreateVmDialogOpen(true) }] : []),
+                      ...(allowLxc ? [{ key: 'lxc', label: `${t('common.create')} LXC`, icon: 'ri-instance-line', plus: true, onClick: () => setCreateLxcDialogOpen(true) }] : []),
+                    ].map((b, i) => (
+                      <MuiTooltip key={b.key} title={b.label}>
+                        <ButtonBase
+                          aria-label={b.label}
+                          onClick={b.onClick}
+                          sx={{
+                            px: 2.75, gap: 0.25, color: 'primary.contrastText',
+                            ...(i > 0 && { borderLeft: '1px solid rgba(255,255,255,0.35)' }),
+                            '&:hover': { bgcolor: 'primary.dark' },
+                          }}
+                        >
+                          {b.plus && <i className="ri-add-line" style={{ fontSize: 13 }} />}
+                          <i className={b.icon} style={{ fontSize: 16 }} />
+                        </ButtonBase>
+                      </MuiTooltip>
+                    ))}
+                  </Box>
+                  {selection?.type === 'node' && (
+                    <>
+                      <Divider orientation="vertical" flexItem />
+                      <NodeActions
+                        disabled={nodeActionBusy}
+                        onReboot={() => { const { connId, node } = parseNodeId(selection!.id); setNodeActionDialog({ action: 'reboot', nodeName: data.title, connId, node }) }}
+                        onShutdown={() => { const { connId, node } = parseNodeId(selection!.id); setNodeActionDialog({ action: 'shutdown', nodeName: data.title, connId, node }) }}
+                      />
+                    </>
+                  )}
+                </Stack>
+              )}
+            </Box>
+          )}
+
+          {/* Node offline placeholder */}
+          {selection?.type === 'node' && data.status === 'crit' && (
+            <Box sx={{
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              gap: 2, flex: 1, minHeight: 0,
+            }}>
+              <img
+                src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'}
+                alt=""
+                style={{ width: 80, height: 80, opacity: 0.3 }}
+              />
+              <Typography variant="h6" fontWeight={700} sx={{ opacity: 0.6 }}>
+                {t('inventory.nodeOffline')}
+              </Typography>
+              <Typography variant="body2" sx={{ opacity: 0.5, textAlign: 'center', maxWidth: 320 }}>
+                {t('inventory.nodeOfflineDesc')}
+              </Typography>
+            </Box>
+          )}
+
+          {selection?.type === 'node' && data.hostInfo?.maintenance && data.status !== 'crit' && (
+            <>
+              <Dialog
+                open={exitMaintenanceDialogOpen}
+                onClose={() => setExitMaintenanceDialogOpen(false)}
+                maxWidth="xs"
+                fullWidth
+              >
+                <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                  <Box sx={{
+                    width: 40, height: 40, borderRadius: 2,
+                    bgcolor: 'rgba(76,175,80,0.12)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center'
+                  }}>
+                    <i className="ri-play-circle-line" style={{ fontSize: 22, color: '#4caf50' }} />
+                  </Box>
+                  {t('inventory.exitMaintenance')}
+                </DialogTitle>
+                <DialogContent>
+                  <DialogContentText>
+                    {t('inventory.confirmExitMaintenance')}
+                  </DialogContentText>
+                  <Typography variant="body2" fontWeight={600} sx={{ mt: 1.5 }}>
+                    {t('inventory.node')}: {selection?.id ? parseNodeId(selection.id).node : ''}
+                  </Typography>
+                  {nodeNoout.available && (
+                    <Box sx={{ mt: 1.5 }}>
+                      <CephNooutOption state={nodeNoout} disabled={exitMaintenanceBusy} />
+                    </Box>
+                  )}
+                  <Typography variant="caption" sx={{ display: 'block', mt: 1, opacity: 0.6 }}>
+                    {t('inventory.maintenanceRequiresSsh')}
+                  </Typography>
+                  {exitMaintenanceError && (
+                    <Alert severity="error" sx={{ mt: 2 }}>
+                      {exitMaintenanceError}
+                    </Alert>
+                  )}
+                </DialogContent>
+                <DialogActions sx={{ px: 3, pb: 2 }}>
+                  <Button onClick={() => { setExitMaintenanceDialogOpen(false); setExitMaintenanceError(null) }} color="inherit">
+                    {t('common.cancel')}
+                  </Button>
+                  <Button
+                    variant="contained"
+                    color="success"
+                    disabled={exitMaintenanceBusy}
+                    startIcon={exitMaintenanceBusy ? <CircularProgress size={16} /> : undefined}
+                    onClick={async () => {
+                      const { connId, node } = parseNodeId(selection!.id)
+                      setExitMaintenanceBusy(true)
+                      setExitMaintenanceError(null)
+                      try {
+                        const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/maintenance`, { method: 'DELETE' })
+                        const data = await res.json().catch(() => ({}))
+                        if (!res.ok) {
+                          setExitMaintenanceError(data?.error || res.statusText)
+                          return
+                        }
+                        setExitMaintenanceDialogOpen(false)
+                        await nodeNoout.removeAfterExit()
+                        void refreshData()
+                        if (onRefresh) await onRefresh()
+                        // Proxmox HA applies the exit on its next round: refresh
+                        // again once it does, or the tree keeps the maintenance state.
+                        void waitForNodeMaintenance(connId, node, false).then(() => {
+                          void refreshData()
+                          void onRefresh?.()
+                        })
+                      } catch (e: any) {
+                        setExitMaintenanceError(e?.message || 'Unknown error')
+                      } finally {
+                        setExitMaintenanceBusy(false)
+                      }
+                    }}
+                  >
+                    {t('common.confirm')}
+                  </Button>
+                </DialogActions>
+              </Dialog>
+            </>
+          )}
+
+
+          {!(selection?.type === 'node' && data.status === 'crit') && selection?.type !== 'cluster' && selection?.type !== 'ext' && selection?.type !== 'ext-type' && selection?.type !== 'extvm' && selection?.type !== 'storage' && selection?.type !== 'datastore' && selection?.type !== 'pbs-datastore' && selection?.type !== 'pbs' && !data.isTemplate && (<>
+          {/* The node header (buttons, maintenance banner) sits in the same
+              Collapse as these panels, with no gap of its own between them:
+              a margin instead of the divider, which only showed as a stray line. */}
+          {selection?.type !== 'node' && <Divider sx={{ flexShrink: 0 }} />}
+
+          <Box sx={{ flexShrink: 0, mt: selection?.type === 'node' ? 3 : 0 }}>
+          <InventorySummary
+            kindLabel={data.kindLabel}
+            status={data.status}
+            subtitle={data.subtitle}
+            metrics={data.metrics}
+            vmState={vmState}
+            showConsole={showConsole}
+            hostInfo={data.hostInfo}
+            kpis={data.kpis}
+            vmInfo={selection?.type === 'vm' ? parseVmId(selection.id) : null}
+            guestInfo={guestInfo}
+            guestInfoLoading={guestInfoLoading}
+            clusterPveVersion={(selection?.type as string) === 'cluster' ? clusterPveVersion : undefined}
+            connId={selection?.type === 'node' ? parseNodeId(selection.id).connId : undefined}
+            nodeName={selection?.type === 'node' ? parseNodeId(selection.id).node : undefined}
+            onRefreshSubscription={async () => {
+              if (selection) {
+                const payload = await fetchDetails(selection)
+                setData(payload)
+              }
+            }}
+            cephHealth={data.cephHealth}
+            nodesOnline={data.nodesData?.filter(n => n.status === 'online').length}
+            nodesTotal={data.nodesData?.length}
+            vmCount={selection?.type === 'node' ? data.vmsData?.filter((vm: any) => vm.status === 'running').length : undefined}
+            isCluster={!!data.clusterName}
+            hasCeph={data.cephHealth ? true : undefined}
+            haState={selection?.type === 'vm' ? (allVms.find(vm => `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}` === selection.id)?.hastate || null) : null}
+            haGroup={selection?.type === 'vm' ? (allVms.find(vm => `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}` === selection.id)?.hagroup || null) : null}
+            agentEnabled={selection?.type === 'vm' ? data.optionsInfo?.agentEnabled ?? null : null}
+            ioSeries={selection?.type === 'vm' ? series : undefined}
+            isTemplate={data.isTemplate}
+            vmNotes={selection?.type === 'vm' ? vmNotes : undefined}
+            disksInfo={selection?.type === 'vm' ? data.disksInfo : undefined}
+            cpuInfo={selection?.type === 'vm' ? data.cpuInfo : undefined}
+            sensors={nodeSensors}
+            nodeVms={selection?.type === 'node' ? data.vmsData : undefined}
+          />
+          </Box>
+          </>)}
+
+          </Collapse>
+
+          {/* Collapse toggle for VM/Node header */}
+          {(selection?.type === 'vm' || selection?.type === 'node') && (
+            <Box
+              onClick={() => setHeaderCollapsed(prev => !prev)}
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                cursor: 'pointer',
+                flexShrink: 0,
+                py: 0.25,
+                opacity: 0.4,
+                transition: 'opacity 0.15s',
+                '&:hover': { opacity: 0.8 },
+              }}
+            >
+              <i className={headerCollapsed ? 'ri-arrow-down-s-line' : 'ri-arrow-up-s-line'} style={{ fontSize: 16 }} />
+            </Box>
+          )}
+
+          {/* VM Detail Tabs */}
+          {selection?.type === 'vm' && (
+            <VmDetailTabs
+              {...{addCephReplicationDialogOpen, availableTargetNodes, backToArchives, backToBackupsList,
+                backups, backupsError, backupsLoading, backupsPreloaded, backupsStats, backupsWarnings, backupsPbsConfigured, backupsVzdumpScanned, balloon,
+                balloonEnabled, browseArchive, canPreview, canShowRrd, cephClusters, cephClustersLoading,
+                cephReplicationJobs, cephReplicationSchedule, compatibleStorages, cpuCores, cpuLimit,
+                cpuFlags, cpuLimitEnabled, cpuModified, cpuSockets, cpuType, createSnapshot,
+                data, deleteReplicationId, deleteSnapshot, deleteAllSnapshots, deleteAllBusy, deleteAllProgress, detailTab, downloadFile,
+                error, exploreWithPveStorage, explorerArchive, explorerArchives, explorerError,
+                explorerFiles, explorerLoading, explorerMode, explorerPath, explorerSearch,
+                filteredExplorerFiles, haComment, haConfig, haEditing, haError,
+                haFailback, haGroup, haGroups, haLoading, haMaxRelocate, haMaxRestart,
+                haSaving, haState, loadBackupContent, loadBackupContentViaPbs, loadHaConfig,
+                loadNotes, loadTasks, loading, localTags, memory,
+                memoryModified, navigateToBreadcrumb, navigateToFolder, navigateUp, numaEnabled, newSnapshotDesc,
+                newSnapshotName, newSnapshotRam, notesEditing, notesError, notesLoading,
+                notesSaving, previewFile, primaryColor, primaryColorLight, removeHaConfig,
+                replicationJobs, replicationLoading,
+                rollbackSnapshot, rrdError, rrdLoading, saveCpuConfig,
+                saveHaConfig, saveMemoryConfig, saveNotes, savingCpu, savingMemory,
+                selectedBackup, selectedCephCluster, selectedPveStorage, selectedVmIsCluster,
+                selection, series, setAddCephReplicationDialogOpen, setAddDiskDialogOpen, setAddNetworkDialogOpen, setAddOtherHardwareDialogOpen, setEditOtherHardwareDialogOpen, setSelectedOtherHardware,
+                setBackupCompress, setBackupMode, setBackupNote, setBackupStorage,
+                setBackupStorages, setBalloon, setBalloonEnabled, setCephClusters, setCephReplicationSchedule,
+                setCpuCores, setCpuFlags, setCpuLimit, setCpuLimitEnabled, setCpuSockets, setCpuType,
+                setCreateBackupDialogOpen, setDeleteReplicationId, setDetailTab, setEditDiskDialogOpen, setEditNetworkDialogOpen,
+                setEditOptionDialog, setEditScsiControllerDialogOpen, setExplorerArchive, setExplorerArchives, setExplorerFiles,
+                setExplorerSearch, setHaComment, setHaEditing, setHaFailback, setHaGroup, setHaMaxRelocate,
+                setHaMaxRestart, setHaState, setMemory, setNewSnapshotDesc, setNewSnapshotName,
+                setSwap, swap,
+                setNewSnapshotRam, setNotesEditing, setNumaEnabled, setReplicationLoaded,
+                setSelectedBackup, setSelectedCephCluster,
+                selectedDisk, setSelectedDisk, setEditDiskInitialTab, editDiskInitialTab, handleDetachDisk, setSelectedNetwork, setSelectedPveStorage, setShowCreateSnapshot, setTasksLoaded,
+                setTf, onRrdRangeChange, onRrdWindowSelect, rrdWindow, rrdMeta, setVmNotes, showCreateSnapshot, snapshotActionBusy, snapshotFeatureAvailable, snapshotRowTasks, snapshots,
+                snapshotsError, snapshotsLoading, snapshotTaskBusy, sourceCephAvailable, tags,
+                refreshData, tasks, tasksError, tasksLoading, tf, vmNotes}}
+            />
+          )}
+
+
+          {/* Cluster Tabs */}
+          {selection?.type === 'cluster' && data.nodesData && (
+            <ClusterTabs
+              {...{allVms, cephTrends, clusterActionError, clusterActionLoading, clusterCephData,
+                clusterCephLoading, clusterCephPerf, clusterCephPerfFiltered, clusterCephTimeframe, clusterConfig,
+                clusterConfigLoaded, clusterConfigLoading, clusterHaGroups, clusterHaLoaded, clusterHaLoading, clusterHaResources, clusterHaRules, clusterHaStatus, loadClusterHa,
+                clusterNotesContent, clusterNotesEditMode, clusterNotesLoading, clusterNotesSaving, clusterPveMajorVersion,
+                clusterStorageData, clusterStorageLoading, clusterTab, createClusterDialogOpen, data, loadClusterStorage,
+                error, expandedClusterNodes, favorites, handleCreateCluster, handleJoinCluster, handleNodeBulkAction, loadVmTrendsBatch,
+                handleSaveClusterNotes, handleTableMigrate, handleTableVmAction, joinClusterDialogOpen, joinClusterInfo,
+                joinClusterPassword, joinInfoDialogOpen, loading, localVmsDialogNode, localVmsDialogOpen,
+                migratingVmIds, newClusterLinks, newClusterName, nodeLocalVms, nodeUpdates,
+                cveAvailable, onSelect, primaryColor, rollingUpdateAvailable, rollingUpdateWizardOpen, selection,
+                setClusterActionError, setClusterCephTimeframe, setClusterNotesContent, setClusterNotesEditMode, setClusterTab,
+                setCreateClusterDialogOpen, setDeleteHaGroupDialog, setDeleteHaRuleDialog, setEditingHaGroup, setEditingHaRule,
+                setExpandedClusterNodes, setHaGroupDialogOpen, setHaRuleDialogOpen, setHaRuleType, setJoinClusterDialogOpen,
+                setJoinClusterInfo, setJoinClusterPassword, setJoinInfoDialogOpen, setLocalVmsDialogNode, setLocalVmsDialogOpen,
+                setNewClusterLinks, setNewClusterName, setNodeLocalVms, setNodeUpdates, setRollingUpdateWizardOpen,
+                setUpdatesDialogNode, setUpdatesDialogOpen, toggleFavorite, updatesDialogNode,
+                updatesDialogOpen}}
+            />
+          )}
+
+
+          {/* Node Tabs */}
+          {selection?.type === 'node' && data.vmsData && data.status !== 'crit' && (
+            <NodeTabs
+              {...{allVms, canShowRrd, clusterConfigLoaded, clusterConfigLoading, cveAvailable, data, deleteReplicationDialogOpen, deletingReplicationJob,
+                dnsFormData, editDnsDialogOpen, editHostsDialogOpen, editTimeDialogOpen, editingReplicationJob,
+                error, expandedVmsTable, favorites, handleTableMigrate, handleTableVmAction, hosts,
+                hostsFormData, loadClusterConfig, loadVmTrendsBatch, loading, migratingVmIds,
+                nodeCephData, nodeCephLoading, nodeCephLogLive, nodeCephSubTab, nodeDisksData,
+                nodeDisksLoading, nodeDisksSubTab, nodeNotesData, nodeNotesEditValue, nodeNotesEditing,
+                nodeNotesLoading, nodeNotesSaving, nodeReplicationData, nodeReplicationLoading, nodeShellData,
+                nodeShellLoading, nodeSubscriptionData, nodeSubscriptionLoading, nodeSyslogData, nodeSyslogLive,
+                nodeSyslogLoading, nodeSystemData, nodeSystemLoading, nodeSystemSubTab, nodeTab,
+                nodeUpdates, setNodeUpdates, nodeLocalVms, setNodeLocalVms, rollingUpdateAvailable, rollingUpdateWizardOpen, setRollingUpdateWizardOpen,
+                updatesDialogOpen, setUpdatesDialogOpen, updatesDialogNode, setUpdatesDialogNode,
+                onSelect, pools, primaryColor, primaryColorLight, removeSubscriptionDialogOpen,
+                removeSubscriptionLoading, replicationDeleting,
+                replicationLogData, replicationLogDialogOpen, replicationLogJob, replicationLogLoading,
+                rrdError, rrdLoading, selection, series, setCreateClusterDialogOpen,
+                setDeleteReplicationDialogOpen, setDeletingReplicationJob, setDnsFormData, setEditDnsDialogOpen, setEditHostsDialogOpen,
+                setEditTimeDialogOpen, setEditingReplicationJob, setExpandedVmsTable, setHostsFormData, setJoinClusterDialogOpen,
+                setNodeCephData, setNodeCephLogLive, setNodeCephSubTab, setNodeDisksData, setNodeDisksLoading,
+                setNodeDisksSubTab, setNodeNotesData, setNodeNotesEditValue, setNodeNotesEditing, setNodeNotesSaving,
+                setNodeReplicationLoaded, setNodeShellConnected, setNodeShellData, setNodeShellLoading, setNodeSubscriptionData,
+                setNodeSubscriptionLoading, setNodeSyslogData, setNodeSyslogLive, setNodeSyslogLoading, setNodeSystemLoaded,
+                setNodeSystemSubTab, setNodeTab, setRemoveSubscriptionDialogOpen, setRemoveSubscriptionLoading, setReplicationDeleting,
+                setReplicationLogData, setReplicationLogDialogOpen,
+                setReplicationLogJob, setReplicationLogLoading, setSubscriptionKeyDialogOpen, setSubscriptionKeyInput,
+                setSubscriptionKeySaving, setSystemReportData, setSystemReportDialogOpen, setSystemReportLoading, setSystemSaving,
+                setTf, onRrdRangeChange, onRrdWindowSelect, rrdWindow, rrdMeta, setTimeFormData, setTimezonesList, subscriptionKeyDialogOpen, subscriptionKeyInput,
+                subscriptionKeySaving, systemReportData, systemReportDialogOpen, systemReportLoading, systemSaving,
+                tf, timeFormData, timezonesList, toggleFavorite}}
+            />
+          )}
+
+
+          {/* PBS Server + Datastore panels (extracted component) */}
+          <PbsServerPanel
+            ref={pbsPanelRef}
+            selection={selection}
+            data={data}
+            onSelect={onSelect}
+            pbsTab={pbsTab}
+            setPbsTab={setPbsTab}
+            pbsServerTab={pbsServerTab}
+            setPbsServerTab={setPbsServerTab}
+            pbsBackupSearch={pbsBackupSearch}
+            setPbsBackupSearch={setPbsBackupSearch}
+            pbsBackupPage={pbsBackupPage}
+            setPbsBackupPage={setPbsBackupPage}
+            pbsTimeframe={pbsTimeframe}
+            setPbsTimeframe={setPbsTimeframe}
+            pbsRrdData={pbsRrdData}
+            setPbsRrdData={setPbsRrdData}
+            datastoreRrdData={datastoreRrdData}
+            setDatastoreRrdData={setDatastoreRrdData}
+            expandedBackupGroups={expandedBackupGroups}
+            setExpandedBackupGroups={setExpandedBackupGroups}
+          />
+
+
+
+          {/* ── Storage Detail Panel (extracted component) ── */}
+          {selection?.type === 'storage' && data.storageInfo && (
+            <StorageDetailPanel
+              data={data}
+              selection={selection}
+              storageRrdHistory={storageRrdHistory}
+              storageRrdTimeframe={storageRrdTimeframe}
+              setStorageRrdTimeframe={setStorageRrdTimeframe}
+              storageCephPerf={storageCephPerf}
+              storageCephPerfHistory={storageCephPerfHistory}
+              storageUploadOpen={storageUploadOpen}
+              setStorageUploadOpen={setStorageUploadOpen}
+              templateDialogOpen={templateDialogOpen}
+              setTemplateDialogOpen={setTemplateDialogOpen}
+              pbsStorageSearch={pbsStorageSearch}
+              setPbsStorageSearch={setPbsStorageSearch}
+              pbsStoragePage={pbsStoragePage}
+              setPbsStoragePage={setPbsStoragePage}
+              expandedStorageBackupGroups={expandedStorageBackupGroups}
+              setExpandedStorageBackupGroups={setExpandedStorageBackupGroups}
+              vmNamesMap={vmNamesMap}
+              dateLocale={dateLocale}
+              primaryColor={primaryColor}
+              primaryColorLight={primaryColorLight}
+              pbsPanelRef={pbsPanelRef}
+              setData={setData}
+            />
+          )}
+
+
+          {/* External Hypervisor Type — Dashboard (VMware ESXi / XCP-ng category) */}
+          {selection?.type === 'ext-type' && data.extTypeInfo && (
+            <ExternalHypervisorDashboard
+              extTypeInfo={data.extTypeInfo}
+              onSelect={onSelect}
+            />
+          )}
+
+          {/* External Host — Dashboard */}
+          {selection?.type === 'ext' && data?.esxiHostInfo && (() => {
+            const isXcpng = data.esxiHostInfo.hostType === 'xcpng'
+            const isVcenter = data.esxiHostInfo.hostType === 'vcenter'
+            const isHyperv = data.esxiHostInfo.hostType === 'hyperv'
+            const isNutanix = data.esxiHostInfo.hostType === 'nutanix'
+            const hostLabel = isNutanix ? 'Nutanix AHV' : isHyperv ? 'Hyper-V' : isXcpng ? 'XCP-ng' : isVcenter ? 'vCenter' : 'VMware ESXi'
+            const vms = data.esxiHostInfo.vms
+            const runningVms = vms.filter((v: any) => v.status === 'running')
+            const stoppedVms = vms.filter((v: any) => v.status !== 'running')
+            const totalCpu = vms.reduce((s: number, v: any) => s + (v.cpu || 0), 0)
+            const totalRamGB = vms.reduce((s: number, v: any) => s + (v.memory_size_MiB || 0), 0) / 1024
+            const totalDiskGB = vms.reduce((s: number, v: any) => s + (v.committed || 0), 0) / 1073741824
+
+            const migCompleted = extHostStats.completed
+            const migFailed = extHostStats.failed
+            const migRunning = extHostStats.inProgress
+            const migTotal = migCompleted + migFailed + migRunning + extHostStats.cancelled + extHostStats.queued
+            const totalMigratedGB = extHostStats.bytesTransferred / 1073741824
+
+            const statCards = [
+              { icon: 'ri-computer-line', label: t('inventoryPage.extDashboard.totalVms'), value: vms.length, color: theme.palette.primary.main },
+              { icon: 'ri-play-circle-line', label: t('inventoryPage.extDashboard.running'), value: runningVms.length, color: theme.palette.success.main },
+              { icon: 'ri-stop-circle-line', label: t('inventoryPage.extDashboard.stopped'), value: stoppedVms.length, color: theme.palette.text.disabled },
+              { icon: 'ri-swap-line', label: t('inventoryPage.extDashboard.migrated'), value: migCompleted, color: theme.palette.info.main },
+            ]
+
+            return (
+              <>
+              {/* Stats cards */}
+              <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 1.5 }}>
+                {statCards.map((s) => (
+                  <Card key={s.label} variant="outlined" sx={{ borderRadius: 2 }}>
+                    <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 }, display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                      <Box sx={{ width: 36, height: 36, borderRadius: 1.5, bgcolor: alpha(s.color, 0.1), display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <i className={s.icon} style={{ fontSize: 18, color: s.color }} />
+                      </Box>
+                      <Box>
+                        <Typography variant="h6" fontWeight={700} fontSize={18} lineHeight={1}>{s.value}</Typography>
+                        <Typography variant="caption" sx={{ opacity: 0.6, fontSize: 10 }}>{s.label}</Typography>
+                      </Box>
+                    </CardContent>
+                  </Card>
+                ))}
+              </Box>
+
+              {/* Resources & Migration overview */}
+              <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                {/* Resources summary */}
+                <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                  <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                    <Typography variant="body2" fontWeight={700} fontSize={12} sx={{ mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className="ri-cpu-line" style={{ fontSize: 16, opacity: 0.5 }} />
+                      {t('inventoryPage.extDashboard.resources')}
+                    </Typography>
+                    <Stack spacing={1.5}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>vCPU</Typography>
+                        <Typography variant="body2" fontSize={12} fontWeight={700}>{totalCpu}</Typography>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>RAM</Typography>
+                        <Typography variant="body2" fontSize={12} fontWeight={700}>{totalRamGB.toFixed(1)} GB</Typography>
+                      </Box>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>{t('inventoryPage.extDashboard.diskUsage')}</Typography>
+                        <Typography variant="body2" fontSize={12} fontWeight={700}>{totalDiskGB.toFixed(1)} GB</Typography>
+                      </Box>
+                    </Stack>
+                  </CardContent>
+                </Card>
+
+                {/* Migration stats */}
+                <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                  <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                    <Typography variant="body2" fontWeight={700} fontSize={12} sx={{ mb: 1.5, display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className="ri-swap-line" style={{ fontSize: 16, opacity: 0.5 }} />
+                      {t('inventoryPage.extDashboard.migrationStats')}
+                    </Typography>
+                    {migTotal === 0 ? (
+                      <Typography variant="body2" fontSize={12} sx={{ opacity: 0.4 }}>
+                        {t('inventoryPage.extDashboard.noMigrations')}
+                      </Typography>
+                    ) : (
+                      <Stack spacing={1.5}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>{t('inventoryPage.extDashboard.completed')}</Typography>
+                          <Chip size="small" label={migCompleted} sx={{ height: 20, fontSize: 11, fontWeight: 700, bgcolor: 'success.main', color: '#fff', minWidth: 30 }} />
+                        </Box>
+                        {migFailed > 0 && (
+                          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>{t('inventoryPage.extDashboard.failed')}</Typography>
+                            <Chip size="small" label={migFailed} sx={{ height: 20, fontSize: 11, fontWeight: 700, bgcolor: 'error.main', color: '#fff', minWidth: 30 }} />
+                          </Box>
+                        )}
+                        {migRunning > 0 && (
+                          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>{t('inventoryPage.extDashboard.inProgress')}</Typography>
+                            <Chip size="small" label={migRunning} sx={{ height: 20, fontSize: 11, fontWeight: 700, bgcolor: 'primary.main', color: 'primary.contrastText', minWidth: 30 }} />
+                          </Box>
+                        )}
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <Typography variant="body2" fontSize={12} sx={{ opacity: 0.7 }}>{t('inventoryPage.extDashboard.dataTransferred')}</Typography>
+                          <Typography variant="body2" fontSize={12} fontWeight={700}>{totalMigratedGB.toFixed(1)} GB</Typography>
+                        </Box>
+                      </Stack>
+                    )}
+                  </CardContent>
+                </Card>
+              </Box>
+
+              </>
+            )
+          })()}
+
+          {/* External Host — VM List with Migrate buttons */}
+          {selection?.type === 'ext' && data?.esxiHostInfo && (() => {
+            const isXcpng = data.esxiHostInfo.hostType === 'xcpng'
+            const isVcenter = data.esxiHostInfo.hostType === 'vcenter'
+            const isHypervHost = data.esxiHostInfo.hostType === 'hyperv'
+            const isNutanixHost = data.esxiHostInfo.hostType === 'nutanix'
+            const extVmIcon = isNutanixHost ? '/images/nutanix-logo.svg' : isXcpng ? '/images/xcpng-logo.svg' : '/images/esxi-vm.svg'
+            return (
+            // The VM table takes the whole height of the host page.
+            <Card variant="outlined" sx={{ width: '100%', borderRadius: 2, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <CardContent sx={{ p: 0, '&:last-child': { pb: 0 }, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                {data.esxiHostInfo.vms.length === 0 ? (
+                  <Box sx={{ p: 4, textAlign: 'center', flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                    <img src={extVmIcon} alt="" width={48} height={48} style={{ opacity: 0.3 }} />
+                    <Typography variant="body2" sx={{ opacity: 0.5, mt: 1 }}>No virtual machines found on this host</Typography>
+                  </Box>
+                ) : (
+                  <>
+                  {/* Search and power filter: the set a bulk migration works on
+                      (running VMs for warm, stopped ones for cold). */}
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1, flexShrink: 0, borderBottom: '1px solid', borderColor: 'divider', flexWrap: 'wrap' }}>
+                    <TextField
+                      size="small"
+                      placeholder={t('inventoryPage.esxiMigration.searchVms')}
+                      value={extVmQuery}
+                      onChange={e => { setExtVmQuery(e.target.value); setExtVmPage(0) }}
+                      slotProps={{
+                        input: { startAdornment: <InputAdornment position="start"><i className="ri-search-line" style={{ fontSize: 14 }} /></InputAdornment> },
+                        htmlInput: { 'data-testid': 'ext-vm-search' },
+                      }}
+                      sx={{ width: 240 }}
+                    />
+                    <ToggleButtonGroup
+                      size="small"
+                      exclusive
+                      value={extVmPower}
+                      onChange={(_e, v) => { if (v) { setExtVmPower(v); setExtVmPage(0) } }}
+                      data-testid="ext-vm-power"
+                      // Same height as the search field next to it.
+                      sx={{ alignSelf: 'stretch' }}
+                    >
+                      {(['all', 'running', 'stopped'] as const).map(p => (
+                        <ToggleButton key={p} value={p} sx={{ textTransform: 'none', fontSize: 12, px: 1.5, py: 0, gap: 0.75 }}>
+                          {p !== 'all' && <Box component="span" sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: p === 'running' ? 'success.main' : 'error.main' }} />}
+                          {t(`inventoryPage.esxiMigration.power_${p}`)} ({extVmCounts[p]})
+                        </ToggleButton>
+                      ))}
+                    </ToggleButtonGroup>
+                  </Box>
+                  {/* Bulk migration toolbar */}
+                  {bulkMigSelected.size > 0 && (
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1, flexShrink: 0, bgcolor: theme.palette.mode === 'dark' ? 'rgba(var(--mui-palette-primary-mainChannel) / 0.08)' : 'rgba(var(--mui-palette-primary-mainChannel) / 0.06)', borderBottom: '1px solid', borderColor: 'divider' }}>
+                      <Typography variant="body2" fontWeight={600} sx={{ fontSize: 12 }}>
+                        {bulkMigSelected.size} VM{bulkMigSelected.size > 1 ? 's' : ''} {t('inventoryPage.esxiMigration.selected')}
+                      </Typography>
+                      <Box sx={{ flex: 1 }} />
+                      <Button
+                        size="small"
+                        variant="text"
+                        sx={{ textTransform: 'none', fontSize: 11 }}
+                        onClick={() => setBulkMigSelected(new Set())}
+                      >
+                        {t('inventoryPage.esxiMigration.deselectAll')}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        sx={{ textTransform: 'none', fontSize: 11, height: 28 }}
+                        startIcon={<img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={14} height={14} />}
+                        onClick={async () => {
+                          if (!vmwareMigrationAvailable) { setUpgradeDialogOpen(true); return }
+                          setBulkMigHostInfo(data.esxiHostInfo)
+                          // A batch already in flight from this source (launched from
+                          // another tab, or before a reload) is shown instead of the form,
+                          // so the same VMs are not queued a second time.
+                          if (!bulkMigBatchRef.current) await loadActiveBulkBatch(data.esxiHostInfo.connectionId)
+                          setBulkMigOpen(true)
+                        }}
+                      >
+                        {t('inventoryPage.esxiMigration.migrateSelected')} ({bulkMigSelected.size})
+                      </Button>
+                    </Box>
+                  )}
+                  <TableContainer sx={{ flex: 1, minHeight: 120, overflow: 'auto' }}>
+                    <Table size="small" stickyHeader>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell padding="checkbox" sx={{ width: 42 }}>
+                            <Checkbox
+                              size="small"
+                              // Every VM the search and the filter keep, on all pages.
+                              indeterminate={extVmSelection === 'some'}
+                              checked={filteredExtVms.length > 0 && extVmSelection === 'all'}
+                              onChange={(e) => setBulkMigSelected(toggleFilteredSelection(bulkMigSelected, filteredExtVms, e.target.checked))}
+                              inputProps={{ 'aria-label': t('inventoryPage.esxiMigration.selectFiltered') }}
+                            />
+                          </TableCell>
+                          {([
+                            { id: 'name' as const, label: t('common.name'), align: 'left' as const },
+                            { id: 'status' as const, label: t('common.status'), align: 'left' as const },
+                            { id: 'guestOS' as const, label: t('inventoryPage.esxiMigration.guestOs'), align: 'left' as const },
+                            { id: 'usedSpace' as const, label: t('inventoryPage.esxiMigration.usedSpace'), align: 'right' as const },
+                            { id: 'cpu' as const, label: 'CPU', align: 'right' as const },
+                            { id: 'ram' as const, label: 'RAM', align: 'right' as const },
+                          ]).map(col => (
+                            // One line per header; Guest OS takes what the other columns leave.
+                            <TableCell key={col.id} align={col.align} sx={{ fontWeight: 700, fontSize: 12, whiteSpace: 'nowrap', ...(col.id === 'guestOS' && { width: '100%' }) }} sortDirection={extVmSortCol === col.id ? extVmSortDir : false}>
+                              <TableSortLabel
+                                active={extVmSortCol === col.id}
+                                direction={extVmSortCol === col.id ? extVmSortDir : 'asc'}
+                                onClick={() => {
+                                  if (extVmSortCol === col.id) setExtVmSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                                  else { setExtVmSortCol(col.id); setExtVmSortDir('asc') }
+                                }}
+                                sx={{ fontSize: 12, fontWeight: 700 }}
+                              >
+                                {col.label}
+                              </TableSortLabel>
+                            </TableCell>
+                          ))}
+                          <TableCell sx={{ fontWeight: 700, fontSize: 12, whiteSpace: 'nowrap' }} align="center">{t('inventoryPage.esxiMigration.migration')}</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {pagedExtVms.map((vm: any) => (
+                          <TableRow
+                            key={vm.vmid}
+                            hover
+                            selected={bulkMigSelected.has(vm.vmid)}
+                            sx={{ cursor: 'pointer', '&:last-child td': { borderBottom: 'none' } }}
+                            onClick={() => onSelect?.({ type: 'extvm', id: `${data.esxiHostInfo!.connectionId}:${vm.vmid}` })}
+                          >
+                            <TableCell padding="checkbox" onClick={e => e.stopPropagation()}>
+                              <Checkbox
+                                size="small"
+                                checked={bulkMigSelected.has(vm.vmid)}
+                                onChange={(e) => {
+                                  setBulkMigSelected(prev => {
+                                    const next = new Set(prev)
+                                    if (e.target.checked) next.add(vm.vmid)
+                                    else next.delete(vm.vmid)
+                                    return next
+                                  })
+                                }}
+                              />
+                            </TableCell>
+                            {/* One line per row: a long name ends in an ellipsis, whole on hover. */}
+                            <TableCell sx={{ maxWidth: 260 }}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+                                <img src={extVmIcon} alt="" width={16} height={16} style={{ opacity: 0.7, flexShrink: 0 }} />
+                                <Typography variant="body2" fontWeight={600} noWrap title={vm.name || vm.vmid}>{vm.name || vm.vmid}</Typography>
+                              </Box>
+                            </TableCell>
+                            <TableCell>
+                              <Chip
+                                size="small"
+                                label={vm.status === 'running' ? t('inventoryPage.esxiMigration.poweredOn') : vm.status === 'suspended' ? t('inventoryPage.esxiMigration.suspended') : t('inventoryPage.esxiMigration.poweredOff')}
+                                sx={{
+                                  height: 22, fontSize: 11, fontWeight: 600,
+                                  bgcolor: vm.status === 'running' ? 'success.main' : vm.status === 'suspended' ? 'warning.main' : 'action.disabledBackground',
+                                  color: vm.status === 'running' || vm.status === 'suspended' ? '#fff' : 'text.secondary',
+                                }}
+                              />
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 0 }}>
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+                                <GuestOsLogo guestOs={vm.guest_OS} />
+                                <Typography variant="body2" noWrap title={vm.guest_OS || undefined} sx={{ opacity: 0.8, fontSize: 12 }}>{vm.guest_OS || 'N/A'}</Typography>
+                              </Box>
+                            </TableCell>
+                            <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                              <Typography variant="body2" sx={{ fontSize: 12 }}>{vm.committed ? formatBytes(vm.committed) : '--'}</Typography>
+                            </TableCell>
+                            <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                              <Typography variant="body2" sx={{ fontSize: 12 }}>{vm.cpu || '--'} vCPU</Typography>
+                            </TableCell>
+                            <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                              <Typography variant="body2" sx={{ fontSize: 12 }}>{vm.memory_size_MiB ? `${(vm.memory_size_MiB / 1024).toFixed(1)} GB` : '--'}</Typography>
+                            </TableCell>
+                            <TableCell align="center" sx={{ whiteSpace: 'nowrap' }} onClick={e => e.stopPropagation()}>
+                              <Button
+                                title={t('inventoryPage.esxiMigration.migrate')}
+                                size="small"
+                                variant="outlined"
+                                color="primary"
+                                sx={{ textTransform: 'none', fontSize: 11, height: 24, minWidth: 0, px: 1, whiteSpace: 'nowrap' }}
+                                startIcon={<img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={12} height={12} />}
+                                onClick={() => {
+                                  if (!vmwareMigrationAvailable) { setUpgradeDialogOpen(true); return }
+                                  const ht = data.esxiHostInfo!.hostType
+                                  if (ht === 'vcenter' || ht === 'hyperv' || ht === 'nutanix') setMigType('cold')
+                                  setEsxiMigrateVm({
+                                    vmid: vm.vmid, name: vm.name || vm.vmid, connId: data.esxiHostInfo!.connectionId,
+                                    connName: data.esxiHostInfo!.connectionName, cpu: vm.cpu, memoryMB: vm.memory_size_MiB,
+                                    committed: vm.committed, guestOS: vm.guest_OS, licenseFull: data.esxiHostInfo!.licenseFull,
+                                    hostType: ht,
+                                    // Connection sub-type: gates warm for an XCP-ng pool
+                                    // (XAPI yes, Xen Orchestra no) in the migrate dialog.
+                                    connSubType: data.esxiHostInfo!.connSubType ?? null,
+                                    // Forwarded to the modal so cold-vs-running guards can
+                                    // disable the migrate button when the VM isn't off.
+                                    status: (vm as any).status || (vm as any).power_state || (vm as any).powerState,
+                                    // VMware Tools state, part of the migrate dialog's VM shape; the Live-on-Windows guard that read it is gone and nothing consumes it today.
+                                    toolsStatus: (vm as any).toolsStatus,
+                                    toolsRunningStatus: (vm as any).toolsRunningStatus,
+                                    // vCenter inventory path resolved server-side via SOAP
+                                    // (soapResolveHostInventoryPaths). Undefined for standalone ESXi.
+                                    vcenterDatacenter: (vm as any).vcenterDatacenter,
+                                    vcenterCluster: (vm as any).vcenterCluster,
+                                    vcenterHost: (vm as any).vcenterHost,
+                                  })
+                                }}
+                              >
+                                {t('inventoryPage.esxiMigration.migrateShort')}
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                  {filteredExtVms.length === 0 && (
+                    <Typography variant="body2" sx={{ p: 2, textAlign: 'center', opacity: 0.6 }}>{t('inventoryPage.esxiMigration.noVmMatch')}</Typography>
+                  )}
+                  {filteredExtVms.length > PAGE_SIZES[0] && (
+                    <TablePagination
+                      component="div"
+                      count={filteredExtVms.length}
+                      page={extVmCurrentPage}
+                      onPageChange={(_e, p) => setExtVmPage(p)}
+                      rowsPerPage={extVmRowsPerPage}
+                      onRowsPerPageChange={e => { setExtVmRowsPerPage(Number(e.target.value)); setExtVmPage(0) }}
+                      rowsPerPageOptions={PAGE_SIZES}
+                      labelRowsPerPage={t('common.rowsPerPage')}
+                      sx={{ flexShrink: 0, borderTop: '1px solid', borderColor: 'divider' }}
+                      data-testid="ext-vm-pagination"
+                    />
+                  )}
+                  </>
+                )}
+              </CardContent>
+            </Card>
+            )
+          })()}
+
+          {/* External VM — Migration Control Panel */}
+          {selection?.type === 'extvm' && data.esxiVmInfo && (() => {
+            const vm = data.esxiVmInfo
+            const isXcpngVm = vm.hostType === 'xcpng'
+            const isVcenterVm = vm.hostType === 'vcenter'
+            const isHypervVm = vm.hostType === 'hyperv'
+            const isNutanixVm = vm.hostType === 'nutanix'
+            const extSourceIcon = isNutanixVm ? '/images/nutanix-logo.svg' : isHypervVm ? '/images/hyperv-logo.svg' : isXcpngVm ? '/images/xcpng-logo.svg' : '/images/esxi-logo.svg'
+            const extSourceLabel = isNutanixVm ? 'Nutanix AHV' : isHypervVm ? 'Hyper-V' : isXcpngVm ? 'XCP-ng' : isVcenterVm ? 'vCenter' : 'ESXi'
+            const memGB = vm.memoryMB ? (vm.memoryMB / 1024).toFixed(1) : '0'
+            const diskGB = vm.committed ? (vm.committed / 1073741824).toFixed(1) : '0'
+
+            // A manual-cutover run stays in delta_sync on purpose: it keeps
+            // replicating while it waits for the operator, so the projection
+            // stays fresh. It is a wait all the same, and must read as one
+            // rather than as yet another passing delta step (#443).
+            const migAwaitingOperator = isAwaitingOperator(vmMigJob)
+            // The pipeline asked the guest to shut down and is waiting for it. Used
+            // to be a silent five minute poll; it is now a state the operator can
+            // see and act on (#614).
+            const migAwaitingPowerOff = isAwaitingPowerOff(vmMigJob)
+            // Guest inspection found several bootable systems and the pipeline
+            // refuses to guess which one to convert; the run is parked until
+            // the operator picks one (#738).
+            const migAwaitingRootChoice = isAwaitingRootChoice(vmMigJob)
+            // Chip label resolved by the shared wait-display rules: an i18n key
+            // for every known state, raw step text otherwise.
+            const migChipLabel = statusChipLabelKey(vmMigJob)
+
+            return (
+              /* The column scrolls as a whole when the fixed tasks bar (issue #582) shrinks the
+                 pane below the cards' combined min-height, so every card stays reachable. */
+              <Stack spacing={2} sx={{ flex: 1, minHeight: 0, overflow: 'auto', pr: 0.5 }}>
+                {/* VM Summary Bar + Migrate button */}
+                <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                  <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <i className="ri-cpu-line" style={{ fontSize: 14, opacity: 0.5 }} />
+                          <Typography variant="body2" fontWeight={600}>{vm.numCPU} vCPU</Typography>
+                        </Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <i className="ri-ram-line" style={{ fontSize: 14, opacity: 0.5 }} />
+                          <Typography variant="body2" fontWeight={600}>{memGB} GB RAM</Typography>
+                        </Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <i className="ri-hard-drive-2-line" style={{ fontSize: 14, opacity: 0.5 }} />
+                          <Typography variant="body2" fontWeight={600}>{diskGB} GB disk</Typography>
+                        </Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                          <i className="ri-terminal-box-line" style={{ fontSize: 14, opacity: 0.5 }} />
+                          <Typography variant="body2" sx={{ opacity: 0.7 }}>{vm.guestOS || 'Unknown OS'}</Typography>
+                        </Box>
+                      </Box>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="primary"
+                        sx={{ textTransform: 'none', fontSize: 11, height: 28, minWidth: 0, px: 1.5, whiteSpace: 'nowrap', flexShrink: 0 }}
+                        startIcon={<img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={14} height={14} />}
+                        onClick={() => {
+                          if (!vmwareMigrationAvailable) { setUpgradeDialogOpen(true); return }
+                          const ht = vm.hostType || data.esxiVmInfo?.hostType
+                          if (ht === 'vcenter' || ht === 'hyperv' || ht === 'nutanix') setMigType('cold')
+                          // Hyper-V disk paths are pre-filled by useMigrationOptions'
+                          // reset-on-open (from the diskPaths passed below); doing it
+                          // here would be wiped by that reset.
+                          setEsxiMigrateVm({
+                            vmid: vm.vmid, name: vm.name, connId: vm.connectionId,
+                            connName: vm.connectionName, cpu: vm.numCPU, memoryMB: vm.memoryMB,
+                            committed: vm.committed, guestOS: vm.guestOS, licenseFull: vm.licenseFull,
+                            hostType: ht, diskPaths: (vm as any).diskPaths, diskMountPaths: (vm as any).diskMountPaths,
+                            // Connection sub-type: gates warm for an XCP-ng pool
+                            // (XAPI yes, Xen Orchestra no) in the migrate dialog.
+                            connSubType: vm.connSubType ?? null,
+                            // Power state for cold-migration guard (disable Start button + warn).
+                            status: (vm as any).status || (vm as any).power_state || (vm as any).powerState,
+                            // VMware Tools state, part of the migrate dialog's VM shape; the Live-on-Windows guard that read it is gone and nothing consumes it today.
+                            toolsStatus: (vm as any).toolsStatus,
+                            toolsRunningStatus: (vm as any).toolsRunningStatus,
+                            // Forward vCenter inventory path if the source endpoint resolved it.
+                            vcenterDatacenter: (vm as any).vcenterDatacenter,
+                            vcenterCluster: (vm as any).vcenterCluster,
+                            vcenterHost: (vm as any).vcenterHost,
+                          })
+                        }}
+                      >
+                        {t('inventoryPage.esxiMigration.startMigration')}
+                      </Button>
+                    </Box>
+                  </CardContent>
+                </Card>
+
+                {/* Migration Control */}
+                <Card variant="outlined" sx={{ borderRadius: 2 }}>
+                  <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+                    <Box sx={{ px: 2, py: 1.5, borderBottom: '1px solid', borderColor: 'divider', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <Typography fontWeight={900} sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 13 }}>
+                        <i className="ri-swap-line" style={{ fontSize: 16, color: '#E65100' }} />
+                        {t('inventoryPage.esxiMigration.migrationToProxmox')}
+                      </Typography>
+                      {vmMigJob && (
+                        <Chip
+                          size="small"
+                          label={isWaitDisplayKey(migChipLabel) ? t(migChipLabel) : migChipLabel}
+                          color={vmMigJob.status === 'completed' ? 'success' : vmMigJob.status === 'failed' ? 'error' : vmMigJob.status === 'cancelled' ? 'default' : 'primary'}
+                          sx={{ height: 20, fontSize: 10, fontWeight: 600 }}
+                        />
+                      )}
+                    </Box>
+
+                    {/* Migration flow visual */}
+                    <Box sx={{ p: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 2 }}>
+                      <Box sx={{ textAlign: 'center' }}>
+                        <Box sx={{ width: 44, height: 44, borderRadius: 1.5, bgcolor: isXcpngVm ? 'rgba(0,173,181,0.1)' : 'rgba(99,140,28,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', mx: 'auto', mb: 0.5 }}>
+                          <img src={extSourceIcon} alt="" width={24} height={24} />
+                        </Box>
+                        <Typography variant="caption" fontWeight={600} sx={{ fontSize: 11 }}>{extSourceLabel}</Typography>
+                        <Typography variant="caption" sx={{ display: 'block', opacity: 0.5, fontSize: 9 }}>{vm.name}</Typography>
+                      </Box>
+                      <Box sx={{ flex: 1, maxWidth: 160, position: 'relative' }}>
+                        <Divider sx={{ borderStyle: 'dashed' }} />
+                        <Box sx={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', bgcolor: 'background.paper', px: 1 }}>
+                          <i className="ri-arrow-right-line" style={{ fontSize: 18, opacity: 0.4 }} />
+                        </Box>
+                      </Box>
+                      <Box sx={{ textAlign: 'center' }}>
+                        <Box sx={{ width: 44, height: 44, borderRadius: 1.5, bgcolor: 'rgba(230,81,0,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', mx: 'auto', mb: 0.5 }}>
+                          <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={24} height={24} />
+                        </Box>
+                        <Typography variant="caption" fontWeight={600} sx={{ fontSize: 11 }}>Proxmox VE</Typography>
+                        <Typography variant="caption" sx={{ display: 'block', opacity: 0.5, fontSize: 9 }}>Target</Typography>
+                      </Box>
+                    </Box>
+
+                    {/* Operator controls. They live in this card, next to the flow
+                        visual, because the operator gate is a decision about the
+                        migration itself — not a transfer metric. A job parked at
+                        the gate waits for a human, so both the wait and the two
+                        ways out of it have to be visible without scrolling. */}
+                    {vmMigJob && !['completed', 'failed', 'cancelled'].includes(vmMigJob.status) && (() => {
+                      const awaiting = migAwaitingOperator || migAwaitingPowerOff || migAwaitingRootChoice
+                      const canCutover = canRequestCutover(vmMigJob)
+                      // Same key-or-raw contract as the chip label above.
+                      const migWaitTitle = waitTitleKey(vmMigJob)
+
+                      return (
+                        <Box sx={{ px: 2, pb: 2 }}>
+                          <Box sx={{
+                            display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap',
+                            p: 1.5, borderRadius: 1.5, border: '1px solid',
+                            borderColor: awaiting ? 'primary.main' : 'divider',
+                            bgcolor: awaiting ? alpha(theme.palette.primary.main, 0.08) : 'transparent',
+                          }}>
+                            <i
+                              className={waitIconClass(vmMigJob)}
+                              style={{ fontSize: 20, color: awaiting ? theme.palette.primary.main : undefined, opacity: awaiting ? 1 : 0.5 }}
+                            />
+                            <Box sx={{ flex: 1, minWidth: 160 }}>
+                              <Typography variant="body2" fontWeight={700}>
+                                {isWaitDisplayKey(migWaitTitle) ? t(migWaitTitle) : migWaitTitle}
+                              </Typography>
+                              {migAwaitingRootChoice && (
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('inventoryPage.esxiMigration.chooseRootBody')}
+                                </Typography>
+                              )}
+                              {canCutover && (
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('inventoryPage.esxiMigration.estimatedDowntime')} ~{Math.round(vmMigJob.projectedDowntimeSec / 60)} min
+                                </Typography>
+                              )}
+                            </Box>
+                            <WarmCutoverButton job={vmMigJob} />
+                            <ForcePowerOffButton job={vmMigJob} />
+                            <RootChoiceButton job={vmMigJob} />
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="error"
+                              disabled={cancelMigBusy}
+                              onClick={() => {
+                                // Mirrors the migrate dialog: nothing is copied before
+                                // full_copy, so those stages cancel without a confirm.
+                                const hasCopiedData = ['full_copy', 'delta_sync', 'awaiting_cutover', 'cutover', 'verify'].includes(vmMigJob.status)
+                                if (hasCopiedData) setCancelMigConfirm(vmMigJob.id)
+                                else void cancelVmMigration(vmMigJob.id)
+                              }}
+                              sx={{ textTransform: 'none' }}
+                            >
+                              {t('inventoryPage.esxiMigration.cancelMigration')}
+                            </Button>
+                          </Box>
+                        </Box>
+                      )
+                    })()}
+                  </CardContent>
+                </Card>
+
+                {/* Transfer Metrics — real data from migration job */}
+                <Card variant="outlined" sx={{ borderRadius: 2, flexShrink: 0 }}>
+                  <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+                    <Box
+                      role="button"
+                      tabIndex={0}
+                      aria-expanded={migPanel.metrics}
+                      data-testid="mig-metrics-toggle"
+                      onClick={() => toggleMigPanel('metrics')}
+                      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleMigPanel('metrics') } }}
+                      sx={{ px: 2, py: 1.5, borderBottom: migPanel.metrics ? '1px solid' : 'none', borderColor: 'divider', display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', userSelect: 'none' }}
+                    >
+                      <Typography fontWeight={900} sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 13 }}>
+                        <i className="ri-line-chart-line" style={{ fontSize: 16, opacity: 0.7 }} />
+                        {t('inventoryPage.esxiMigration.transferMetrics')}
+                        {!migPanel.metrics && vmMigJob && (
+                          <Typography component="span" variant="caption" sx={{ opacity: 0.5 }}>{vmMigJob.progress || 0}%</Typography>
+                        )}
+                      </Typography>
+                      <i className={migPanel.metrics ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'} style={{ fontSize: 18, opacity: 0.6 }} />
+                    </Box>
+                    <Collapse in={migPanel.metrics} unmountOnExit>
+                    <Box sx={{ p: 2, flex: 1 }}>
+                      {vmMigJob ? (
+                        <>
+                          {/* Progress bar */}
+                          <Box sx={{ mb: 2 }}>
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+                              <Typography variant="caption" color="text.secondary">{t('inventoryPage.esxiMigration.overallProgress')}</Typography>
+                              <Typography variant="caption" fontWeight={700}>{vmMigJob.progress || 0}%</Typography>
+                            </Box>
+                            <LinearProgress
+                              variant={!['completed', 'failed', 'cancelled'].includes(vmMigJob.status) && vmMigJob.progress === 0 ? 'indeterminate' : 'determinate'}
+                              value={vmMigJob.progress || 0}
+                              color={vmMigJob.status === 'completed' ? 'success' : vmMigJob.status === 'failed' ? 'error' : 'primary'}
+                              sx={{ height: 6, borderRadius: 3, bgcolor: 'action.hover', '& .MuiLinearProgress-bar': { borderRadius: 3 } }}
+                            />
+                          </Box>
+
+                          {/* Metrics grid */}
+                          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                            <Box sx={{ p: 1.5, borderRadius: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)', border: '1px solid', borderColor: 'divider' }}>
+                              <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>{t('inventoryPage.esxiMigration.transferSpeed')}</Typography>
+                              <Typography variant="body2" fontWeight={700}>{vmMigJob.transferSpeed || '—'}</Typography>
+                            </Box>
+                            <Box sx={{ p: 1.5, borderRadius: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)', border: '1px solid', borderColor: 'divider' }}>
+                              <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>{t('inventoryPage.esxiMigration.disk')}</Typography>
+                              <Typography variant="body2" fontWeight={700}>
+                                {vmMigJob.currentDisk != null && vmMigJob.totalDisks ? `${vmMigJob.currentDisk} / ${vmMigJob.totalDisks}` : '—'}
+                              </Typography>
+                            </Box>
+                            <Box sx={{ p: 1.5, borderRadius: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)', border: '1px solid', borderColor: 'divider' }}>
+                              <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>{t('inventoryPage.esxiMigration.transferred')}</Typography>
+                              <Typography variant="body2" fontWeight={700}>
+                                {vmMigJob.bytesTransferred ? `${(vmMigJob.bytesTransferred / 1073741824).toFixed(1)} GB` : '—'}
+                                {vmMigJob.totalBytes ? <Typography component="span" variant="caption" color="text.secondary"> / {(vmMigJob.totalBytes / 1073741824).toFixed(1)} GB</Typography> : ''}
+                              </Typography>
+                            </Box>
+                            <Box sx={{ p: 1.5, borderRadius: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)', border: '1px solid', borderColor: 'divider' }}>
+                              <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>{t('inventoryPage.esxiMigration.targetVmid')}</Typography>
+                              <Typography variant="body2" fontWeight={700}>{vmMigJob.targetVmid || '—'}</Typography>
+                            </Box>
+                            <MuiTooltip title={t('inventoryPage.esxiMigration.estimatedDowntimeHint')}>
+                              <Box sx={{ p: 1.5, borderRadius: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)', border: '1px solid', borderColor: 'divider' }}>
+                                <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10 }}>{t('inventoryPage.esxiMigration.estimatedDowntime')}</Typography>
+                                <Typography variant="body2" fontWeight={700}>
+                                  {vmMigJob.projectedDowntimeSec != null && ['delta_sync', 'awaiting_cutover'].includes(vmMigJob.status)
+                                    ? `~${Math.round(vmMigJob.projectedDowntimeSec / 60)} min`
+                                    : '—'}
+                                </Typography>
+                              </Box>
+                            </MuiTooltip>
+                          </Box>
+
+                          {/* Progress graph — Recharts area chart with tooltip */}
+                          {vmMigJob.logs?.length > 1 && (() => {
+                            const logs = vmMigJob.logs as { ts: string; msg: string; level: string }[]
+                            const startTime = new Date(logs[0].ts).getTime()
+                            const chartData = logs.map((l: any, idx: number) => {
+                              const elapsed = (new Date(l.ts).getTime() - startTime) / 1000
+                              return {
+                                elapsed,
+                                pct: typeof l.progress === 'number' ? l.progress : Math.round((idx / (logs.length - 1)) * 100),
+                                time: new Date(l.ts).toLocaleTimeString(),
+                                msg: l.msg,
+                              }
+                            })
+                            return (
+                              <Box sx={{ mt: 2 }}>
+                                <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10, mb: 0.5, display: 'block' }}>{t('inventoryPage.esxiMigration.progressOverTime')}</Typography>
+                                <ChartContainer height={70}>
+                                  <AreaChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: -20 }}>
+                                    <defs>
+                                      <linearGradient id="migGradChart" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stopColor={theme.palette.primary.main} stopOpacity={0.3} />
+                                        <stop offset="100%" stopColor={theme.palette.primary.main} stopOpacity={0.02} />
+                                      </linearGradient>
+                                    </defs>
+                                    <XAxis dataKey="elapsed" tick={false} axisLine={false} tickLine={false} />
+                                    <YAxis domain={[0, 100]} tick={false} axisLine={false} tickLine={false} />
+                                    <Tooltip
+                                      content={({ active, payload }) => {
+                                        if (!active || !payload?.[0]) return null
+                                        const d = payload[0].payload
+                                        return (
+                                          <Box sx={{
+                                            px: 1, py: 0.5, borderRadius: 1, fontSize: 11,
+                                            bgcolor: theme.palette.mode === 'dark' ? 'rgba(30,30,30,0.95)' : 'rgba(255,255,255,0.95)',
+                                            border: '1px solid', borderColor: 'divider',
+                                            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+                                          }}>
+                                            <Box sx={{ fontWeight: 700, fontFamily: '"JetBrains Mono", monospace', color: 'primary.main', fontSize: 11 }}>
+                                              {vmMigJob.transferSpeed || `${d.pct}%`}
+                                            </Box>
+                                          </Box>
+                                        )
+                                      }}
+                                    />
+                                    <Area type="monotone" dataKey="pct" stroke={theme.palette.primary.main} strokeWidth={2} fill="url(#migGradChart)" dot={false} activeDot={{ r: 4, strokeWidth: 0 }} />
+                                  </AreaChart>
+                                </ChartContainer>
+                              </Box>
+                            )
+                          })()}
+                        </>
+                      ) : (
+                        <Box sx={{ py: 3, textAlign: 'center' }}>
+                          <i className="ri-bar-chart-grouped-line" style={{ fontSize: 36, opacity: 0.12 }} />
+                          <Typography variant="body2" sx={{ opacity: 0.35, mt: 0.5, fontSize: 12 }}>{t('inventoryPage.esxiMigration.noMigrationStarted')}</Typography>
+                        </Box>
+                      )}
+                    </Box>
+                    </Collapse>
+                  </CardContent>
+                </Card>
+
+                {/* Migration Logs — real data from migration job */}
+                <Card variant="outlined" sx={{ borderRadius: 2, flex: migPanel.logs ? 1 : '0 0 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                  <CardContent sx={{ p: 0, '&:last-child': { pb: 0 }, flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <Box sx={{ px: 2, py: 1.5, borderBottom: migPanel.logs ? '1px solid' : 'none', borderColor: 'divider', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <Box
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={migPanel.logs}
+                        data-testid="mig-logs-toggle"
+                        onClick={() => toggleMigPanel('logs')}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleMigPanel('logs') } }}
+                        sx={{ display: 'flex', alignItems: 'center', gap: 1, flex: 1, cursor: 'pointer', userSelect: 'none' }}
+                      >
+                        <Typography fontWeight={900} sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 13 }}>
+                          <i className="ri-terminal-box-line" style={{ fontSize: 16, opacity: 0.7 }} />
+                          {t('inventoryPage.esxiMigration.migrationLogs')}
+                          {vmMigJob?.logs?.length > 0 && (
+                            <Typography component="span" variant="caption" sx={{ opacity: 0.4 }}>({vmMigJob.logs.length})</Typography>
+                          )}
+                        </Typography>
+                      </Box>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25 }}>
+                        {vmMigJob?.logs?.length > 0 && (
+                          <MuiTooltip title={logCopy.copied ? t('common.copied') : t('common.copy')}>
+                            <IconButton size="small" sx={{ opacity: 0.5, '&:hover': { opacity: 1 } }} onClick={() => {
+                              const text = migrationLogText(vmMigJob.logs)
+                              void logCopy.copy(text)
+                            }}>
+                              <i className={logCopy.copied ? 'ri-check-line' : 'ri-file-copy-line'} style={{ fontSize: 14 }} />
+                            </IconButton>
+                          </MuiTooltip>
+                        )}
+                        <MuiTooltip title={t('inventoryPage.esxiMigration.migrationLogsExpand')}>
+                          <IconButton size="small" data-testid="mig-logs-expand" aria-label={t('inventoryPage.esxiMigration.migrationLogsExpand')} sx={{ opacity: 0.5, '&:hover': { opacity: 1 } }} onClick={() => setMigLogsFull(true)}>
+                            <i className="ri-fullscreen-line" style={{ fontSize: 14 }} />
+                          </IconButton>
+                        </MuiTooltip>
+                        <IconButton size="small" aria-hidden tabIndex={-1} sx={{ opacity: 0.6 }} onClick={() => toggleMigPanel('logs')}>
+                          <i className={migPanel.logs ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'} style={{ fontSize: 18 }} />
+                        </IconButton>
+                      </Box>
+                    </Box>
+                    {migPanel.logs && (
+                    <Box data-testid="mig-logs-box" sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                    <LiveLogBox
+                      lineCount={vmMigJob?.logs?.length ?? 0}
+                      resetKey={vmMigJob?.id}
+                      jumpButton={false}
+                      wrapperSx={{ flex: 1, minHeight: 220, display: 'flex', flexDirection: 'column' }}
+                      sx={{ p: 1.5, bgcolor: theme.palette.mode === 'dark' ? 'rgba(0,0,0,0.3)' : 'rgba(0,0,0,0.03)', fontFamily: '"JetBrains Mono", monospace', fontSize: 11, overflow: 'auto', borderRadius: '0 0 8px 8px', lineHeight: 1.8, flex: 1, minHeight: 0 }}
+                    >
+                      {vmMigJob?.logs?.length > 0 ? (
+                        <MigrationLogLines logs={vmMigJob.logs} />
+                      ) : (
+                        <Typography variant="body2" sx={{ fontFamily: 'inherit', fontSize: 'inherit', opacity: 0.3, fontStyle: 'italic' }}>
+                          {t('inventoryPage.esxiMigration.logsWillAppear')}
+                        </Typography>
+                      )}
+                    </LiveLogBox>
+                    </Box>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* The same logs, full size: the side panel is too short to read a long run. */}
+                <Dialog open={migLogsFull} onClose={() => setMigLogsFull(false)} maxWidth="lg" fullWidth PaperProps={{ sx: { height: '85vh' } }}>
+                  <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 15 }}>
+                    <i className="ri-terminal-box-line" style={{ fontSize: 18, opacity: 0.7 }} />
+                    <Box component="span" sx={{ flex: 1 }}>
+                      {t('inventoryPage.esxiMigration.migrationLogs')}
+                      {vmMigJob?.sourceVmName ? ` · ${vmMigJob.sourceVmName}` : ''}
+                    </Box>
+                    {vmMigJob?.logs?.length > 0 && (
+                      <MuiTooltip title={logCopy.copied ? t('common.copied') : t('common.copy')}>
+                        <IconButton size="small" onClick={() => { void logCopy.copy(migrationLogText(vmMigJob.logs)) }}>
+                          <i className={logCopy.copied ? 'ri-check-line' : 'ri-file-copy-line'} style={{ fontSize: 16 }} />
+                        </IconButton>
+                      </MuiTooltip>
+                    )}
+                    <IconButton size="small" aria-label={t('common.close')} onClick={() => setMigLogsFull(false)}>
+                      <i className="ri-close-line" style={{ fontSize: 18 }} />
+                    </IconButton>
+                  </DialogTitle>
+                  <DialogContent sx={{ p: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                    <Box data-testid="mig-logs-dialog-box" sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+                      <LiveLogBox
+                        lineCount={vmMigJob?.logs?.length ?? 0}
+                        resetKey={vmMigJob?.id}
+                        jumpButton={false}
+                        wrapperSx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
+                        sx={{ p: 2, bgcolor: theme.palette.mode === 'dark' ? 'rgba(0,0,0,0.3)' : 'rgba(0,0,0,0.03)', fontFamily: '"JetBrains Mono", monospace', fontSize: 12, overflow: 'auto', lineHeight: 1.8, flex: 1, minHeight: 0 }}
+                      >
+                        {vmMigJob?.logs?.length > 0 ? (
+                          <MigrationLogLines logs={vmMigJob.logs} />
+                        ) : (
+                          <Typography variant="body2" sx={{ fontFamily: 'inherit', fontSize: 'inherit', opacity: 0.3, fontStyle: 'italic' }}>
+                            {t('inventoryPage.esxiMigration.logsWillAppear')}
+                          </Typography>
+                        )}
+                      </LiveLogBox>
+                    </Box>
+                  </DialogContent>
+                </Dialog>
+
+                {/* Same warning the migrate dialog shows: a target volume holding a
+                    completed copy survives the cancel, so the operator has to know
+                    before firing it. */}
+                <Dialog
+                  open={!!cancelMigConfirm}
+                  onClose={() => setCancelMigConfirm(null)}
+                  maxWidth="xs"
+                  fullWidth
+                >
+                  <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'error.main' }}>
+                    <i className="ri-error-warning-line" style={{ fontSize: 20 }} />
+                    {t('inventoryPage.esxiMigration.cancelMigrationConfirmTitle')}
+                  </DialogTitle>
+                  <DialogContent>
+                    <Typography sx={{ mb: 1.5 }}>
+                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmStop')}
+                    </Typography>
+                    <Alert severity="warning" sx={{ mb: 1.5 }}>
+                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmVolumesKept')}
+                    </Alert>
+                    <Typography variant="body2" color="text.secondary">
+                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmSourceUntouched')}
+                    </Typography>
+                  </DialogContent>
+                  <DialogActions sx={{ px: 3, pb: 2 }}>
+                    <Button onClick={() => setCancelMigConfirm(null)} color="inherit">
+                      {t('inventoryPage.esxiMigration.keepMigrating')}
+                    </Button>
+                    <Button
+                      variant="contained"
+                      color="error"
+                      disabled={cancelMigBusy}
+                      startIcon={cancelMigBusy ? <CircularProgress size={16} /> : undefined}
+                      onClick={async () => {
+                        if (!cancelMigConfirm) return
+                        if (await cancelVmMigration(cancelMigConfirm)) setCancelMigConfirm(null)
+                      }}
+                    >
+                      {t('inventoryPage.esxiMigration.cancelMigration')}
+                    </Button>
+                  </DialogActions>
+                </Dialog>
+              </Stack>
+            )
+          })()}
+
+        </Stack>
+      ) : null}
+
+      <InventoryDialogs
+        selection={selection}
+        data={data}
+        allVms={allVms}
+        hosts={hosts}
+        nodeActionDialog={nodeActionDialog}
+        setNodeActionDialog={setNodeActionDialog}
+        nodeActionBusy={nodeActionBusy}
+        setNodeActionBusy={setNodeActionBusy}
+        nodeActionStep={nodeActionStep}
+        setNodeActionStep={setNodeActionStep}
+        nodeActionMigrateTarget={nodeActionMigrateTarget}
+        setNodeActionMigrateTarget={setNodeActionMigrateTarget}
+        nodeActionFailedVms={nodeActionFailedVms}
+        setNodeActionFailedVms={setNodeActionFailedVms}
+        nodeActionShutdownFailed={nodeActionShutdownFailed}
+        setNodeActionShutdownFailed={setNodeActionShutdownFailed}
+        nodeActionLocalVms={nodeActionLocalVms}
+        nodeActionStorageLoading={nodeActionStorageLoading}
+        nodeActionShutdownLocal={nodeActionShutdownLocal}
+        setNodeActionShutdownLocal={setNodeActionShutdownLocal}
+        createVmDialogOpen={createVmDialogOpen}
+        setCreateVmDialogOpen={setCreateVmDialogOpen}
+        createLxcDialogOpen={createLxcDialogOpen}
+        setCreateLxcDialogOpen={setCreateLxcDialogOpen}
+        effectiveCreateDefaults={effectiveCreateDefaults}
+        handleVmCreated={handleVmCreated}
+        handleLxcCreated={handleLxcCreated}
+        addDiskDialogOpen={addDiskDialogOpen}
+        setAddDiskDialogOpen={setAddDiskDialogOpen}
+        addNetworkDialogOpen={addNetworkDialogOpen}
+        setAddNetworkDialogOpen={setAddNetworkDialogOpen}
+        editScsiControllerDialogOpen={editScsiControllerDialogOpen}
+        setEditScsiControllerDialogOpen={setEditScsiControllerDialogOpen}
+        editDiskDialogOpen={editDiskDialogOpen}
+        setEditDiskDialogOpen={setEditDiskDialogOpen}
+        editNetworkDialogOpen={editNetworkDialogOpen}
+        setEditNetworkDialogOpen={setEditNetworkDialogOpen}
+        addOtherHardwareDialogOpen={addOtherHardwareDialogOpen}
+        setAddOtherHardwareDialogOpen={setAddOtherHardwareDialogOpen}
+        editOtherHardwareDialogOpen={editOtherHardwareDialogOpen}
+        setEditOtherHardwareDialogOpen={setEditOtherHardwareDialogOpen}
+        selectedOtherHardware={selectedOtherHardware}
+        setSelectedOtherHardware={setSelectedOtherHardware}
+        selectedDisk={selectedDisk}
+        setSelectedDisk={setSelectedDisk}
+        editDiskInitialTab={editDiskInitialTab}
+        setEditDiskInitialTab={setEditDiskInitialTab}
+        selectedNetwork={selectedNetwork}
+        setSelectedNetwork={setSelectedNetwork}
+        handleSaveDisk={handleSaveDisk}
+        handleSaveNetwork={handleSaveNetwork}
+        handleSaveScsiController={handleSaveScsiController}
+        handleEditDisk={handleEditDisk}
+        handleDetachDisk={handleDetachDisk}
+        handleResizeDisk={handleResizeDisk}
+        handleMoveDisk={handleMoveDisk}
+        handleDeleteNetwork={handleDeleteNetwork}
+        migrateDialogOpen={migrateDialogOpen}
+        setMigrateDialogOpen={setMigrateDialogOpen}
+        cloneDialogOpen={cloneDialogOpen}
+        setCloneDialogOpen={setCloneDialogOpen}
+        handleMigrateVm={handleMigrateVm}
+        handleCrossClusterMigrate={handleCrossClusterMigrate}
+        handleCloneVm={handleCloneVm}
+        selectedVmIsCluster={selectedVmIsCluster}
+        tableMigrateVm={tableMigrateVm}
+        setTableMigrateVm={setTableMigrateVm}
+        tableCloneVm={tableCloneVm}
+        setTableCloneVm={setTableCloneVm}
+        handleTableMigrateVm={handleTableMigrateVm}
+        handleTableCrossClusterMigrate={handleTableCrossClusterMigrate}
+        handleTableCloneVm={handleTableCloneVm}
+        editOptionDialog={editOptionDialog}
+        setEditOptionDialog={setEditOptionDialog}
+        editOptionError={editOptionError}
+        editOptionValue={editOptionValue}
+        setEditOptionValue={setEditOptionValue}
+        editOptionSaving={editOptionSaving}
+        handleSaveOption={handleSaveOption}
+        haGroupDialogOpen={haGroupDialogOpen}
+        setHaGroupDialogOpen={setHaGroupDialogOpen}
+        editingHaGroup={editingHaGroup}
+        setEditingHaGroup={setEditingHaGroup}
+        deleteHaGroupDialog={deleteHaGroupDialog}
+        setDeleteHaGroupDialog={setDeleteHaGroupDialog}
+        haRuleDialogOpen={haRuleDialogOpen}
+        setHaRuleDialogOpen={setHaRuleDialogOpen}
+        editingHaRule={editingHaRule}
+        setEditingHaRule={setEditingHaRule}
+        deleteHaRuleDialog={deleteHaRuleDialog}
+        setDeleteHaRuleDialog={setDeleteHaRuleDialog}
+        haRuleType={haRuleType}
+        clusterHaResources={clusterHaResources}
+        clusterPveMajorVersion={clusterPveMajorVersion}
+        loadClusterHa={loadClusterHa}
+        confirmAction={confirmAction}
+        setConfirmAction={setConfirmAction}
+        confirmActionLoading={confirmActionLoading}
+        createBackupDialogOpen={createBackupDialogOpen}
+        setCreateBackupDialogOpen={setCreateBackupDialogOpen}
+        backupStorage={backupStorage}
+        setBackupStorage={setBackupStorage}
+        backupMode={backupMode}
+        setBackupMode={setBackupMode}
+        backupCompress={backupCompress}
+        setBackupCompress={setBackupCompress}
+        backupNote={backupNote}
+        setBackupNote={setBackupNote}
+        creatingBackup={creatingBackup}
+        setCreatingBackup={setCreatingBackup}
+        backupStorages={backupStorages}
+        loadBackups={loadBackups}
+        deleteVmDialogOpen={deleteVmDialogOpen}
+        setDeleteVmDialogOpen={setDeleteVmDialogOpen}
+        deleteVmConfirmText={deleteVmConfirmText}
+        setDeleteVmConfirmText={setDeleteVmConfirmText}
+        deletingVm={deletingVm}
+        deleteVmPurge={deleteVmPurge}
+        setDeleteVmPurge={setDeleteVmPurge}
+        handleDeleteVm={handleDeleteVm}
+        convertTemplateDialogOpen={convertTemplateDialogOpen}
+        setConvertTemplateDialogOpen={setConvertTemplateDialogOpen}
+        convertingTemplate={convertingTemplate}
+        handleConvertTemplate={handleConvertTemplate}
+        unlockErrorDialog={unlockErrorDialog}
+        setUnlockErrorDialog={setUnlockErrorDialog}
+        bulkActionDialog={bulkActionDialog}
+        setBulkActionDialog={setBulkActionDialog}
+        executeBulkAction={executeBulkAction}
+        esxiMigrateVm={esxiMigrateVm}
+        setEsxiMigrateVm={setEsxiMigrateVm}
+        migTargetConn={migTargetConn}
+        setMigTargetConn={setMigTargetConn}
+        migTargetNode={migTargetNode}
+        setMigTargetNode={setMigTargetNode}
+        migTargetStorage={migTargetStorage}
+        setMigTargetStorage={setMigTargetStorage}
+        migTargetVmid={migTargetVmid}
+        setMigTargetVmid={setMigTargetVmid}
+        migTargetVmidStatus={migTargetVmidStatus}
+        setMigTargetVmidStatus={setMigTargetVmidStatus}
+        migNetworkBridge={migNetworkBridge}
+        setMigNetworkBridge={setMigNetworkBridge}
+        migVlanTag={migVlanTag}
+        setMigVlanTag={setMigVlanTag}
+        migBridges={migBridges}
+        migStartAfter={migStartAfter}
+        setMigStartAfter={setMigStartAfter}
+        migConvertToQcow2={migConvertToQcow2}
+        migManualCutover={migManualCutover}
+        migConvertGuest={migConvertGuest}
+        setMigConvertGuest={setMigConvertGuest}
+        migEfiPreEnrolledKeys={migEfiPreEnrolledKeys}
+        setMigEfiPreEnrolledKeys={setMigEfiPreEnrolledKeys}
+        setMigManualCutover={setMigManualCutover}
+        migDowntimeBudget={migDowntimeBudget}
+        setMigDowntimeBudget={setMigDowntimeBudget}
+        migZeroRateLimit={migZeroRateLimit}
+        setMigZeroRateLimit={setMigZeroRateLimit}
+        migBulkConcurrency={migBulkConcurrency}
+        setMigBulkConcurrency={setMigBulkConcurrency}
+        migCopyVmk={migCopyVmk}
+        setMigCopyVmk={setMigCopyVmk}
+        setMigConvertToQcow2={setMigConvertToQcow2}
+        migCpuType={migCpuType}
+        setMigCpuType={setMigCpuType}
+        migStep={migStep}
+        setMigStep={setMigStep}
+        migHardware={migHardware}
+        setMigHardware={setMigHardware}
+        migNics={migNics}
+        setMigNics={setMigNics}
+        migDiskPaths={migDiskPaths}
+        setMigDiskPaths={setMigDiskPaths}
+        migTempStorage={migTempStorage}
+        setMigTempStorage={setMigTempStorage}
+        migV2vRoot={migV2vRoot}
+        setMigV2vRoot={setMigV2vRoot}
+        migNfcConcurrency={migNfcConcurrency}
+        setMigNfcConcurrency={setMigNfcConcurrency}
+        migType={migType}
+        setMigType={setMigType}
+        migTransferMode={migTransferMode}
+        setMigTransferMode={setMigTransferMode}
+        migPveConnections={migPveConnections}
+        migNodes={migNodes}
+        migStorages={migStorages}
+        migStoragesLoading={migStoragesLoading}
+        migStoragesError={migStoragesError}
+        retryMigStorages={retryMigStorages}
+        migSshfsAvailable={migSshfsAvailable}
+        vcenterPreflight={vcenterPreflight}
+        setVcenterPreflight={setVcenterPreflight}
+        migStarting={migStarting}
+        setMigStarting={setMigStarting}
+        migJobId={migJobId}
+        setMigJobId={setMigJobId}
+        migJob={migJob}
+        setMigJob={setMigJob}
+        migNodeOptions={migNodeOptions}
+        bulkMigSelected={bulkMigSelected}
+        setBulkMigSelected={setBulkMigSelected}
+        bulkMigOpen={bulkMigOpen}
+        setBulkMigOpen={setBulkMigOpen}
+        bulkMigStarting={bulkMigStarting}
+        setBulkMigStarting={setBulkMigStarting}
+        bulkMigJobs={bulkMigJobs}
+        setBulkMigJobs={setBulkMigJobs}
+        bulkMigProgressExpanded={bulkMigProgressExpanded}
+        setBulkMigProgressExpanded={setBulkMigProgressExpanded}
+        bulkMigLogsExpanded={bulkMigLogsExpanded}
+        setBulkMigLogsExpanded={setBulkMigLogsExpanded}
+        bulkMigLogsFilter={bulkMigLogsFilter}
+        setBulkMigLogsFilter={setBulkMigLogsFilter}
+        bulkMigBatch={bulkMigBatch}
+        setBulkMigBatch={setBulkMigBatch}
+        bulkMigHostInfo={bulkMigHostInfo}
+        upgradeDialogOpen={upgradeDialogOpen}
+        setUpgradeDialogOpen={setUpgradeDialogOpen}
+      />
+
+    </Box>
+  )
+}

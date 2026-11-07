@@ -1,0 +1,164 @@
+# ============================================
+# ProxCenter Community Edition
+# Frontend only - No orchestrator required
+# ============================================
+
+services:
+  # ========================================
+  # Frontend (Next.js + WebSocket Proxy)
+  # ========================================
+  frontend:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-frontend:${VERSION:-latest}
+    container_name: proxcenter-frontend
+    restart: unless-stopped
+    ports:
+      # Published ports. The defaults are deliberately unprivileged so that
+      # upgrading a host that already runs nginx on 80/443 cannot fail to
+      # start. Set HTTP_BIND=80 and HTTPS_BIND=443 in .env to serve the
+      # standard ports directly.
+      - "${HTTP_BIND:-3000}:3000"
+      # HTTPS has NO default host port on purpose. An upgrade pulls this file
+      # without ever having asked for TLS, and a hard-coded 8443 on a host that
+      # already uses that port makes the whole stack fail to start. Empty, the
+      # container's HTTPS port is published on a free host port Docker picks,
+      # so an upgrade always comes up. The install scripts write HTTPS_BIND
+      # themselves: 443 on a fresh install, which is what makes HTTPS work out
+      # of the box, and 8443 on an upgrade when nothing else holds it.
+      - "${HTTPS_BIND:-}:${TLS_PORT:-8443}"
+    environment:
+      - NODE_ENV=production
+      # ProxCenter speaks Postgres only since the SQLite cutover. The
+      # bundled `postgres` service below holds every table.
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-proxcenter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-proxcenter}?schema=public
+      - APP_SECRET=${APP_SECRET}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-http://localhost:3000}
+      - APP_URL=${APP_URL:-http://localhost:3000}
+      # Built-in HTTPS. TLS_PORT is the port INSIDE the container and must stay
+      # in step with the mapping above. TLS_ENABLED is read once, on the very
+      # first boot, to seed the setting; afterwards /settings is the source of
+      # truth.
+      - TLS_PORT=${TLS_PORT:-8443}
+      - TLS_ENABLED=${TLS_ENABLED:-false}
+      # Identity this instance stamps on the migration jobs it runs, so a boot
+      # can fail the ones its previous incarnation left behind (#608). Fixed on
+      # purpose: the container id changes on every image upgrade, which would
+      # delay the cleanup of a job interrupted by that very upgrade. Only ever
+      # one frontend per stack here; give each instance its own value if you
+      # point several at one database.
+      - PROXCENTER_INSTANCE_ID=${PROXCENTER_INSTANCE_ID:-proxcenter-frontend}
+      # Session lifetimes, in seconds. Left empty on purpose: the frontend
+      # then applies its defaults, 12 hours of inactivity and 7 days absolute.
+      # A malformed value falls back to those defaults rather than to no limit.
+      - SESSION_IDLE_TIMEOUT=${SESSION_IDLE_TIMEOUT:-}
+      - SESSION_ABSOLUTE_TIMEOUT=${SESSION_ABSOLUTE_TIMEOUT:-}
+      # Cloud image catalog: point TEMPLATE_CATALOG_URL at an internal mirror,
+      # or set TEMPLATE_CATALOG_AUTO_UPDATE=false on an air-gapped install.
+      - TEMPLATE_CATALOG_URL=${TEMPLATE_CATALOG_URL:-}
+      - TEMPLATE_CATALOG_AUTO_UPDATE=${TEMPLATE_CATALOG_AUTO_UPDATE:-}
+      # Air-gapped instance: no version check, no GitHub badge, no catalog
+      # refresh, and the maps say why they cannot show tiles. Written by
+      # install-airgap.sh; leave empty on a connected site.
+      - PROXCENTER_OFFLINE=${PROXCENTER_OFFLINE:-}
+      # Outbound HTTP proxy, written by the installer when it runs behind one.
+      # The frontend only uses it for the calls to the SSO identity provider
+      # (discovery, token, keys, sign-out), and only when no proxy is set in
+      # Settings > OIDC / SSO. Proxmox and the internal services stay direct.
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,frontend,postgres,orchestrator,weasyprint}
+      # Shared secret for the first-run setup endpoint, which is reachable
+      # without authentication for as long as no account exists. Empty keeps
+      # the historical behaviour. Set it when the first boot happens on a
+      # network someone else can reach, then send the same value as the
+      # x-setup-token header of the setup request.
+      - PROXCENTER_SETUP_TOKEN=${PROXCENTER_SETUP_TOKEN:-}
+      # Proxmox API budgets in milliseconds. Empty keeps the defaults: 8000 for
+      # a regular call, 30000 for the reads that enumerate every storage. Raise
+      # the slow one on a datacenter declaring many PBS targets.
+      - PVE_TIMEOUT_MS=${PVE_TIMEOUT_MS:-}
+      - PVE_SLOW_READ_TIMEOUT_MS=${PVE_SLOW_READ_TIMEOUT_MS:-}
+      # No ORCHESTRATOR_URL = Community mode
+      #
+      # Docker Secrets support (Swarm / file-based):
+      # Instead of setting APP_SECRET directly, point to a secret file:
+      # - APP_SECRET_FILE=/run/secrets/app_secret
+      # - NEXTAUTH_SECRET_FILE=/run/secrets/nextauth_secret
+    volumes:
+      - proxcenter_data:/app/data
+    # secrets:
+    #   - app_secret
+    #   - nextauth_secret
+    networks:
+      - proxcenter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ========================================
+  # Postgres (application database)
+  # ========================================
+  # Single source of truth for ProxCenter data. The frontend (and the
+  # enterprise orchestrator, if running) connect to this instance over
+  # the internal network.
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: proxcenter-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-proxcenter}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (see .env.example)}
+      - POSTGRES_DB=${POSTGRES_DB:-proxcenter}
+      # Performance + correctness: stop the server if a write fails on disk
+      # rather than silently corrupting the WAL. Defaults are fine but we
+      # pin them to avoid surprises across postgres image versions.
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No ports: published on purpose. Postgres is reached over the internal
+    # `proxcenter` network only. Uncomment to expose it to the host for
+    # debugging with psql / DBeaver / pgAdmin.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    networks:
+      - proxcenter
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxcenter} -d ${POSTGRES_DB:-proxcenter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# ========================================
+# Networks
+# ========================================
+networks:
+  proxcenter:
+    driver: bridge
+    name: proxcenter
+
+# ========================================
+# Volumes
+# ========================================
+# ========================================
+# Secrets (uncomment for Docker Swarm)
+# ========================================
+# secrets:
+#   app_secret:
+#     external: true
+#   nextauth_secret:
+#     external: true
+
+volumes:
+  proxcenter_data:
+    name: proxcenter_data
+    external: true
+  postgres_data:
+    name: postgres_data
+    external: true

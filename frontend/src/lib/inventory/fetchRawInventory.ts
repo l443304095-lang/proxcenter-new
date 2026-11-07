@@ -1,0 +1,812 @@
+// Extracted from src/app/api/v1/inventory/route.ts (spec D9): the raw
+// multi-cluster fan-out plus its stale-while-revalidate cache wrapper, so the
+// public metrics/health endpoints reuse ONE implementation instead of copying
+// it (Sonar new-code duplication ceiling is 3%).
+//
+// The fan-out reads /nodes FIRST and skips offline nodes: on a 3-node cluster
+// with one node down, every per-guest call to the dead node fails with HTTP 595
+// after about 1s, so 50 guests on a dead node would add 50s of latency
+// (measured, spec section 9).
+import { getSessionPrisma } from "@/lib/tenant"
+import { prisma as globalPrisma } from "@/lib/db/prisma"
+import { getConnectionById, getPbsConnectionById } from "@/lib/connections/getConnection"
+import { pveFetch } from "@/lib/proxmox/client"
+import { aggregateStorage, type AggregatedStorage } from "@/lib/proxmox/storage"
+import type { PoolFacts } from "./proxmoxProjections"
+import { readNodeStatus, readPools, readStorageResources } from "./proxmoxProjections"
+import { pbsFetch } from "@/lib/proxmox/pbs-client"
+import { collectNodeAddresses, resolveManagementIp } from "@/lib/proxmox/resolveManagementIp"
+import { attachGuestDiskTotals, onlineNodeSet } from "./guestDiskTotals"
+import {
+  getInventoryFromCache,
+  setCachedInventory,
+  getInflightFetch,
+  setInflightFetch,
+  clearInflightFetch,
+  inventoryCacheEpoch,
+  type CachedInventory,
+} from "@/lib/cache/inventoryCache"
+import { inventoryConnectionPlan, type InfraScope } from "@/lib/tenant/infraScope"
+import { cephVisibleTo } from "@/lib/ceph/tenantVisibility"
+
+export type NodeData = {
+  node: string
+  status: string
+  cpu?: number
+  /** Physical cores the host exposes, straight from /nodes. */
+  maxcpu?: number
+  mem?: number
+  maxmem?: number
+  disk?: number
+  maxdisk?: number
+  uptime?: number
+  /**
+   * Everything below comes from the per-node `/nodes/{node}/status` call this
+   * module ALREADY makes for its memory figures (#925). The payload carries
+   * load, iowait, swap and the exact root filesystem bytes, and all of it used
+   * to be discarded. `/nodes` and `/cluster/resources` carry none of them.
+   */
+  loadavg?: number[]
+  iowait?: number
+  swapUsed?: number
+  swapTotal?: number
+  rootfsUsed?: number
+  rootfsTotal?: number
+  cores?: number
+  pveVersion?: string
+  kernel?: string
+  ip?: string
+  /** All non-loopback addresses of the host, for the IP search of the palette (#861). */
+  ips?: string[]
+  maintenance?: string
+}
+
+export type GuestData = {
+  vmid: string | number
+  name?: string
+  type: string
+  status: string
+  node: string
+  cpu?: number
+  /** vCPUs *assigned* to the guest (cores x sockets), not the usage ratio. */
+  maxcpu?: number
+  mem?: number
+  maxmem?: number
+  disk?: number
+  maxdisk?: number
+  uptime?: number
+  pool?: string
+  tags?: string
+  template?: number | boolean
+  hastate?: string
+  hagroup?: string
+  /**
+   * Cumulative byte COUNTERS since guest start, straight off
+   * `/cluster/resources?type=vm` (#925). Measured present on PVE 9. They were
+   * fetched and dropped by this projection.
+   */
+  netin?: number
+  netout?: number
+  diskread?: number
+  diskwrite?: number
+  cores?: number
+  /** PVE 9 host-side memory of the guest, distinct from the guest-side `mem`. */
+  memhost?: number
+  /**
+   * Sum of every attached disk, from the guest config (#938). `maxdisk` is
+   * only the boot disk (rootfs for a container), and 0 for a VM whose boot
+   * order names no disk. Absent until a config read succeeded.
+   */
+  diskTotal?: number
+}
+
+export type HaResource = {
+  sid: string
+  state: string
+  group?: string
+  max_restart?: number
+  max_relocate?: number
+}
+
+/**
+ * A resource pool as Proxmox declares it, NOT as its members imply it. Every
+ * pool list in this app used to be derived from the guests carrying a `pool`
+ * field, so a pool with no guest existed nowhere (issue #978). `/pools` is the
+ * only endpoint that answers for empty ones.
+ */
+export type PoolData = PoolFacts
+
+export type ClusterData = {
+  id: string
+  name: string
+  type: string
+  isCluster: boolean
+  status: 'online' | 'degraded' | 'offline'
+  cephHealth?: string
+  latitude?: number | null
+  longitude?: number | null
+  locationLabel?: string | null
+  sshEnabled?: boolean
+  /** Declared pools of the cluster, empty ones included (issue #978). */
+  pools?: PoolData[]
+  nodes: Array<NodeData & { guests: GuestData[] }>
+}
+
+export type PbsDatastoreData = {
+  name: string
+  path?: string
+  comment?: string
+  total: number
+  used: number
+  available: number
+  usagePercent: number
+  backupCount: number
+  vmCount: number
+  ctCount: number
+  hostCount: number
+}
+
+export type PbsServerData = {
+  id: string
+  name: string
+  type: 'pbs'
+  status: 'online' | 'offline'
+  version?: string
+  uptime?: number
+  datastores: PbsDatastoreData[]
+  stats: {
+    totalSize: number
+    totalUsed: number
+    datastoreCount: number
+    backupCount: number
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Raw fetch from Proxmox (the expensive part)                        */
+/* ------------------------------------------------------------------ */
+
+export type ExternalHypervisor = {
+  id: string
+  name: string
+  type: string
+}
+
+export type RawInventory = {
+  clusters: ClusterData[]
+  pbsServers: PbsServerData[]
+  externalHypervisors: ExternalHypervisor[]
+  // Per-storage aggregate for the metrics exposition. NOT the shape the
+  // inventory tree consumes: that one is {connId, nodes[], sharedStorages[]}
+  // and is built per request by the stream route. The two used to share the
+  // name `storages`, which put this shape in front of the tree and broke it.
+  storageResources: AggregatedStorage[]
+  stats: { totalClusters: number; totalNodes: number; totalGuests: number; onlineNodes: number; runningGuests: number; totalPbsServers: number; totalDatastores: number; totalBackups: number }
+}
+
+export async function fetchRawInventory(infra: InfraScope): Promise<RawInventory> {
+  const sessionPrisma = await getSessionPrisma()
+  const plan = inventoryConnectionPlan(infra)
+  const readCeph = cephVisibleTo(infra)
+  const pveClient = plan.pveClient === 'global' ? globalPrisma : sessionPrisma
+  const pbsExtClient = plan.pbsExtClient === 'global' ? globalPrisma : sessionPrisma
+  const pveWhere = plan.pveConnectionIds
+    ? { type: 'pve' as const, id: { in: plan.pveConnectionIds } }
+    : { type: 'pve' as const }
+
+  const [pveConnections, pbsConnections, externalConnections] = await Promise.all([
+    pveClient.connection.findMany({
+      where: pveWhere,
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, name: true, type: true, latitude: true, longitude: true, locationLabel: true, sshEnabled: true, tenantId: true },
+    }),
+    pbsExtClient.connection.findMany({
+      where: { type: 'pbs' },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, name: true, type: true, tenantId: true },
+    }),
+    pbsExtClient.connection.findMany({
+      where: { type: { in: ['vmware', 'hyperv', 'xcpng', 'nutanix'] } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, name: true, type: true },
+    }),
+  ])
+
+  const emptyResult = {
+    clusters: [] as ClusterData[],
+    pbsServers: [] as PbsServerData[],
+    externalHypervisors: [] as ExternalHypervisor[],
+    storageResources: [] as AggregatedStorage[],
+    stats: {
+      totalClusters: 0, totalNodes: 0, totalGuests: 0,
+      onlineNodes: 0, runningGuests: 0,
+      totalPbsServers: 0, totalDatastores: 0, totalBackups: 0,
+    }
+  }
+
+  if (!pveConnections.length && !pbsConnections.length && !externalConnections.length) {
+    return { ...emptyResult, externalHypervisors: externalConnections }
+  }
+
+  // 2) Pour chaque connexion PVE, charger nodes et guests EN PARALLÈLE
+  const clusterPromises = pveConnections.map(async (conn): Promise<{ cluster: ClusterData; storages: AggregatedStorage[] } | null> => {
+    try {
+      const connConfig = await getConnectionById(conn.id, (conn as any).tenantId)
+
+      const [nodesResult, guestsResult, haResult, cephResult, nodeResourcesResult, storagesResult, poolsResult] = await Promise.allSettled([
+        pveFetch<NodeData[]>(connConfig, '/nodes'),
+        pveFetch<GuestData[]>(connConfig, '/cluster/resources?type=vm'),
+        pveFetch<HaResource[]>(connConfig, '/cluster/ha/resources'),
+        // Ceph is a whole-cluster object: never read for an IaaS tenant (vDC
+        // slice of a provider cluster), so no cephHealth reaches its cache.
+        readCeph ? pveFetch<any>(connConfig, '/cluster/ceph/status') : Promise.resolve(null),
+        pveFetch<any[]>(connConfig, '/cluster/resources?type=node'),
+        // #925: the ONE call this module gains. `storages` has been declared on
+        // RawInventory since the beginning and never filled, and
+        // inventoryCache.ts treats a missing one as a cache miss, so filling it
+        // is the direction that was always intended.
+        pveFetch<any[]>(connConfig, '/cluster/resources?type=storage'),
+        // #978: the pool list has to come from Proxmox. `/cluster/resources`
+        // only ever names a pool through a member, so an empty pool is absent
+        // from every type= projection above.
+        pveFetch<any[]>(connConfig, '/pools'),
+      ])
+
+      const nodes: NodeData[] = nodesResult.status === 'fulfilled' ? nodesResult.value || [] : []
+      const guests: GuestData[] = guestsResult.status === 'fulfilled' ? guestsResult.value || [] : []
+      const haResources: HaResource[] = haResult.status === 'fulfilled' ? haResult.value || [] : []
+      const nodeResources: any[] = nodeResourcesResult.status === 'fulfilled' ? nodeResourcesResult.value || [] : []
+
+      const pools = readPools(poolsResult.status === 'fulfilled' ? poolsResult.value : null)
+
+      const nodeHastateMap = new Map<string, string>()
+      for (const nr of nodeResources) {
+        if (nr?.node && nr?.hastate) nodeHastateMap.set(nr.node, nr.hastate)
+      }
+
+      let cephHealth: string | undefined
+      if (cephResult.status === 'fulfilled' && cephResult.value) {
+        const cephData = cephResult.value
+        if (typeof cephData.health === 'string') {
+          cephHealth = cephData.health
+        } else if (cephData.health?.status) {
+          cephHealth = cephData.health.status
+        }
+      }
+
+      const nodeEnrichPromises = nodes.map(async (node) => {
+        if (!node?.node) return { node: node.node, ip: undefined, ips: [] as string[], mem: undefined, maxmem: undefined }
+
+        try {
+          // Fetch network and node status in parallel
+          const [networks, nodeStatus] = await Promise.all([
+            pveFetch<any[]>(connConfig, `/nodes/${encodeURIComponent(node.node)}/network`).catch(() => null),
+            node.status === 'online'
+              ? pveFetch<any>(connConfig, `/nodes/${encodeURIComponent(node.node)}/status`).catch(() => null)
+              : Promise.resolve(null),
+          ])
+
+          // Everything read out of the status payload lives in a pure module
+          // with its own tests (#925): the parsing is where the awkward
+          // Proxmox details are, and this function is unreachable by a unit
+          // test without mocking every network call around it.
+          return {
+            node: node.node,
+            ip: resolveManagementIp(networks),
+            ips: collectNodeAddresses(networks),
+            ...readNodeStatus(nodeStatus),
+          }
+        } catch {
+          return { node: node.node, ip: undefined, ips: [] as string[], mem: undefined, maxmem: undefined }
+        }
+      })
+
+      const nodeEnrichData = await Promise.all(nodeEnrichPromises)
+      type NodeEnrichment = Omit<(typeof nodeEnrichData)[number], 'node'>
+      const nodeIpMap = new Map<string, NodeEnrichment>()
+
+      for (const entry of nodeEnrichData) {
+        const { node, ...rest } = entry as any
+        if (node) nodeIpMap.set(node, rest)
+      }
+
+      const haMap = new Map<string, HaResource>()
+
+      for (const ha of haResources) {
+        if (ha.sid) {
+          haMap.set(ha.sid, ha)
+        }
+      }
+
+      const nodeMap = new Map<string, NodeData & { guests: GuestData[] }>()
+
+      for (const n of nodes) {
+        if (!n?.node) continue
+        const extra = nodeIpMap.get(n.node)
+        const hastate = nodeHastateMap.get(n.node)
+        const maintenance = hastate === 'maintenance' ? 'maintenance' : undefined
+        nodeMap.set(n.node, {
+          ...n,
+          // Override mem/maxmem with accurate values from /nodes/{node}/status
+          ...(extra?.mem !== undefined ? { mem: extra.mem } : {}),
+          ...(extra?.maxmem !== undefined ? { maxmem: extra.maxmem } : {}),
+          // #925: load, iowait, swap and root filesystem, from the same call.
+          loadavg: (extra as any)?.loadavg,
+          iowait: (extra as any)?.iowait,
+          swapUsed: (extra as any)?.swapUsed,
+          swapTotal: (extra as any)?.swapTotal,
+          rootfsUsed: (extra as any)?.rootfsUsed,
+          rootfsTotal: (extra as any)?.rootfsTotal,
+          cores: (extra as any)?.cores ?? (n as any)?.maxcpu,
+          pveVersion: (extra as any)?.pveVersion,
+          kernel: (extra as any)?.kernel,
+          ip: extra?.ip,
+          ips: extra?.ips ?? [],
+          maintenance,
+          guests: []
+        })
+      }
+
+      for (const g of guests) {
+        if (!g?.node) continue
+
+        if (!nodeMap.has(g.node)) {
+          nodeMap.set(g.node, {
+            node: g.node,
+            status: 'unknown',
+            guests: []
+          })
+        }
+
+        nodeMap.get(g.node)!.guests.push({
+          vmid: g.vmid,
+          name: g.name || `${g.type}/${g.vmid}`,
+          type: g.type || 'qemu',
+          status: g.status || 'unknown',
+          node: g.node,
+          cpu: g.cpu,
+          maxcpu: g.maxcpu,
+          mem: g.mem,
+          maxmem: g.maxmem,
+          disk: g.disk,
+          maxdisk: g.maxdisk,
+          uptime: g.uptime,
+          pool: g.pool,
+          tags: g.tags,
+          template: g.template === 1 || g.template === true,
+          // #925: cumulative counters, dropped by this projection until now.
+          netin: g.netin,
+          netout: g.netout,
+          diskread: g.diskread,
+          diskwrite: g.diskwrite,
+          cores: (g as any).maxcpu,
+          memhost: (g as any).memhost,
+          hastate: (() => {
+            const haSid = `${g.type === 'lxc' ? 'ct' : 'vm'}:${g.vmid}`
+            const ha = haMap.get(haSid)
+
+
+return ha?.state
+          })(),
+          hagroup: (() => {
+            const haSid = `${g.type === 'lxc' ? 'ct' : 'vm'}:${g.vmid}`
+            const ha = haMap.get(haSid)
+
+
+return ha?.group
+          })(),
+        })
+      }
+
+      for (const nodeData of nodeMap.values()) {
+        nodeData.guests.sort((a, b) => {
+          const aId = Number.parseInt(String(a.vmid), 10) || 0
+          const bId = Number.parseInt(String(b.vmid), 10) || 0
+
+
+return aId - bId
+        })
+      }
+
+      // #938: one /config per guest, cached across polls (guestDiskTotals.ts).
+      await attachGuestDiskTotals(
+        connConfig,
+        conn.id,
+        Array.from(nodeMap.values()).flatMap(n => n.guests),
+        { onlineNodes: nodesResult.status === 'fulfilled' ? onlineNodeSet(nodes) : null },
+      )
+
+      const nodesArray = Array.from(nodeMap.values())
+      const onlineNodes = nodesArray.filter(n => n.status === 'online').length
+      const totalNodes = nodesArray.length
+
+      let status: 'online' | 'degraded' | 'offline' = 'offline'
+
+      if (onlineNodes === totalNodes && totalNodes > 0) {
+        status = 'online'
+      } else if (onlineNodes > 0) {
+        status = 'degraded'
+      }
+
+      // #925. aggregateStorage is reused rather than reimplemented: a shared
+      // storage appears once PER NODE in /cluster/resources, so summing the raw
+      // rows triples the capacity of an RBD pool on a three node cluster. That
+      // helper already collapses shared storages to one entry and sums local
+      // ones per node, producing the nodeBreakdown a per-node panel needs.
+      const rawStorages = readStorageResources(
+        storagesResult.status === 'fulfilled' ? storagesResult.value : null,
+        conn.id,
+        conn.name,
+      )
+
+      return {
+        cluster: {
+        id: conn.id,
+        name: conn.name,
+        type: conn.type,
+        isCluster: totalNodes > 1,
+        status,
+        cephHealth,
+        sshEnabled: !!conn.sshEnabled,
+        latitude: conn.latitude,
+        longitude: conn.longitude,
+        locationLabel: conn.locationLabel,
+        pools,
+        nodes: nodesArray.sort((a, b) => a.node.localeCompare(b.node)),
+        },
+        storages: aggregateStorage(rawStorages),
+      }
+    } catch (e: any) {
+      console.error(`[inventory] Failed to load ${conn.name}:`, e?.message)
+
+      return {
+        cluster: {
+        id: conn.id,
+        name: conn.name,
+        type: conn.type,
+        isCluster: false,
+        status: 'offline' as const,
+        sshEnabled: !!conn.sshEnabled,
+        latitude: conn.latitude,
+        longitude: conn.longitude,
+        locationLabel: conn.locationLabel,
+        pools: [],
+        nodes: [],
+        },
+        storages: [],
+      }
+    }
+  })
+
+  const clustersResults = await Promise.all(clusterPromises)
+  const clusterEntries = clustersResults.filter((c): c is { cluster: ClusterData; storages: AggregatedStorage[] } => c !== null)
+  const clusters = clusterEntries.map(entry => entry.cluster)
+  const storages = clusterEntries.flatMap(entry => entry.storages)
+
+  // 3) Pour chaque connexion PBS, charger status et datastores EN PARALLÈLE
+  const pbsPromises = pbsConnections.map(async (conn): Promise<PbsServerData | null> => {
+    try {
+      // Pass the connection's own tenantId so the provider (global query) can
+      // open PBS servers owned by MSP tenants, not just default-owned ones.
+      const connConfig = await getPbsConnectionById(conn.id, (conn as any).tenantId)
+
+      const [statusResult, datastoresResult, versionResult] = await Promise.allSettled([
+        pbsFetch<any>(connConfig, '/status'),
+        pbsFetch<any[]>(connConfig, '/admin/datastore'),
+        // #925: `/status` carries NO version on PBS. It was read here as
+        // `status.info.version` and had always been undefined, so the PBS
+        // version was blank in the inventory tree and absent from the
+        // Prometheus exposition. `/version` is the endpoint that answers it,
+        // as connectionDiagnostics.ts:368 and the connections route already do.
+        pbsFetch<any>(connConfig, '/version'),
+      ])
+
+      const status = statusResult.status === 'fulfilled' ? statusResult.value : null
+      const datastores = datastoresResult.status === 'fulfilled' ? datastoresResult.value || [] : []
+      const versionInfo = versionResult.status === 'fulfilled' ? versionResult.value : null
+      // allSettled swallows a rejection, which is how `status.info.version`
+      // stayed dead and unnoticed. Say WHY the version is missing (#925).
+      if (versionResult.status === 'rejected') {
+        console.warn(`[inventory] PBS ${conn.name}: /version failed:`, versionResult.reason?.message)
+      }
+
+      const datastoreDetailsPromises = datastores.map(async (ds): Promise<PbsDatastoreData> => {
+        const storeName = ds.store || ds.name
+
+        if (!storeName) {
+          return {
+            name: 'unknown',
+            total: 0, used: 0, available: 0, usagePercent: 0,
+            backupCount: 0, vmCount: 0, ctCount: 0, hostCount: 0,
+          }
+        }
+
+        try {
+          const [dsStatusResult, snapshotsResult] = await Promise.allSettled([
+            pbsFetch<any>(connConfig, `/admin/datastore/${encodeURIComponent(storeName)}/status`),
+            pbsFetch<any[]>(connConfig, `/admin/datastore/${encodeURIComponent(storeName)}/snapshots`),
+          ])
+
+          const dsStatus = dsStatusResult.status === 'fulfilled' ? dsStatusResult.value : null
+          const snapshots = snapshotsResult.status === 'fulfilled' ? snapshotsResult.value || [] : []
+
+          const total = dsStatus?.total || 0
+          const used = dsStatus?.used || 0
+          const available = dsStatus?.avail || (total - used)
+
+          let vmCount = 0
+          let ctCount = 0
+          let hostCount = 0
+
+          for (const snap of snapshots) {
+            const backupType = snap['backup-type']
+            if (backupType === 'vm') vmCount++
+            else if (backupType === 'ct') ctCount++
+            else if (backupType === 'host') hostCount++
+          }
+
+          return {
+            name: storeName,
+            path: ds.path || '',
+            comment: ds.comment || '',
+            total, used, available,
+            usagePercent: total > 0 ? Math.round((used / total) * 100) : 0,
+            backupCount: snapshots.length,
+            vmCount, ctCount, hostCount,
+          }
+        } catch {
+          return {
+            name: storeName,
+            path: ds.path || '',
+            comment: ds.comment || '',
+            total: 0, used: 0, available: 0, usagePercent: 0,
+            backupCount: 0, vmCount: 0, ctCount: 0, hostCount: 0,
+          }
+        }
+      })
+
+      const datastoreDetails = await Promise.all(datastoreDetailsPromises)
+
+      let totalSize = 0
+      let totalUsed = 0
+      let totalBackups = 0
+
+      for (const ds of datastoreDetails) {
+        totalSize += ds.total
+        totalUsed += ds.used
+        totalBackups += ds.backupCount
+      }
+
+      return {
+        id: conn.id,
+        name: conn.name,
+        type: 'pbs',
+        status: status ? 'online' : 'offline',
+        version: versionInfo?.version || undefined,
+        // KNOWN DEAD, left as-is on purpose (#925): `/status` carries no
+        // uptime either. The answer is on /nodes/{node}/status, which needs a
+        // node name this call does not have, and no consumer reads it today.
+        uptime: status?.uptime || undefined,
+        datastores: datastoreDetails,
+        stats: { totalSize, totalUsed, datastoreCount: datastoreDetails.length, backupCount: totalBackups }
+      }
+    } catch (e: any) {
+      console.error(`[inventory] Failed to load PBS ${conn.name}:`, e?.message)
+      return {
+        id: conn.id,
+        name: conn.name,
+        type: 'pbs',
+        status: 'offline',
+        datastores: [],
+        stats: { totalSize: 0, totalUsed: 0, datastoreCount: 0, backupCount: 0 }
+      }
+    }
+  })
+
+  const pbsResults = await Promise.all(pbsPromises)
+  const pbsServers = pbsResults.filter((p): p is PbsServerData => p !== null)
+
+  // 4) Calculer les stats globales (sur données brutes, avant RBAC)
+  let totalNodes = 0
+  let onlineNodes = 0
+  let totalGuests = 0
+  let runningGuests = 0
+
+  for (const cluster of clusters) {
+    for (const node of cluster.nodes) {
+      totalNodes++
+      if (node.status === 'online') onlineNodes++
+
+      for (const guest of node.guests) {
+        totalGuests++
+        if (guest.status === 'running') runningGuests++
+      }
+    }
+  }
+
+  let totalDatastores = 0
+  let totalBackups = 0
+
+  for (const pbs of pbsServers) {
+    totalDatastores += pbs.stats.datastoreCount
+    totalBackups += pbs.stats.backupCount
+  }
+
+  return {
+    clusters,
+    pbsServers,
+    externalHypervisors: externalConnections,
+    storageResources: storages,
+    stats: {
+      totalClusters: clusters.length,
+      totalNodes,
+      totalGuests,
+      onlineNodes,
+      runningGuests,
+      totalPbsServers: pbsServers.length,
+      totalDatastores,
+      totalBackups,
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Fetch helpers (blocking + background revalidation)                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Blocking fetch with thundering-herd protection.
+ * Used on cache miss or force refresh — the caller awaits the result.
+ *
+ * `vdcContext` MUST describe the same scope `infra` was resolved under — a
+ * narrowed `infra` stored under the union cache key (or vice-versa) poisons
+ * the cache: the next reader for the wrong context gets someone else's slice
+ * of the inventory (or a truncated one).
+ */
+export async function blockingFetch(tenantId: string, infra: InfraScope, vdcContext: string | null = null) {
+  let inflight = getInflightFetch(tenantId, vdcContext)
+
+  if (inflight === null) {
+    const startTime = Date.now()
+    const epoch = inventoryCacheEpoch()
+    const fetching: Promise<CachedInventory> = fetchRawInventory(infra)
+      .then(result => {
+        console.log(`[inventory] Fetched from Proxmox in ${Date.now() - startTime}ms`)
+        setCachedInventory(result, tenantId, vdcContext, epoch)
+        clearInflightFetch(fetching, tenantId, vdcContext)
+        return result
+      })
+      .catch(err => {
+        clearInflightFetch(fetching, tenantId, vdcContext)
+        throw err
+      })
+    inflight = fetching
+    setInflightFetch(inflight, tenantId, vdcContext)
+  }
+
+  return inflight
+}
+
+/**
+ * Trigger a background revalidation if one isn't already in progress.
+ * Fire-and-forget — errors are logged but don't affect the current request.
+ *
+ * `vdcContext` MUST describe the same scope `infra` was resolved under — a
+ * narrowed `infra` stored under the union cache key (or vice-versa) poisons
+ * the cache: the next reader for the wrong context gets someone else's slice
+ * of the inventory (or a truncated one).
+ */
+export function triggerBackgroundRevalidation(tenantId: string, infra: InfraScope, vdcContext: string | null = null) {
+  if (getInflightFetch(tenantId, vdcContext) !== null) return
+
+  const startTime = Date.now()
+  const epoch = inventoryCacheEpoch()
+
+  // This promise goes into the SHARED in-flight slot, which blockingFetch
+  // hands straight back to its callers. So it must resolve to the inventory
+  // and reject on failure, exactly like blockingFetch's own promise does.
+  //
+  // It used to do neither. The `.then` returned nothing and the `.catch`
+  // swallowed the error, making this a Promise<void> stored through an
+  // `as any` — the slot is typed Promise<CachedInventory>, so the cast was
+  // the only reason it compiled. Any request that reached the blocking path
+  // while a background revalidation was running got that promise, awaited it,
+  // and received `undefined`, which then died on `raw.clusters` as a 500.
+  // Reproduced on the first inventory call after a server start, but the same
+  // window opens on EVERY stale revalidation, so under a polling monitor it
+  // was an intermittent 500 with no explanation.
+  const revalidation: Promise<CachedInventory> = fetchRawInventory(infra)
+    .then(result => {
+      console.log(`[inventory] Background revalidation completed in ${Date.now() - startTime}ms`)
+      setCachedInventory(result, tenantId, vdcContext, epoch)
+      clearInflightFetch(revalidation, tenantId, vdcContext)
+
+      return result
+    })
+    .catch(err => {
+      console.error('[inventory] Background revalidation failed:', err?.message)
+      clearInflightFetch(revalidation, tenantId, vdcContext)
+      // Rethrow so a piggybacking blockingFetch caller learns the fetch
+      // failed. Answering it with `undefined` is what produced the bogus
+      // TypeError instead of the real cause.
+      throw err
+    })
+
+  setInflightFetch(revalidation, tenantId, vdcContext)
+
+  // Fire-and-forget for THIS caller: the rethrow above is for whoever awaits
+  // the shared slot, and without a detached handler it would surface as an
+  // unhandled rejection. Attached after the slot is set, and deliberately on
+  // a separate handler chain so the promise stored above still rejects.
+  revalidation.catch(() => {})
+}
+
+/** All-empty shape, same fields as a real RawInventory, served on a cold
+ * cache to a `nonBlocking` caller instead of making it wait. */
+function emptyRawInventory(): RawInventory {
+  return {
+    clusters: [],
+    pbsServers: [],
+    externalHypervisors: [],
+    storageResources: [],
+    stats: {
+      totalClusters: 0, totalNodes: 0, totalGuests: 0, onlineNodes: 0,
+      runningGuests: 0, totalPbsServers: 0, totalDatastores: 0, totalBackups: 0,
+    },
+  }
+}
+
+/**
+ * Stale-while-revalidate read, extracted from route.ts:586-601 so the public
+ * endpoints share it. Fresh: serve. Stale: serve and revalidate in the
+ * background. Miss or forceRefresh: blocking fetch — UNLESS `nonBlocking`.
+ *
+ * `nonBlocking` exists for the public scrape endpoints ONLY (D12): a UI
+ * caller awaiting a cold cache is normal and bounded by the user's
+ * patience, but a Prometheus scrape has a fixed ~10s default timeout and a
+ * cold fan-out over a large fleet can take longer than that (measured ~5s
+ * for 500 VMs, worse for bigger fleets or PBS) — the scrape would time out
+ * and get marked DOWN, a fault the monitoring system caused itself. On a
+ * miss, a non-blocking caller gets an empty inventory immediately while a
+ * background fetch warms the cache for the NEXT scrape. Every existing
+ * caller omits the flag and keeps blocking, unchanged.
+ *
+ * `vdcContext` MUST describe the same scope `infra` was resolved under — a
+ * narrowed `infra` stored under the union cache key (or vice-versa) poisons
+ * the cache: the next reader for the wrong context gets someone else's slice
+ * of the inventory (or a truncated one).
+ */
+// A cache entry can be written by either producer: the stream route fills
+// `storages` for the inventory tree, this module fills `storageResources` for
+// the metrics exposition. Neither carries the other's field, so read them as
+// absent rather than undefined.
+function rawFromCache(data: CachedInventory): RawInventory {
+  return { ...data, storageResources: data.storageResources ?? [] } as RawInventory
+}
+
+export async function getInventorySWR(
+  tenantId: string,
+  infra: InfraScope,
+  forceRefresh = false,
+  nonBlocking = false,
+  vdcContext: string | null = null,
+): Promise<{ raw: RawInventory; cached: boolean }> {
+  if (forceRefresh) {
+    return { raw: rawFromCache(await blockingFetch(tenantId, infra, vdcContext)), cached: false }
+  }
+  const cacheResult = getInventoryFromCache(tenantId, vdcContext)
+  if (cacheResult.status === "fresh") {
+    return { raw: rawFromCache(cacheResult.data), cached: true }
+  }
+  if (cacheResult.status === "stale") {
+    console.log('[inventory] Serving stale data, revalidating in background')
+    triggerBackgroundRevalidation(tenantId, infra, vdcContext)
+    return { raw: rawFromCache(cacheResult.data), cached: true }
+  }
+  if (nonBlocking) {
+    console.log('[inventory] Cold cache, serving empty and warming in background (non-blocking caller)')
+    triggerBackgroundRevalidation(tenantId, infra, vdcContext)
+    return { raw: emptyRawInventory(), cached: false }
+  }
+  return { raw: rawFromCache(await blockingFetch(tenantId, infra, vdcContext)), cached: false }
+}

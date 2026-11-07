@@ -1,0 +1,70 @@
+// src/app/api/v1/connections/[id]/resources/route.ts
+import { NextResponse } from "next/server"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { mapClusterResource } from "@/lib/proxmox/mappers"
+import { attachGuestDiskTotals, onlineNodeSet } from "@/lib/inventory/guestDiskTotals"
+import { getRBACContext, filterVmsByPermission, PERMISSIONS, checkPermission } from "@/lib/rbac"
+import { sessionGuestVisibility } from "@/lib/vdc/guestGuard"
+
+export const runtime = "nodejs"
+
+export async function GET(
+  _req: Request,
+  ctx: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await ctx.params
+
+    if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 })
+
+    // Use VM_VIEW without resource context so scoped users (node/vm/tag/pool) pass.
+    // The actual filtering happens below with filterVmsByPermission.
+    const denied = await checkPermission(PERMISSIONS.VM_VIEW)
+    if (denied) return denied
+
+    const conn = await getConnectionById(id)
+    const raw = await pveFetch<any[]>(conn, "/cluster/resources")
+
+    // A vDC session only lists the guests of its pools, as /api/v1/vms does;
+    // the listing just read carries each guest's pool, so nothing is re-read.
+    const scoped = await sessionGuestVisibility({ connectionId: id, conn, resources: raw })
+    if (!scoped.ok) return scoped.response
+
+    // Filtrer uniquement les VMs/CTs (pas les nodes, storage, etc.)
+    let guests = raw
+      .filter((r) => (r?.type === "qemu" || r?.type === "lxc") && scoped.visibility.has(r.type, r.vmid))
+      .map(mapClusterResource)
+
+    // #938: `diskTotal` (sum of every disk) for the cluster and node panels.
+    // Answered from the cache the inventory keeps warm; this route never waits
+    // on N config reads, it only refreshes the missing figures behind itself.
+    await attachGuestDiskTotals(conn, id, guests, {
+      onlineNodes: onlineNodeSet(raw.filter((r) => r?.type === "node")),
+      blocking: false,
+    })
+
+    // Apply RBAC scope filtering so scoped users only see their permitted VMs
+    const rbacCtx = await getRBACContext()
+    if (rbacCtx && !rbacCtx.isAdmin) {
+      const withMeta = guests.map(g => ({
+        ...g,
+        connId: id,
+        vmid: String(g.vmid),
+      }))
+      const filtered = await filterVmsByPermission(
+        rbacCtx.userId,
+        withMeta,
+        PERMISSIONS.VM_VIEW,
+        rbacCtx.tenantId
+      )
+      const allowed = new Set(filtered.map(g => g.vmid))
+      guests = guests.filter(g => allowed.has(String(g.vmid)))
+    }
+
+    return NextResponse.json({ data: guests })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

@@ -1,0 +1,2658 @@
+'use client'
+
+import { useEffect, useMemo, useRef, useState } from 'react'
+
+import dynamic from 'next/dynamic'
+import { useSearchParams, useRouter } from 'next/navigation'
+
+import { useSession } from 'next-auth/react'
+
+import { useTranslations } from 'next-intl'
+
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControlLabel,
+  IconButton,
+  MenuItem,
+  Select,
+  FormControl,
+  FormHelperText,
+  InputLabel,
+  Switch,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+  LinearProgress,
+  InputAdornment,
+  useTheme
+} from '@mui/material'
+
+import { DataGrid } from '@mui/x-data-grid'
+
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import { useLicense, Features } from '@/contexts/LicenseContext'
+import { useRBAC } from '@/contexts/RBACContext'
+import EmptyState from '@/components/EmptyState'
+import { CountryFlag } from '@/components/ui/CountryFlag'
+import { interpretConnectionStatusResponse } from '@/components/settings/connectionStatusResult'
+import { findCountry } from '@/lib/utils/countries'
+
+
+import LicenseTab from '@/components/settings/license/LicenseTab'
+import LlmModelLabel from '@/components/settings/LlmModelLabel'
+import SettingsNav from '@/components/settings/SettingsNav'
+import { useConnectionsManagement } from '@/hooks/useConnectionsManagement'
+import { useAISettings } from '@/hooks/useAISettings'
+import { isQualifiedOllamaModel, QUALIFIED_OLLAMA_MODELS } from '@/lib/ai/qualifiedModels'
+import { useGreenSettings } from '@/hooks/useGreenSettings'
+
+// Import dynamique pour éviter les erreurs SSR
+// One shared loading fallback for every lazily-imported tab. Repeating the
+// same JSX per import puts any new tab inside an already-duplicated block,
+// which fails the new-code duplication gate.
+const tabLoading = () => (
+  <Box sx={{ p: 3, textAlign: 'center' }}>
+    <LinearProgress />
+  </Box>
+)
+
+const NotificationsTab = dynamic(() => import('@/components/settings/NotificationsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const SyslogTab = dynamic(() => import('@/components/settings/SyslogTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const AvailabilitySettingsTab = dynamic(() => import('@/components/settings/AvailabilitySettingsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const GuestFileRestoreTab = dynamic(() => import('@/components/settings/GuestFileRestoreTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const AIActionsTab = dynamic(() => import('@/components/settings/AIActionsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const AppearanceTab = dynamic(() => import('@/components/settings/AppearanceTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const LdapConfigTab = dynamic(() => import('@/components/settings/LdapConfigTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const OidcConfigTab = dynamic(() => import('@/components/settings/OidcConfigTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const ConnectionDialog = dynamic(() => import('@/components/settings/ConnectionDialog'), {
+  ssr: false
+})
+
+const HaTab = dynamic(() => import('@/components/settings/ha/HaTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const TlsTab = dynamic(() => import('@/components/settings/TlsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const ApiTokensTab = dynamic(() => import('@/components/settings/api-tokens/ApiTokensTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const DiagnosticModal = dynamic(() => import('@/components/settings/DiagnosticModal'), {
+  ssr: false
+})
+
+const ConnectionCheckDialog = dynamic(() => import('@/components/settings/ConnectionCheckDialog'), {
+  ssr: false
+})
+
+const WhiteLabelTab = dynamic(() => import('@/components/settings/WhiteLabelTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const VdcTab = dynamic(() => import('@/components/settings/VdcTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const TenantsTab = dynamic(() => import('@/components/settings/TenantsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const AlertThresholdsTab = dynamic(() => import('@/components/settings/AlertThresholdsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const SshCommandsTab = dynamic(() => import('@/components/settings/SshCommandsTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const BroadcastTab = dynamic(() => import('@/components/settings/BroadcastTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const ConfigBackupTab = dynamic(() => import('@/components/settings/ConfigBackupTab'), {
+  ssr: false,
+  loading: tabLoading
+})
+
+const DatacentersSection = dynamic(() => import('@/components/settings/green/DatacentersSection'), {
+  ssr: false,
+  loading: () => <Box sx={{ p: 2, textAlign: 'center' }}><LinearProgress /></Box>
+})
+
+/* ==================== Utility ==================== */
+
+function MainTabPanel({ value, index, children }) {
+  if (value !== index) return null
+  return <Box>{children}</Box>
+}
+
+function SubTabPanel({ value, index, children }) {
+  return value === index ? <Box sx={{ mt: 2 }}>{children}</Box> : null
+}
+
+async function fetchJson(url, init) {
+  const r = await fetch(url, init)
+  const text = await r.text()
+  let json = null
+
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch {
+    // Response is not JSON — use raw text as error message
+  }
+
+  if (!r.ok) {
+    // Build a useful error message from Zod validation details if present
+    let msg = json?.error || text || `HTTP ${r.status}`
+    if (json?.details?.fieldErrors) {
+      const fields = Object.entries(json.details.fieldErrors)
+        .filter(([, v]) => v?.length)
+        .map(([k, v]) => `${k}: ${v.join(', ')}`)
+      if (fields.length) msg += ' — ' + fields.join('; ')
+    }
+    throw new Error(msg)
+  }
+
+  return json
+}
+
+/* ==================== ConnectionStatus Component ==================== */
+
+function ConnectionStatus({ connection, autoTest = false, onNodesLoaded }) {
+  const t = useTranslations()
+  const [status, setStatus] = useState(null)
+  const [error, setError] = useState(null)
+
+  const testConnection = async () => {
+    setStatus('loading')
+    setError(null)
+
+    try {
+      const endpoint = connection.type === 'pbs'
+        ? `/api/v1/pbs/${connection.id}/status`
+        : connection.type === 'vmware'
+        ? `/api/v1/vmware/${connection.id}/status`
+        : connection.type === 'xcpng'
+        ? `/api/v1/xcpng/${connection.id}/status`
+        : connection.type === 'nutanix'
+        ? `/api/v1/nutanix/${connection.id}/status`
+        : connection.type === 'hyperv'
+        ? `/api/v1/hyperv/${connection.id}/status`
+        : `/api/v1/connections/${connection.id}/nodes`
+
+      const res = await fetch(endpoint)
+      const json = await res.json().catch(() => ({}))
+      const result = interpretConnectionStatusResponse(res, json)
+
+      if (result.status === 'ok') {
+        setStatus('ok')
+        if (onNodesLoaded) onNodesLoaded()
+      } else {
+        setStatus('error')
+        setError(result.error)
+      }
+    } catch (e) {
+      setStatus('error')
+      setError(t('settings.connectionError'))
+    }
+  }
+
+  useEffect(() => {
+    if (autoTest && connection?.id) {
+      testConnection()
+    }
+  }, [connection?.id, autoTest])
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+      {status === 'loading' && (
+        <Chip size='small' label='Test...' color='default' variant='outlined' />
+      )}
+      {status === 'ok' && (
+        <Chip size='small' label={`● ${t('common.online')}`} color='success' variant='outlined' />
+      )}
+      {status === 'error' && (
+        <Tooltip title={error || t('common.error')}>
+          <Chip size='small' label={`● ${t('common.error')}`} color='error' variant='outlined' />
+        </Tooltip>
+      )}
+      {status === null && (
+        <Chip size='small' label={`○ ${t('common.unknown')}`} color='default' variant='outlined' sx={{ opacity: 0.5 }} />
+      )}
+      <Tooltip title={t('common.refresh')}>
+        <IconButton size='small' onClick={testConnection}>
+          <i className='ri-refresh-line' style={{ fontSize: 16 }} />
+        </IconButton>
+      </Tooltip>
+    </Box>
+  )
+}
+
+/* ==================== ConnectionVersion ==================== */
+
+function ConnectionVersion({ connection }) {
+  const [version, setVersion] = useState(null)
+
+  useEffect(() => {
+    if (!connection?.id) return
+    const endpoint = connection.type === 'pbs'
+      ? `/api/v1/pbs/${connection.id}/status`
+      : `/api/v1/connections/${connection.id}/version`
+
+    fetch(endpoint)
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        if (!json) return
+        const data = json.data || json
+        const ver = data.version || ''
+        const rel = data.release ? `-${data.release}` : ''
+        if (ver) setVersion(`${ver}${rel}`)
+      })
+      .catch(() => {})
+  }, [connection?.id, connection?.type])
+
+  if (!version) {
+    return <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+  }
+
+  return (
+    <Chip
+      size='small'
+      label={version}
+      variant='outlined'
+      sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.75rem' }}
+    />
+  )
+}
+
+/* ==================== BridgeTypes Component ==================== */
+
+function BridgeTypes({ connection }) {
+  const t = useTranslations()
+  const [bridgeInfo, setBridgeInfo] = useState(null)
+
+  useEffect(() => {
+    if (!connection?.id || connection.type !== 'pve') return
+
+    fetch(`/api/v1/connections/${connection.id}/nodes`)
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        if (!json?.data) return
+        let hasNative = false
+        let hasOvs = false
+
+        for (const node of json.data) {
+          if (node.bridges?.native?.length > 0) hasNative = true
+          if (node.bridges?.ovs?.length > 0) hasOvs = true
+        }
+
+        setBridgeInfo({ hasNative, hasOvs })
+      })
+      .catch(() => {})
+  }, [connection?.id, connection?.type])
+
+  if (!bridgeInfo) {
+    return <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+  }
+
+  const { hasNative, hasOvs } = bridgeInfo
+
+  if (!hasNative && !hasOvs) {
+    return <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+  }
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
+      {hasNative && (
+        <Chip size='small' label={t('network.bridgeNative')} variant='outlined' sx={{ fontSize: '0.7rem', height: 22 }} />
+      )}
+      {hasOvs && (
+        <Chip size='small' label='OVS' color='info' variant='outlined' sx={{ fontSize: '0.7rem', height: 22 }} />
+      )}
+    </Box>
+  )
+}
+
+/* ==================== ConnectionsTab Component ==================== */
+
+function ConnectionsTab() {
+  const t = useTranslations()
+  const theme = useTheme()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const isOnboarding = searchParams.get('onboarding') === 'true'
+  const { hasFeature } = useLicense()
+  const migrationAvailable = hasFeature(Features.VMWARE_MIGRATION)
+  const [connTab, setConnTab] = useState(0)
+
+  // Hook for data fetching
+  const {
+    pveConnections,
+    pbsConnections,
+    vmwareConnections,
+    xcpngConnections,
+    nutanixConnections,
+    hypervConnections,
+    pveLoading,
+    pbsLoading,
+    vmwareLoading,
+    xcpngLoading,
+    nutanixLoading,
+    hypervLoading,
+    pveError,
+    pbsError,
+    vmwareError,
+    xcpngError,
+    nutanixError,
+    hypervError,
+    loadPveConnections,
+    loadPbsConnections,
+    loadVmwareConnections,
+    loadXcpngConnections,
+    loadNutanixConnections,
+    loadHypervConnections,
+  } = useConnectionsManagement()
+  // Migration settings of a PVE target only matter once a source hypervisor
+  // is configured: the tab is hidden otherwise, and its values are not sent.
+  const migrationSourcesConfigured = [vmwareConnections, xcpngConnections, nutanixConnections, hypervConnections].some(l => (l?.length ?? 0) > 0)
+
+  // Tenant name map for ownership badges: id -> name
+  const [tenantNameMap, setTenantNameMap] = useState({})
+  useEffect(() => {
+    fetch('/api/v1/tenants')
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        if (!Array.isArray(json?.data)) return
+        const map = {}
+        for (const tenant of json.data) map[tenant.id] = tenant.name
+        setTenantNameMap(map)
+      })
+      .catch(() => {})
+  }, [])
+
+  // vDC map: connectionId -> Array<{ vdcName, tenantId }> (provider-only; silently ignore non-OK)
+  const [vdcsByConnection, setVdcsByConnection] = useState({})
+  useEffect(() => {
+    fetch('/api/v1/admin/vdcs')
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        const rows = Array.isArray(json) ? json : (Array.isArray(json?.data) ? json.data : null)
+        if (!rows) return
+        const map = {}
+        for (const vdc of rows) {
+          if (!vdc.connectionId) continue
+          if (!map[vdc.connectionId]) map[vdc.connectionId] = []
+          map[vdc.connectionId].push({ vdcName: vdc.name, tenantId: vdc.tenantId })
+        }
+        setVdcsByConnection(map)
+      })
+      .catch(() => {})
+  }, [])
+
+  // Dialog
+  const [addConnOpen, setAddConnOpen] = useState(false)
+  const [addConnType, setAddConnType] = useState('pve')
+  const [editingConn, setEditingConn] = useState(null)
+  const [detectingCephId, setDetectingCephId] = useState(null)
+
+  // Diagnostic modal state
+  const [diagOpen, setDiagOpen] = useState(false)
+  const [diagConnectionId, setDiagConnectionId] = useState(null)
+  const [diagConnectionName, setDiagConnectionName] = useState('')
+
+  const openDiagnostic = (id, name) => {
+    setDiagConnectionId(id)
+    setDiagConnectionName(name)
+    setDiagOpen(true)
+  }
+
+  // "Check connection" dialog state (PVE connections only)
+  const [checkConn, setCheckConn] = useState(null)
+
+  const handleDetectCeph = async (connId) => {
+    setDetectingCephId(connId)
+    try {
+      await fetch(`/api/v1/connections/${connId}/detect-ceph`, { method: 'POST' })
+      await loadPveConnections()
+    } catch { /* ignore */ }
+    setDetectingCephId(null)
+  }
+
+  const openAddDialog = (type) => {
+    setAddConnType(type)
+    setEditingConn(null)
+    setAddConnOpen(true)
+  }
+
+  const openEditDialog = (connection) => {
+    setAddConnType(connection.type)
+    setEditingConn(connection)
+    setAddConnOpen(true)
+  }
+
+  const handleSaveConnection = async (formData) => {
+    const isExtHypervisor = addConnType === 'vmware' || addConnType === 'xcpng' || addConnType === 'nutanix' || addConnType === 'hyperv'
+    const payload = {
+      name: formData.name.trim(),
+      type: addConnType,
+      baseUrl: formData.baseUrl.trim(),
+      behindProxy: isExtHypervisor ? false : !!formData.behindProxy,
+      insecureTLS: !!formData.insecureTLS,
+      ...(addConnType === 'pve' && { cephExporterPort: formData.cephExporterPort }),
+      // Location fields
+      latitude: formData.latitude !== '' && !Number.isNaN(Number.parseFloat(formData.latitude)) ? Number.parseFloat(formData.latitude) : null,
+      longitude: formData.longitude !== '' && !Number.isNaN(Number.parseFloat(formData.longitude)) ? Number.parseFloat(formData.longitude) : null,
+      locationLabel: formData.locationLabel?.trim() || null,
+      country: formData.country?.trim().toUpperCase() || null,
+      // PVE/PBS: API token
+      ...(!isExtHypervisor && formData.apiToken.trim() && { apiToken: formData.apiToken.trim() }),
+      // VMware/XCP-ng: username + password
+      ...(isExtHypervisor && { vmwareUser: formData.vmwareUser?.trim() || (addConnType === 'xcpng' ? (formData.subType === 'xapi' ? 'root' : 'admin@admin.net') : addConnType === 'hyperv' ? 'Administrator' : addConnType === 'nutanix' ? 'admin' : 'root') }),
+      ...(isExtHypervisor && formData.vmwarePassword && { vmwarePassword: formData.vmwarePassword }),
+      // VMware sub-type and datacenter
+      ...(addConnType === 'vmware' && { subType: formData.subType || 'esxi' }),
+      ...(addConnType === 'vmware' && formData.vmwareDatacenter?.trim() && { vmwareDatacenter: formData.vmwareDatacenter.trim() }),
+      // XCP-ng connection mode: direct pool over XAPI, or through Xen Orchestra
+      ...(addConnType === 'xcpng' && { subType: formData.subType || 'xo' }),
+      // Hyper-V SMB share name
+      ...(addConnType === 'hyperv' && { hypervShareName: formData.hypervShareName?.trim() || 'VMs' }),
+      // SSH fields (PVE + VMware — not XCP-ng)
+      ...(addConnType !== 'xcpng' && addConnType !== 'hyperv' && addConnType !== 'nutanix' && {
+        sshEnabled: formData.sshEnabled,
+        sshPort: formData.sshPort,
+        sshUser: formData.sshUser,
+        sshAuthMethod: formData.sshAuthMethod || null,
+        sshUseSudo: !!formData.sshUseSudo,
+        // Site Recovery replication network (PVE only), null = management network.
+        // Cleared along with SSH: the field is hidden then and may hold a half-typed value.
+        ...(addConnType === 'pve' && { replicationNetwork: formData.sshEnabled ? (formData.replicationNetwork?.trim() || null) : null }),
+        ...(formData.sshKey.trim() && { sshKey: formData.sshKey.trim() }),
+        ...(formData.sshPassphrase.trim() && { sshPassphrase: formData.sshPassphrase.trim() }),
+        ...(formData.sshPassword.trim() && { sshPassword: formData.sshPassword.trim() }),
+      }),
+      // Warm migration zeroing cap of this PVE target (roadmap#45), Enterprise
+      // only; empty = unlimited (null clears a value saved before).
+      ...(addConnType === 'pve' && migrationAvailable && migrationSourcesConfigured && {
+        warmZeroRateLimitMBps: formData.warmZeroRateLimitMBps?.trim() ? Number(formData.warmZeroRateLimitMBps.trim()) : null,
+        integrityCheckEnabled: formData.integrityCheckEnabled,
+        integrityRegionCount: formData.integrityRegionCount,
+        integrityRegionSizeMiB: formData.integrityRegionSizeMiB,
+      }),
+      // Provider-only create-with-owner: own the connection by an MSP tenant
+      ...(!editingConn?.id && formData.ownerTenantId && { ownerTenantId: formData.ownerTenantId }),
+    }
+
+    if (editingConn?.id) {
+      // Update existing
+      await fetchJson(`/api/v1/connections/${editingConn.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+    } else {
+      // Create new
+      if (!isExtHypervisor && !formData.apiToken.trim()) {
+        throw new Error('API Token is required')
+      }
+      await fetchJson('/api/v1/connections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+    }
+
+    // Reload connections
+    if (addConnType === 'pve') {
+      loadPveConnections()
+    } else if (addConnType === 'pbs') {
+      loadPbsConnections()
+    } else if (addConnType === 'vmware') {
+      loadVmwareConnections()
+    } else if (addConnType === 'xcpng') {
+      loadXcpngConnections()
+    } else if (addConnType === 'nutanix') {
+      loadNutanixConnections()
+    } else if (addConnType === 'hyperv') {
+      loadHypervConnections()
+    }
+
+    // En mode onboarding, rediriger vers la page d'accueil après création
+    if (isOnboarding && !editingConn?.id) {
+      // Supprimer le cookie app_status pour forcer un refresh
+      document.cookie = 'app_status=; path=/; max-age=0'
+      router.push('/home')
+    }
+  }
+
+  const createConnection = async () => {
+    const payload = {
+      name: addConn.name.trim(),
+      type: addConnType,
+      baseUrl: addConn.baseUrl.trim(),
+      behindProxy: !!addConn.behindProxy,
+      insecureTLS: !!addConn.insecureTLS,
+      apiToken: addConn.apiToken.trim()
+    }
+
+    await fetchJson('/api/v1/connections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+
+    setAddConnOpen(false)
+    setAddConn({ name: '', baseUrl: '', behindProxy: false, insecureTLS: true, apiToken: '' })
+
+    if (addConnType === 'pve') {
+      await loadPveConnections()
+    } else {
+      await loadPbsConnections()
+    }
+  }
+
+  // Connection delete confirmation. Native window.confirm() was leaking
+  // through here — see feedback_modals_mui rule. State holds the pending
+  // deletion target until the user clicks Delete or Cancel in the MUI
+  // dialog rendered below.
+  const [deleteConnectionDialog, setDeleteConnectionDialog] = useState(null)
+  const [deletingConnection, setDeletingConnection] = useState(false)
+
+  const deleteConnection = (id, type) => {
+    const typeName = type === 'pbs' ? 'PBS' : type === 'vmware' ? 'VMware ESXi' : type === 'xcpng' ? 'XCP-ng' : type === 'nutanix' ? 'Nutanix' : type === 'hyperv' ? 'Hyper-V' : 'PVE'
+    setDeleteConnectionDialog({ id, type, typeName })
+  }
+
+  const confirmDeleteConnection = async () => {
+    if (!deleteConnectionDialog) return
+    const { id, type } = deleteConnectionDialog
+    setDeletingConnection(true)
+    try {
+      await fetchJson(`/api/v1/connections/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
+      if (type === 'pve') {
+        await loadPveConnections()
+      } else if (type === 'pbs') {
+        await loadPbsConnections()
+      } else if (type === 'vmware') {
+        await loadVmwareConnections()
+      } else if (type === 'xcpng') {
+        await loadXcpngConnections()
+      } else if (type === 'nutanix') {
+        await loadNutanixConnections()
+      } else if (type === 'hyperv') {
+        await loadHypervConnections()
+      }
+      setDeleteConnectionDialog(null)
+    } finally {
+      setDeletingConnection(false)
+    }
+  }
+
+  // Shared "Tenant / vDC" column definition factory
+  const makeTenantVdcColumn = (tenantMap, vdcMap) => ({
+    field: 'tenantVdc',
+    headerName: t('settings.connTenantVdcHeader'),
+    width: 200,
+    sortable: false,
+    renderCell: params => {
+      const row = params.row
+      const tid = row.tenantId
+      const isMspOwned = tid && tid !== 'default'
+
+      if (isMspOwned) {
+        const name = tenantMap[tid] || tid
+        return (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%', flexWrap: 'wrap' }}>
+            <Chip size='small' label={t('settings.connectionOwnedBy', { name })} color='secondary' variant='outlined' sx={{ fontSize: '0.7rem', height: 20 }} />
+          </Box>
+        )
+      }
+
+      const vdcs = vdcMap[row.id]
+      if (vdcs && vdcs.length > 0) {
+        return (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%', flexWrap: 'wrap' }}>
+            {vdcs.map((v, i) => {
+              const tName = tenantMap[v.tenantId] || v.tenantId
+              return (
+                <Chip
+                  key={i}
+                  size='small'
+                  label={`${tName} / ${v.vdcName}`}
+                  color='info'
+                  variant='outlined'
+                  sx={{ fontSize: '0.7rem', height: 20 }}
+                />
+              )
+            })}
+          </Box>
+        )
+      }
+
+      return (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <Typography variant='caption' sx={{ opacity: 0.4 }}>{t('settings.connPoolLabel')}</Typography>
+        </Box>
+      )
+    }
+  })
+
+  // Diagnostic column (shared across all 6 grids)
+  const makeDiagnosticColumn = () => ({
+    field: 'diagnostic',
+    headerName: '',
+    width: 46,
+    sortable: false,
+    renderCell: params => (
+      <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+        <Tooltip
+          title={t('settings.diagnostics.runDiagnostics')}
+          slotProps={{
+            tooltip: {
+              sx: {
+                bgcolor: 'background.paper',
+                color: 'text.primary',
+                border: '1px solid',
+                borderColor: 'divider',
+                borderRadius: 1,
+                boxShadow: 3,
+              }
+            }
+          }}
+        >
+          <IconButton
+            size='small'
+            onClick={(e) => { e.stopPropagation(); openDiagnostic(params.row.id, params.row.name) }}
+            sx={{ width: 28, height: 28 }}
+          >
+            <i className='ri-heart-pulse-line' style={{ fontSize: 16 }} />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    )
+  })
+
+  // "Check connection" column (PVE grid only): read-only probes with a fix per failure
+  const makeCheckColumn = () => ({
+    field: 'check',
+    headerName: '',
+    width: 46,
+    sortable: false,
+    renderCell: params => (
+      <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+        <Tooltip
+          title={t('settings.connectionCheck.button')}
+          slotProps={{
+            tooltip: {
+              sx: {
+                bgcolor: 'background.paper',
+                color: 'text.primary',
+                border: '1px solid',
+                borderColor: 'divider',
+                borderRadius: 1,
+                boxShadow: 3,
+              }
+            }
+          }}
+        >
+          <IconButton
+            size='small'
+            onClick={(e) => { e.stopPropagation(); setCheckConn({ id: params.row.id, name: params.row.name }) }}
+            sx={{ width: 28, height: 28 }}
+          >
+            <i className='ri-shield-check-line' style={{ fontSize: 16 }} />
+          </IconButton>
+        </Tooltip>
+      </Box>
+    )
+  })
+
+  // PVE Columns
+  const pveColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt='' width={18} height={18} style={{ opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: t('settings.urlApi'),
+        flex: 1.2,
+        minWidth: 240,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} onNodesLoaded={loadPveConnections} />
+        )
+      },
+      {
+        field: 'version',
+        headerName: t('common.version'),
+        width: 120,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <ConnectionVersion connection={params.row} />
+          </Box>
+        )
+      },
+      {
+        field: 'clusterType',
+        headerName: t('common.type'),
+        width: 120,
+        sortable: false,
+        valueGetter: (value, row) => {
+          const hosts = row.hosts
+          return hosts && hosts.length > 1 ? 'cluster' : 'standalone'
+        },
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            {params.value === 'cluster' ? (
+              <Chip size='small' label='Cluster' color='primary' variant='outlined' icon={<i className='ri-server-line' style={{ fontSize: 14 }} />} />
+            ) : (
+              <Chip size='small' label='Standalone' variant='outlined' icon={<i className='ri-computer-line' style={{ fontSize: 14 }} />} />
+            )}
+          </Box>
+        )
+      },
+      {
+        field: 'hosts',
+        headerName: t('settings.nodesHeader'),
+        width: 200,
+        sortable: false,
+        renderCell: params => {
+          const hosts = params.value
+          if (!hosts || hosts.length === 0) {
+            return (
+              <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+                <Typography variant='caption' sx={{ opacity: 0.4 }}>--</Typography>
+              </Box>
+            )
+          }
+          const firstHost = hosts[0]
+          const extraCount = hosts.length - 1
+          // Full node list shown on hover so the row stays a single line even
+          // for large clusters. One node per line: name, IP, and disabled flag.
+          const nodeList = hosts
+            .map(h => `${h.node}${h.ip ? ` - ${h.ip}` : ''}${h.enabled ? '' : ` (${t('common.disabled')})`}`)
+            .join('\n')
+          return (
+            <Tooltip
+              title={<span style={{ whiteSpace: 'pre-line' }}>{nodeList}</span>}
+              arrow
+              slotProps={{
+                tooltip: { sx: { bgcolor: 'background.paper', color: 'text.primary', border: '1px solid', borderColor: 'divider', boxShadow: 3, maxWidth: 360 } },
+                arrow: { sx: { color: 'background.paper', '&::before': { border: '1px solid', borderColor: 'divider' } } },
+              }}
+            >
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%', minWidth: 0 }}>
+                <Chip
+                  size='small'
+                  label={firstHost.node}
+                  icon={<i className='ri-server-line' style={{ fontSize: 14 }} />}
+                  variant='outlined'
+                  color={firstHost.enabled ? 'default' : 'warning'}
+                  sx={{ fontSize: '0.75rem', maxWidth: 130, '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' } }}
+                />
+                {extraCount > 0 && (
+                  <Chip size='small' label={`+${extraCount}`} variant='outlined' sx={{ fontSize: '0.75rem' }} />
+                )}
+              </Box>
+            </Tooltip>
+          )
+        }
+      },
+      {
+        field: 'hasCeph',
+        headerName: t('settings.cephHeader'),
+        width: 110,
+        renderCell: params => {
+          const isDetecting = detectingCephId === params.row.id
+          return (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+              {params.value ? (
+                <Chip size='small' label={t('common.yes')} color='info' variant='outlined' />
+              ) : (
+                <Typography variant='caption' sx={{ opacity: 0.4 }}>{t('common.no')}</Typography>
+              )}
+              {params.row.type === 'pve' && (
+                <Tooltip title={t('settings.detectCeph')}>
+                  <span>
+                    <IconButton
+                      aria-label={t('settings.detectCeph')}
+                      size='small'
+                      disabled={isDetecting}
+                      onClick={(e) => { e.stopPropagation(); handleDetectCeph(params.row.id) }}
+                      sx={{ width: 24, height: 24 }}
+                    >
+                      <i className={isDetecting ? 'ri-loader-4-line' : 'ri-refresh-line'} style={{ fontSize: 14, animation: isDetecting ? 'spin 1s linear infinite' : 'none' }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
+            </Box>
+          )
+        }
+      },
+      {
+        field: 'sshEnabled',
+        headerName: t('settings.sshHeader'),
+        width: 80,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            {params.value ? (
+              <Chip size='small' label={t('common.yes')} color='success' variant='outlined' icon={<i className='ri-terminal-line' style={{ fontSize: 14 }} />} />
+            ) : (
+              <Typography variant='caption' sx={{ opacity: 0.4 }}>{t('common.no')}</Typography>
+            )}
+          </Box>
+        )
+      },
+      {
+        field: 'bridgeType',
+        headerName: t('network.bridgeType'),
+        width: 140,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <BridgeTypes connection={params.row} />
+          </Box>
+        )
+      },
+      {
+        field: 'locationLabel',
+        headerName: t('settings.location'),
+        width: 180,
+        renderCell: params => {
+          const country = params.row.country
+          const country3 = findCountry(country)?.code
+          if (!params.value && !country3) {
+            return (
+              <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+                <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+              </Box>
+            )
+          }
+          return (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, height: '100%', overflow: 'hidden' }}>
+              {country3 && <CountryFlag code={country3} size={18} />}
+              {params.value ? (
+                <>
+                  <i className='ri-map-pin-2-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                  <Typography variant='body2' noWrap>{params.value}</Typography>
+                </>
+              ) : country3 ? (
+                <Typography variant='body2' sx={{ opacity: 0.7 }}>{country3}</Typography>
+              ) : null}
+            </Box>
+          )
+        },
+      },
+      makeDiagnosticColumn(),
+      makeCheckColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'pve')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, loadPveConnections, theme, tenantNameMap, vdcsByConnection]
+  )
+
+  // PBS Columns
+  const pbsColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt='' width={18} height={18} style={{ opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: t('settings.urlApi'),
+        flex: 1.2,
+        minWidth: 240,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} />
+        )
+      },
+      {
+        field: 'version',
+        headerName: t('common.version'),
+        width: 120,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <ConnectionVersion connection={{ ...params.row, type: 'pbs' }} />
+          </Box>
+        )
+      },
+      {
+        field: 'locationLabel',
+        headerName: t('settings.location'),
+        width: 180,
+        renderCell: params => {
+          const country = params.row.country
+          const country3 = findCountry(country)?.code
+          if (!params.value && !country3) {
+            return (
+              <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+                <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+              </Box>
+            )
+          }
+          return (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, height: '100%', overflow: 'hidden' }}>
+              {country3 && <CountryFlag code={country3} size={18} />}
+              {params.value ? (
+                <>
+                  <i className='ri-map-pin-2-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                  <Typography variant='body2' noWrap>{params.value}</Typography>
+                </>
+              ) : country3 ? (
+                <Typography variant='body2' sx={{ opacity: 0.7 }}>{country3}</Typography>
+              ) : null}
+            </Box>
+          )
+        },
+      },
+      makeDiagnosticColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'pbs')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, theme, tenantNameMap, vdcsByConnection]
+  )
+
+  // VMware columns
+  const vmwareColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <img src='/images/esxi-logo.svg' alt='' width={18} height={18} style={{ opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: t('settings.esxiHost'),
+        flex: 1.2,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} />
+        )
+      },
+      {
+        field: 'sshEnabled',
+        headerName: t('settings.sshHeader'),
+        width: 80,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            {params.value ? (
+              <Chip size='small' label={t('common.yes')} color='success' variant='outlined' icon={<i className='ri-terminal-line' style={{ fontSize: 14 }} />} />
+            ) : (
+              <Typography variant='caption' sx={{ opacity: 0.4 }}>{t('common.no')}</Typography>
+            )}
+          </Box>
+        )
+      },
+      makeDiagnosticColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'vmware')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, tenantNameMap, vdcsByConnection]
+  )
+
+  // XCP-ng columns
+  const xcpngColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <img src='/images/xcpng-logo.svg' alt='' width={18} height={18} style={{ opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: t('settings.xcpngHost'),
+        flex: 1.2,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'subType',
+        headerName: t('settings.xcpngModeColumn'),
+        width: 230,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Chip
+              size='small'
+              variant='outlined'
+              color={params.value === 'xapi' ? 'primary' : 'default'}
+              label={params.value === 'xapi' ? 'XAPI' : 'XO'}
+            />
+            <Chip size='small' variant='outlined' label={t('settings.migrationBadgeOffline')} />
+            {params.value === 'xapi' && (
+              <Chip size='small' variant='outlined' color='success' label={t('settings.migrationBadgeWarm')} />
+            )}
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} />
+        )
+      },
+      {
+        field: 'locationLabel',
+        headerName: t('settings.location'),
+        width: 180,
+        renderCell: params => {
+          const country = params.row.country
+          const country3 = findCountry(country)?.code
+          if (!params.value && !country3) {
+            return (
+              <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+                <Typography variant='caption' sx={{ opacity: 0.3 }}>—</Typography>
+              </Box>
+            )
+          }
+          return (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, height: '100%', overflow: 'hidden' }}>
+              {country3 && <CountryFlag code={country3} size={18} />}
+              {params.value ? (
+                <>
+                  <i className='ri-map-pin-2-line' style={{ fontSize: 14, opacity: 0.6 }} />
+                  <Typography variant='body2' noWrap>{params.value}</Typography>
+                </>
+              ) : country3 ? (
+                <Typography variant='body2' sx={{ opacity: 0.7 }}>{country3}</Typography>
+              ) : null}
+            </Box>
+          )
+        },
+      },
+      makeDiagnosticColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'xcpng')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, tenantNameMap, vdcsByConnection]
+  )
+
+  // Nutanix columns
+  const nutanixColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <img src='/images/nutanix-logo.svg' alt='' width={18} height={18} style={{ opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: 'Prism Central',
+        flex: 1.2,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} />
+        )
+      },
+      makeDiagnosticColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'nutanix')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, tenantNameMap, vdcsByConnection]
+  )
+
+  // Hyper-V columns
+  const hypervColumns = useMemo(
+    () => [
+      {
+        field: 'name',
+        headerName: t('common.name'),
+        flex: 1,
+        minWidth: 180,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, height: '100%' }}>
+            <i className='ri-microsoft-line' style={{ fontSize: 18, color: '#0078d4', opacity: 0.8 }} />
+            <Typography variant='body2' sx={{ fontWeight: 600 }}>{params.value}</Typography>
+          </Box>
+        )
+      },
+      makeTenantVdcColumn(tenantNameMap, vdcsByConnection),
+      {
+        field: 'baseUrl',
+        headerName: 'Hyper-V Host',
+        flex: 1.2,
+        minWidth: 200,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Typography variant='body2' sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem', opacity: 0.8 }}>
+              {params.value}
+            </Typography>
+          </Box>
+        )
+      },
+      {
+        field: 'status',
+        headerName: t('common.status'),
+        width: 160,
+        renderCell: params => (
+          <ConnectionStatus connection={params.row} autoTest={true} />
+        )
+      },
+      makeDiagnosticColumn(),
+      {
+        field: 'actions',
+        headerName: '',
+        width: 100,
+        sortable: false,
+        renderCell: params => (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, height: '100%' }}>
+            <Tooltip title={t('common.edit')}>
+              <IconButton size='small' onClick={() => openEditDialog(params.row)}>
+                <i className='ri-pencil-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={t('common.delete')}>
+              <IconButton size='small' color='error' onClick={() => deleteConnection(params.row.id, 'hyperv')}>
+                <i className='ri-delete-bin-6-line' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )
+      }
+    ],
+    [t, tenantNameMap, vdcsByConnection]
+  )
+
+  return (
+    <>
+      {/* Sub-tabs PVE / PBS / VMware */}
+      <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <Tabs
+          value={connTab}
+          onChange={(_, v) => setConnTab(v)}
+          variant="scrollable"
+          scrollButtons="auto"
+          allowScrollButtonsMobile
+          sx={{ '& .MuiTab-root': { minHeight: 48 } }}
+        >
+          <Tab
+            label={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt='' width={18} height={18} />
+                <span>{t('settings.proxmoxVe')}</span>
+                <Chip size='small' label={pveConnections.length} color='primary' sx={{ height: 18, fontSize: 10, ml: 0.5 }} />
+              </Box>
+            }
+          />
+          <Tab
+            label={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt='' width={18} height={18} />
+                <span>{t('settings.proxmoxBackupServer')}</span>
+                <Chip size='small' label={pbsConnections.length} color='secondary' sx={{ height: 18, fontSize: 10, ml: 0.5 }} />
+              </Box>
+            }
+          />
+          <Tab
+            disabled={!migrationAvailable}
+            label={
+              <Tooltip title={!migrationAvailable ? 'Enterprise' : ''} placement='top'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: migrationAvailable ? 1 : 0.4 }}>
+                  <img src='/images/esxi-logo.svg' alt='' width={18} height={18} />
+                  <span>VMware ESXi</span>
+                  {migrationAvailable ? (
+                    <Chip size='small' label={vmwareConnections.length} sx={{ height: 18, fontSize: 10, ml: 0.5, bgcolor: '#638C1C', color: '#fff' }} />
+                  ) : (
+                    <i className='ri-lock-line' style={{ fontSize: 14, opacity: 0.5 }} />
+                  )}
+                </Box>
+              </Tooltip>
+            }
+          />
+          <Tab
+            disabled={!migrationAvailable}
+            label={
+              <Tooltip title={!migrationAvailable ? 'Enterprise' : ''} placement='top'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: migrationAvailable ? 1 : 0.4 }}>
+                  <img src='/images/xcpng-logo.svg' alt='' width={18} height={18} />
+                  <span>XCP-ng</span>
+                  {migrationAvailable ? (
+                    <Chip size='small' label={xcpngConnections.length} sx={{ height: 18, fontSize: 10, ml: 0.5, bgcolor: '#00ADB5', color: '#fff' }} />
+                  ) : (
+                    <i className='ri-lock-line' style={{ fontSize: 14, opacity: 0.5 }} />
+                  )}
+                </Box>
+              </Tooltip>
+            }
+          />
+          <Tab
+            disabled={!migrationAvailable}
+            label={
+              <Tooltip title={!migrationAvailable ? 'Enterprise' : ''} placement='top'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: migrationAvailable ? 1 : 0.4 }}>
+                  <img src='/images/nutanix-logo.svg' alt='' width={18} height={18} />
+                  <span>Nutanix</span>
+                  {migrationAvailable ? (
+                    <Chip size='small' label={nutanixConnections.length} sx={{ height: 18, fontSize: 10, ml: 0.5, bgcolor: '#24B47E', color: '#fff' }} />
+                  ) : (
+                    <i className='ri-lock-line' style={{ fontSize: 14, opacity: 0.5 }} />
+                  )}
+                </Box>
+              </Tooltip>
+            }
+          />
+          <Tab
+            disabled={!migrationAvailable}
+            label={
+              <Tooltip title={!migrationAvailable ? 'Enterprise' : ''} placement='top'>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, opacity: migrationAvailable ? 1 : 0.4 }}>
+                  <img src='/images/hyperv-logo.svg' alt='' width={18} height={18} />
+                  <span>Hyper-V</span>
+                  {migrationAvailable ? (
+                    <Chip size='small' label={hypervConnections.length} sx={{ height: 18, fontSize: 10, ml: 0.5, bgcolor: '#0078d4', color: '#fff' }} />
+                  ) : (
+                    <i className='ri-lock-line' style={{ fontSize: 14, opacity: 0.5 }} />
+                  )}
+                </Box>
+              </Tooltip>
+            }
+          />
+        </Tabs>
+      </Box>
+
+      {/* PVE Tab */}
+      <SubTabPanel value={connTab} index={0}>
+        {pveError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {pveError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {t('settings.pveServers')}
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadPveConnections} disabled={pveLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' onClick={() => openAddDialog('pve')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} PVE
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!pveLoading && pveConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-server-line"
+              title={t('emptyState.noConnections')}
+              description={t('emptyState.noConnectionsDesc')}
+              action={{ label: `${t('common.add')} PVE`, onClick: () => openAddDialog('pve'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={pveConnections}
+              columns={pveColumns}
+              loading={pveLoading}
+              getRowId={r => r.id}
+              getRowHeight={() => 'auto'}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{
+                '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' },
+                '& .MuiDataGrid-cell': { py: 1 },
+              }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* PBS Tab */}
+      <SubTabPanel value={connTab} index={1}>
+        {pbsError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {pbsError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {t('settings.pbsServers')}
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadPbsConnections} disabled={pbsLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' color='secondary' onClick={() => openAddDialog('pbs')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} PBS
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!pbsLoading && pbsConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-hard-drive-2-line"
+              title={t('emptyState.noConnections')}
+              description={t('emptyState.noConnectionsDesc')}
+              action={{ label: `${t('common.add')} PBS`, onClick: () => openAddDialog('pbs'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={pbsConnections}
+              columns={pbsColumns}
+              loading={pbsLoading}
+              getRowId={r => r.id}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{ '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' } }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* VMware ESXi Tab */}
+      <SubTabPanel value={connTab} index={2}>
+        {vmwareError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {vmwareError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {t('settings.vmwareServers')}
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadVmwareConnections} disabled={vmwareLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' sx={{ bgcolor: '#638C1C', '&:hover': { bgcolor: '#4a6915' } }} onClick={() => openAddDialog('vmware')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} ESXi
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!vmwareLoading && vmwareConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-cloud-line"
+              title={t('settings.noVmwareConnections')}
+              description={t('settings.noVmwareConnectionsDesc')}
+              action={{ label: `${t('common.add')} ESXi`, onClick: () => openAddDialog('vmware'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={vmwareConnections}
+              columns={vmwareColumns}
+              loading={vmwareLoading}
+              getRowId={r => r.id}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{ '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' } }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* XCP-ng Tab */}
+      <SubTabPanel value={connTab} index={3}>
+        {xcpngError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {xcpngError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            {t('settings.xcpngServers')}
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadXcpngConnections} disabled={xcpngLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' sx={{ bgcolor: '#00ADB5', '&:hover': { bgcolor: '#008B92' } }} onClick={() => openAddDialog('xcpng')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} XCP-ng
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!xcpngLoading && xcpngConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-server-line"
+              title={t('settings.noXcpngConnections')}
+              description={t('settings.noXcpngConnectionsDesc')}
+              action={{ label: `${t('common.add')} XCP-ng`, onClick: () => openAddDialog('xcpng'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={xcpngConnections}
+              columns={xcpngColumns}
+              loading={xcpngLoading}
+              getRowId={r => r.id}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{ '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' } }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* Nutanix Tab */}
+      <SubTabPanel value={connTab} index={4}>
+        {nutanixError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {nutanixError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            Nutanix Prism Central Connections
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadNutanixConnections} disabled={nutanixLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' sx={{ bgcolor: '#24B47E', '&:hover': { bgcolor: '#1a8f63' } }} onClick={() => openAddDialog('nutanix')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} Nutanix
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!nutanixLoading && nutanixConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-database-2-line"
+              title="No Nutanix connections"
+              description="Add a Nutanix Prism Central connection to migrate VMs to Proxmox VE."
+              action={{ label: `${t('common.add')} Nutanix`, onClick: () => openAddDialog('nutanix'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={nutanixConnections}
+              columns={nutanixColumns}
+              loading={nutanixLoading}
+              getRowId={r => r.id}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{ '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' } }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* Hyper-V Tab */}
+      <SubTabPanel value={connTab} index={5}>
+        {hypervError && <Alert severity='error' sx={{ mb: 2 }}>{t('common.error')}: {hypervError}</Alert>}
+
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+          <Typography variant='body2' sx={{ opacity: 0.7 }}>
+            Hyper-V Servers
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button variant='outlined' size='small' onClick={loadHypervConnections} disabled={hypervLoading} startIcon={<i className='ri-refresh-line' />}>
+              {t('common.refresh')}
+            </Button>
+            <Button variant='contained' size='small' sx={{ bgcolor: '#0078d4', '&:hover': { bgcolor: '#005a9e' } }} onClick={() => openAddDialog('hyperv')} startIcon={<i className='ri-add-line' />}>
+              {t('common.add')} Hyper-V
+            </Button>
+          </Box>
+        </Box>
+
+        <Box sx={{ height: 'calc(100vh - 380px)', minHeight: 300 }}>
+          {!hypervLoading && hypervConnections.length === 0 ? (
+            <EmptyState
+              icon="ri-microsoft-line"
+              title="No Hyper-V connections"
+              description="Add a Hyper-V server to start migrating VMs to Proxmox."
+              action={{ label: `${t('common.add')} Hyper-V`, onClick: () => openAddDialog('hyperv'), icon: 'ri-add-line' }}
+              size="large"
+            />
+          ) : (
+            <DataGrid
+              rows={hypervConnections}
+              columns={hypervColumns}
+              loading={hypervLoading}
+              getRowId={r => r.id}
+              pageSizeOptions={[10, 25, 50]}
+              initialState={{ pagination: { paginationModel: { pageSize: 10, page: 0 } } }}
+              disableRowSelectionOnClick
+              sx={{ '& .MuiDataGrid-row:hover': { backgroundColor: 'action.hover' } }}
+            />
+          )}
+        </Box>
+      </SubTabPanel>
+
+      {/* Dialog Ajouter/Modifier Connexion */}
+      <ConnectionDialog
+        open={addConnOpen}
+        onClose={() => {
+          setAddConnOpen(false)
+          setEditingConn(null)
+        }}
+        onSave={handleSaveConnection}
+        type={addConnType}
+        initialData={editingConn}
+        mode={editingConn ? 'edit' : 'create'}
+        // The Migrations tab only matters once a source hypervisor is set up.
+        migrationSourcesConfigured={migrationSourcesConfigured}
+      />
+
+      {/* Diagnostic modal */}
+      <DiagnosticModal
+        open={diagOpen}
+        connectionId={diagConnectionId}
+        connectionName={diagConnectionName}
+        onClose={() => setDiagOpen(false)}
+      />
+
+      {/* Check connection dialog */}
+      <ConnectionCheckDialog
+        open={!!checkConn}
+        connectionId={checkConn?.id ?? null}
+        connectionName={checkConn?.name ?? ''}
+        onClose={() => setCheckConn(null)}
+      />
+
+      {/* Dialog confirmation suppression connexion — remplace l'ancien
+          window.confirm. Le titre i18n existant t('settings.deleteConnectionConfirm')
+          est interpolé avec le typeName (PVE / PBS / VMware / …). */}
+      <Dialog
+        open={!!deleteConnectionDialog}
+        onClose={() => !deletingConnection && setDeleteConnectionDialog(null)}
+        maxWidth='xs'
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'error.main' }}>
+          <i className='ri-delete-bin-line' style={{ fontSize: 20 }} />
+          {t('settings.deleteConnectionConfirm', { type: deleteConnectionDialog?.typeName || '' })}
+        </DialogTitle>
+        <DialogContent>
+          <Alert severity='warning' sx={{ mt: 1 }}>
+            {t('common.deleteConfirmation')}
+          </Alert>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteConnectionDialog(null)} disabled={deletingConnection}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant='contained'
+            color='error'
+            onClick={confirmDeleteConnection}
+            disabled={deletingConnection}
+          >
+            {deletingConnection ? t('common.loading') : t('common.delete')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </>
+  )
+}
+
+/* ==================== AITab Component ==================== */
+
+// One "Artificial Intelligence" tab, two sub-tabs: the model the assistant
+// runs on, and the actions it may propose (#188). The actions keep their own
+// feature id, so the sub-tab only shows when that capability is licensed.
+const AI_SUB_TABS = ['model', 'actions']
+
+function AITab() {
+  const t = useTranslations()
+  const searchParams = useSearchParams()
+  const router = useRouter()
+  const { hasFeature } = useLicense()
+  const actionsAvailable = hasFeature(Features.AI_ACTIONS)
+  const requested = AI_SUB_TABS.indexOf(searchParams.get('sub') || '')
+  const subTab = requested === 1 && !actionsAvailable ? 0 : Math.max(0, requested)
+
+  const changeSubTab = (_, index) => {
+    const params = new URLSearchParams(searchParams.toString())
+
+    params.set('sub', AI_SUB_TABS[index])
+    router.replace(`?${params.toString()}`, { scroll: false })
+  }
+
+  return (
+    <>
+      <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <Tabs value={subTab} onChange={changeSubTab} sx={{ '& .MuiTab-root': { minHeight: 48 } }}>
+          <Tab
+            label={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <i className='ri-cpu-line' style={{ fontSize: 18 }} />
+                <span>{t('settings.aiModelSubTab')}</span>
+              </Box>
+            }
+          />
+          {actionsAvailable && (
+            <Tab
+              label={
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <i className='ri-flashlight-line' style={{ fontSize: 18 }} />
+                  <span>{t('settings.aiActions.subTabLabel')}</span>
+                </Box>
+              }
+            />
+          )}
+        </Tabs>
+      </Box>
+
+      <SubTabPanel value={subTab} index={0}>
+        <AIModelSettings />
+      </SubTabPanel>
+      {actionsAvailable && (
+        <SubTabPanel value={subTab} index={1}>
+          <AIActionsTab />
+        </SubTabPanel>
+      )}
+    </>
+  )
+}
+
+function AIModelSettings() {
+  const t = useTranslations()
+
+  const {
+    settings,
+    setSettings,
+    testing,
+    testResult,
+    setTestResult,
+    saving,
+    availableModels,
+    modelToolCalling,
+    loadingModels,
+    saveSettings: hookSaveSettings,
+    testConnection: hookTestConnection,
+    loadModels,
+  } = useAISettings()
+
+  const saveSettings = async () => {
+    const result = await hookSaveSettings()
+
+    if (result.success) {
+      setTestResult({ type: 'success', message: t('settings.saved') })
+    } else {
+      setTestResult({ type: 'error', message: result.error || t('common.error') })
+    }
+  }
+
+  // #459: what the probe measured on the Ollama server, one line per finding.
+  const preflightLines = preflight => {
+    if (!preflight) return []
+
+    const lines = []
+    const gpu = preflight.gpuShare === null ? null : Math.round(preflight.gpuShare * 100)
+    const speed = preflight.tokensPerSecond
+
+    if (gpu !== null && speed !== null) lines.push(t('settings.preflightMeasured', { gpu, speed }))
+    if (preflight.issues.includes('cpu-offload')) lines.push(t('settings.preflightCpuOffload', { gpu }))
+    if (preflight.issues.includes('slow')) lines.push(t('settings.preflightSlow', { speed }))
+    if (preflight.issues.includes('not-qualified')) lines.push(t('settings.preflightNotQualified'))
+
+    if (preflight.issues.length > 0) {
+      lines.push(preflight.fits.length > 0
+        ? t('settings.preflightFits', { models: preflight.fits.join(', ') })
+        : t('settings.preflightNoneFits'))
+    }
+
+    return lines
+  }
+
+  const testConnection = async () => {
+    const result = await hookTestConnection()
+
+    if (result.success) {
+      const message = `${t('settings.connectionOk')} "${result.response?.substring(0, 100)}..."`
+      const details = preflightLines(result.preflight)
+
+      // #459: connected, but the model cannot call tools, so the assistant will
+      // only see the live snapshot. Worth a warning, not an error: it still works.
+      if (result.toolCalling === false) {
+        setTestResult({ type: 'warning', message: `${message} ${t('settings.testNoToolCalling')}`, details })
+      } else {
+        setTestResult({ type: result.preflight?.issues.length > 0 ? 'warning' : 'success', message, details })
+      }
+    } else if (result.code === 'probe-timeout') {
+      setTestResult({ type: 'warning', message: t('settings.preflightTimeout') })
+    } else {
+      setTestResult({ type: 'error', message: result.error || t('settings.connectionError') })
+    }
+  }
+
+  return (
+    <Box>
+      <Typography variant='body2' sx={{ opacity: 0.7, mb: 3 }}>
+        {t('settings.aiConfigDescription')}
+      </Typography>
+
+      {/* Enable/Disable */}
+      <Card variant='outlined' sx={{ mb: 3 }}>
+        <CardContent>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={settings.enabled}
+                onChange={e => setSettings(s => ({ ...s, enabled: e.target.checked }))}
+              />
+            }
+            label={
+              <Box>
+                <Typography fontWeight={600}>{t('settings.enableAiAssistant')}</Typography>
+                <Typography variant='caption' sx={{ opacity: 0.7 }}>
+                  {t('settings.enableAiAssistantDesc')}
+                </Typography>
+              </Box>
+            }
+          />
+        </CardContent>
+      </Card>
+
+      {/* Data Disclosure Notice */}
+      {settings.enabled && (
+        <Alert
+          severity={settings.provider === 'ollama' ? 'success' : 'warning'}
+          icon={<i className={settings.provider === 'ollama' ? 'ri-shield-check-line' : 'ri-error-warning-line'} />}
+          sx={{ mb: 3 }}
+        >
+          <Typography variant='subtitle2' fontWeight={700} sx={{ mb: 0.5 }}>
+            {t('settings.aiDataDisclosureTitle')}
+          </Typography>
+          {settings.provider === 'ollama' ? (
+            <Typography variant='body2'>
+              {t('settings.aiDataDisclosureLocal')}
+            </Typography>
+          ) : (
+            <>
+              <Typography variant='body2' sx={{ mb: 1 }}>
+                {t('settings.aiDataDisclosureCloud')}
+              </Typography>
+              <Box component='ul' sx={{ m: 0, pl: 2 }}>
+                {t('settings.aiDataDisclosureItems').split(';').map((item, i) => (
+                  <li key={i}><Typography variant='body2'>{item}</Typography></li>
+                ))}
+              </Box>
+              <Typography variant='body2' sx={{ mt: 1, fontStyle: 'italic' }}>
+                {t('settings.aiDataDisclosureRecommendation')}
+              </Typography>
+            </>
+          )}
+        </Alert>
+      )}
+
+      {/* Provider Selection */}
+      {settings.enabled && (
+        <>
+          <Card variant='outlined' sx={{ mb: 3 }}>
+            <CardContent>
+              <Typography variant='subtitle1' fontWeight={700} sx={{ mb: 2 }}>
+                <i className='ri-brain-line' style={{ marginRight: 8 }} />
+                {t('settings.llmProvider')}
+              </Typography>
+
+              <FormControl fullWidth sx={{ mb: 3 }}>
+                <InputLabel>{t('settings.providerLabel')}</InputLabel>
+                <Select
+                  value={settings.provider}
+                  label={t('settings.providerLabel')}
+                  onChange={e => setSettings(s => ({ ...s, provider: e.target.value }))}
+                >
+                  <MenuItem value='ollama'>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className='ri-server-line' />
+                      {t('settings.ollamaLocalOption')}
+                    </Box>
+                  </MenuItem>
+                  <MenuItem value='openai'>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className='ri-openai-fill' />
+                      {t('settings.openaiCloudOption')}
+                    </Box>
+                  </MenuItem>
+                  <MenuItem value='anthropic'>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <i className='simple-icons-anthropic' />
+                      {t('settings.anthropicCloudOption')}
+                    </Box>
+                  </MenuItem>
+                </Select>
+              </FormControl>
+
+              {/* Ollama Settings */}
+              {settings.provider === 'ollama' && (
+                <Box>
+                  <Alert severity='info' sx={{ mb: 2 }}>
+                    <Typography variant='body2'>
+                      {t.rich('settings.ollamaInfo', { b: chunks => <b>{chunks}</b> })}
+                    </Typography>
+                  </Alert>
+
+                  <TextField
+                    fullWidth
+                    label={t('settings.ollamaUrlLabel')}
+                    value={settings.ollamaUrl}
+                    onChange={e => setSettings(s => ({ ...s, ollamaUrl: e.target.value }))}
+                    placeholder='http://localhost:11434'
+                    sx={{ mb: 2 }}
+                    InputProps={{
+                      startAdornment: (
+                        <InputAdornment position='start'>
+                          <i className='ri-link' style={{ opacity: 0.5 }} />
+                        </InputAdornment>
+                      )
+                    }}
+                  />
+
+                  <FormControl fullWidth sx={{ mb: 2 }}>
+                    <InputLabel>{t('settings.modelLabel')}</InputLabel>
+                    <Select
+                      value={settings.ollamaModel}
+                      label={t('settings.modelLabel')}
+                      onChange={e => setSettings(s => ({ ...s, ollamaModel: e.target.value }))}
+                    >
+                      {availableModels.length > 0
+                        ? availableModels.map(m => (
+                          <MenuItem key={m} value={m}>
+                            <LlmModelLabel model={m}>
+                              {m}
+                              {isQualifiedOllamaModel(m) ? ` (${t('settings.recommended')})` : ''}
+                              {modelToolCalling[m] === false ? ` (${t('settings.modelNoToolCalling')})` : ''}
+                            </LlmModelLabel>
+                          </MenuItem>
+                        ))
+                        : QUALIFIED_OLLAMA_MODELS.map(q => (
+                          <MenuItem key={q.model} value={q.model}>
+                            <LlmModelLabel model={q.model}>{q.model} ({t('settings.recommended')})</LlmModelLabel>
+                          </MenuItem>
+                        ))}
+                    </Select>
+                    <FormHelperText>{t('settings.ollamaToolModelHelp')}</FormHelperText>
+                  </FormControl>
+
+                  {loadingModels && <LinearProgress sx={{ mb: 2 }} />}
+
+                  <Button
+                    size='small'
+                    onClick={loadModels}
+                    disabled={loadingModels}
+                    startIcon={<i className='ri-refresh-line' />}
+                  >
+                    {t('settings.refreshModels')}
+                  </Button>
+                </Box>
+              )}
+
+              {/* OpenAI Settings */}
+              {settings.provider === 'openai' && (
+                <Box>
+                  <Alert severity='warning' sx={{ mb: 2 }}>
+                    <Typography variant='body2'>
+                      {t('settings.openAiWarning')}
+                    </Typography>
+                  </Alert>
+
+                  <TextField
+                    fullWidth
+                    type='password'
+                    label={t('settings.openAiApiKey')}
+                    value={settings.openaiKey}
+                    onChange={e => setSettings(s => ({ ...s, openaiKey: e.target.value }))}
+                    placeholder='sk-...'
+                    sx={{ mb: 2 }}
+                  />
+
+                  <TextField
+                    fullWidth
+                    label={t('settings.openAiBaseUrl')}
+                    value={settings.openaiBaseUrl || ''}
+                    onChange={e => setSettings(s => ({ ...s, openaiBaseUrl: e.target.value }))}
+                    placeholder='https://api.openai.com/v1'
+                    helperText={t('settings.openAiBaseUrlHelp')}
+                    sx={{ mb: 2 }}
+                  />
+
+                  <FormControl fullWidth sx={{ mb: 2 }}>
+                    <InputLabel>{t('settings.modelLabel')}</InputLabel>
+                    <Select
+                      value={settings.openaiModel}
+                      label={t('settings.modelLabel')}
+                      onChange={e => setSettings(s => ({ ...s, openaiModel: e.target.value }))}
+                    >
+                      {availableModels.length > 0 ? (
+                        availableModels.map(m => (
+                          <MenuItem key={m} value={m}><LlmModelLabel model={m} /></MenuItem>
+                        ))
+                      ) : (
+                        [
+                          ['gpt-4.1-nano', 'gpt41Nano'],
+                          ['gpt-4.1-mini', 'gpt41Mini'],
+                          ['gpt-4.1', 'gpt41'],
+                          ['o3-mini', 'o3Mini'],
+                        ].map(([model, key]) => (
+                          <MenuItem key={model} value={model}>
+                            <LlmModelLabel model={model}>{t(`settings.openaiModels.${key}`)}</LlmModelLabel>
+                          </MenuItem>
+                        ))
+                      )}
+                    </Select>
+                  </FormControl>
+
+                  {loadingModels && <LinearProgress sx={{ mb: 2 }} />}
+
+                  <Button
+                    size='small'
+                    onClick={loadModels}
+                    disabled={loadingModels || !settings.openaiKey}
+                    startIcon={<i className='ri-refresh-line' />}
+                  >
+                    {t('settings.refreshModels')}
+                  </Button>
+                </Box>
+              )}
+
+              {/* Anthropic Settings */}
+              {settings.provider === 'anthropic' && (
+                <Box>
+                  <Alert severity='warning' sx={{ mb: 2 }}>
+                    <Typography variant='body2'>
+                      {t('settings.anthropicWarning')}
+                    </Typography>
+                  </Alert>
+
+                  <TextField
+                    fullWidth
+                    type='password'
+                    label={t('settings.anthropicApiKey')}
+                    value={settings.anthropicKey || ''}
+                    onChange={e => setSettings(s => ({ ...s, anthropicKey: e.target.value }))}
+                    placeholder='sk-ant-...'
+                    sx={{ mb: 2 }}
+                  />
+
+                  <FormControl fullWidth sx={{ mb: 2 }}>
+                    <InputLabel>{t('settings.modelLabel')}</InputLabel>
+                    <Select
+                      value={settings.anthropicModel || 'claude-haiku-4-5-20251001'}
+                      label={t('settings.modelLabel')}
+                      onChange={e => setSettings(s => ({ ...s, anthropicModel: e.target.value }))}
+                    >
+                      {availableModels.length > 0 ? (
+                        availableModels.map(m => (
+                          <MenuItem key={m} value={m}><LlmModelLabel model={m} /></MenuItem>
+                        ))
+                      ) : (
+                        [
+                          ['claude-haiku-4-5-20251001', 'haiku'],
+                          ['claude-sonnet-4-6-20250514', 'sonnet'],
+                          ['claude-opus-4-6-20250918', 'opus'],
+                        ].map(([model, key]) => (
+                          <MenuItem key={model} value={model}>
+                            <LlmModelLabel model={model}>{t(`settings.anthropicModels.${key}`)}</LlmModelLabel>
+                          </MenuItem>
+                        ))
+                      )}
+                    </Select>
+                  </FormControl>
+
+                  {loadingModels && <LinearProgress sx={{ mb: 2 }} />}
+
+                  <Button
+                    size='small'
+                    onClick={loadModels}
+                    disabled={loadingModels || !settings.anthropicKey}
+                    startIcon={<i className='ri-refresh-line' />}
+                  >
+                    {t('settings.refreshModels')}
+                  </Button>
+                </Box>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Test & Save */}
+          <Card variant='outlined'>
+            <CardContent>
+              <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+                <Button
+                  variant='outlined'
+                  onClick={testConnection}
+                  disabled={testing}
+                  startIcon={testing ? <i className='ri-loader-4-line' /> : <i className='ri-play-line' />}
+                >
+                  {testing ? t('settings.testingConnection') : t('settings.testConnection')}
+                </Button>
+
+                <Button
+                  variant='contained'
+                  onClick={saveSettings}
+                  disabled={saving}
+                  startIcon={<i className='ri-save-line' />}
+                >
+                  {t('common.save')}
+                </Button>
+              </Box>
+
+              {testResult && (
+                <Alert severity={testResult.type} sx={{ mt: 2 }}>
+                  {testResult.message}
+                  {testResult.details?.length > 0 && (
+                    <Box component='ul' sx={{ m: 0, mt: 1, pl: 2.5 }}>
+                      {testResult.details.map(line => (
+                        <Typography key={line} component='li' variant='body2'>{line}</Typography>
+                      ))}
+                    </Box>
+                  )}
+                </Alert>
+              )}
+            </CardContent>
+          </Card>
+        </>
+      )}
+
+      {/* Save button always visible (even when AI is disabled) */}
+      {!settings.enabled && (
+        <Card variant='outlined' sx={{ mt: 3 }}>
+          <CardContent>
+            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+              <Button
+                variant='contained'
+                onClick={saveSettings}
+                disabled={saving}
+                startIcon={<i className='ri-save-line' />}
+              >
+                {t('common.save')}
+              </Button>
+            </Box>
+
+            {testResult && (
+              <Alert severity={testResult.type} sx={{ mt: 2 }}>
+                {testResult.message}
+              </Alert>
+            )}
+          </CardContent>
+        </Card>
+      )}
+    </Box>
+  )
+}
+
+/* ==================== GreenTab Component (RSE / Green IT) ==================== */
+
+function GreenTab() {
+  const t = useTranslations()
+
+  const {
+    settings,
+    setSettings,
+    saving,
+    loading,
+    message,
+    setMessage,
+    loadSettings,
+    saveSettings: hookSaveSettings,
+  } = useGreenSettings()
+
+  const currencyOptions = [
+    { code: 'EUR', label: 'Euro (€)' },
+    { code: 'USD', label: 'US Dollar ($)' },
+    { code: 'GBP', label: 'British Pound (£)' },
+    { code: 'CHF', label: 'Swiss Franc (CHF)' },
+    { code: 'CAD', label: 'Canadian Dollar (CA$)' },
+    { code: 'AUD', label: 'Australian Dollar (A$)' },
+    { code: 'JPY', label: 'Japanese Yen (¥)' },
+    { code: 'CNY', label: 'Chinese Yuan (¥)' },
+    { code: 'SEK', label: 'Swedish Krona (kr)' },
+    { code: 'NOK', label: 'Norwegian Krone (kr)' },
+    { code: 'DKK', label: 'Danish Krone (kr)' },
+    { code: 'PLN', label: 'Polish Złoty (zł)' },
+    { code: 'CZK', label: 'Czech Koruna (Kč)' },
+    { code: 'HUF', label: 'Hungarian Forint (Ft)' },
+    { code: 'RON', label: 'Romanian Leu (lei)' },
+    { code: 'BRL', label: 'Brazilian Real (R$)' },
+    { code: 'INR', label: 'Indian Rupee (₹)' },
+    { code: 'KRW', label: 'South Korean Won (₩)' },
+    { code: 'TRY', label: 'Turkish Lira (₺)' },
+    { code: 'ZAR', label: 'South African Rand (R)' },
+    { code: 'MXN', label: 'Mexican Peso (MX$)' },
+  ]
+
+  const currencySymbol = currencyOptions.find(c => c.code === settings.currency)?.label?.match(/\((.+)\)/)?.[1] || '€'
+
+  const co2FactorsByCountry = {
+    france: { label: t('settings.co2Countries.france'), value: 0.052 },
+    germany: { label: t('settings.co2Countries.germany'), value: 0.385 },
+    usa: { label: t('settings.co2Countries.usa'), value: 0.417 },
+    uk: { label: t('settings.co2Countries.uk'), value: 0.233 },
+    spain: { label: t('settings.co2Countries.spain'), value: 0.210 },
+    italy: { label: t('settings.co2Countries.italy'), value: 0.330 },
+    poland: { label: t('settings.co2Countries.poland'), value: 0.650 },
+    sweden: { label: t('settings.co2Countries.sweden'), value: 0.045 },
+    norway: { label: t('settings.co2Countries.norway'), value: 0.020 },
+    europe_avg: { label: t('settings.co2Countries.europe_avg'), value: 0.276 },
+    world_avg: { label: t('settings.co2Countries.world_avg'), value: 0.475 },
+    custom: { label: t('settings.co2Countries.custom'), value: settings.co2Factor },
+  }
+
+  const handleCountryChange = (country) => {
+    const factor = co2FactorsByCountry[country]?.value || 0.052
+
+    setSettings(s => ({
+      ...s,
+      co2Country: country,
+      co2Factor: country === 'custom' ? s.co2Factor : factor
+    }))
+  }
+
+  const saveSettings = async () => {
+    const result = await hookSaveSettings()
+
+    if (result.success) {
+      setMessage({ type: 'success', text: t('settings.savedSuccess') })
+    } else {
+      setMessage({ type: 'error', text: result.error || t('settings.saveError') })
+    }
+  }
+
+  if (loading) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+        <LinearProgress sx={{ width: 200 }} />
+      </Box>
+    )
+  }
+
+  return (
+    <Box>
+      <Typography variant='body2' sx={{ opacity: 0.7, mb: 3 }}>
+        {t('settings.greenConfigDescription')}
+      </Typography>
+
+      {/* Datacenter catalogue — energy + server-spec defaults live per-DC. */}
+      <Box sx={{ mb: 3 }}>
+        <DatacentersSection />
+      </Box>
+
+      {/* Section Affichage */}
+      <Card variant='outlined' sx={{ mb: 3 }}>
+        <CardContent>
+          <Typography variant='subtitle1' fontWeight={700} sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 1 }}>
+            <i className='ri-eye-line' style={{ color: '#06b6d4' }} />
+            {t('settings.displayOptions')}
+          </Typography>
+
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 2 }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={settings.display?.showCost !== false}
+                  onChange={e => setSettings(s => ({
+                    ...s,
+                    display: { ...s.display, showCost: e.target.checked }
+                  }))}
+                />
+              }
+              label={t('settings.showCosts')}
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={settings.display?.showCo2 !== false}
+                  onChange={e => setSettings(s => ({
+                    ...s,
+                    display: { ...s.display, showCo2: e.target.checked }
+                  }))}
+                />
+              }
+              label={t('settings.showCo2Emissions')}
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={settings.display?.showEquivalences !== false}
+                  onChange={e => setSettings(s => ({
+                    ...s,
+                    display: { ...s.display, showEquivalences: e.target.checked }
+                  }))}
+                />
+              }
+              label={t('settings.showEquivalences')}
+            />
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={settings.display?.showScore !== false}
+                  onChange={e => setSettings(s => ({
+                    ...s,
+                    display: { ...s.display, showScore: e.target.checked }
+                  }))}
+                />
+              }
+              label={t('settings.showGreenScore')}
+            />
+          </Box>
+        </CardContent>
+      </Card>
+
+      {/* Bouton Sauvegarder */}
+      <Card variant='outlined'>
+        <CardContent>
+          <Box sx={{ display: 'flex', gap: 2, alignItems: 'center' }}>
+            <Button
+              variant='contained'
+              onClick={saveSettings}
+              disabled={saving}
+              startIcon={saving ? <i className='ri-loader-4-line' /> : <i className='ri-save-line' />}
+            >
+              {saving ? t('common.saving') : t('settings.saveChanges')}
+            </Button>
+
+            <Button
+              variant='outlined'
+              onClick={loadSettings}
+              disabled={saving}
+              startIcon={<i className='ri-refresh-line' />}
+            >
+              {t('common.reset')}
+            </Button>
+          </Box>
+
+          {message && (
+            <Alert severity={message.type} sx={{ mt: 2 }}>
+              {message.text}
+            </Alert>
+          )}
+        </CardContent>
+      </Card>
+    </Box>
+  )
+}
+
+/* ==================== GeneralTab Component ==================== */
+
+/* ==================== Main Settings Page ==================== */
+
+export default function SettingsPage() {
+  const t = useTranslations()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const { hasFeature, loading: licenseLoading } = useLicense()
+  const { isAdmin: isSuperAdmin } = useRBAC()
+  const { data: session } = useSession()
+  const currentTenantId = session?.user?.tenantId || 'default'
+  const isProviderTenant = currentTenantId === 'default'
+
+  const { setPageInfo } = usePageTitle()
+
+  // Mode onboarding : l'utilisateur doit configurer une connexion
+  const isOnboarding = searchParams.get('onboarding') === 'true'
+  const tabParam = searchParams.get('tab')
+
+  useEffect(() => {
+    if (isOnboarding) {
+      setPageInfo(t('settings.welcome'), t('settings.welcomeSubtitle'), 'ri-settings-3-line')
+    } else {
+      setPageInfo(t('settings.title'), t('settings.subtitle'), 'ri-settings-3-line')
+    }
+
+    return () => setPageInfo('', '', '')
+  }, [setPageInfo, t, isOnboarding])
+
+  // `name` is the ?tab= value, `group` the section of the side navigation
+  // (SETTINGS_NAV_GROUPS). Listed group by group so the mobile tab row runs in
+  // the same order as the side list.
+  const allTabs = [
+    { name: 'connections', group: 'infrastructure', label: t('settings.connections'), icon: 'ri-link', component: ConnectionsTab, providerOnly: true },
+    { name: 'vdc', group: 'infrastructure', label: t('vdc.title'), icon: 'ri-cloud-line', component: VdcTab, requiredFeature: Features.MULTI_TENANCY, providerOnly: true },
+    { name: 'tenants', group: 'infrastructure', label: 'Tenants', icon: 'ri-building-line', component: TenantsTab, requiredFeature: Features.MULTI_TENANCY, providerOnly: true },
+    { name: 'ha', group: 'infrastructure', label: t('ha.tabLabel'), icon: 'ri-shield-check-line', component: HaTab, providerOnly: true },
+    { name: 'ssh-commands', group: 'infrastructure', label: t('settings.sshCommands.tabLabel'), icon: 'ri-terminal-line', component: SshCommandsTab, providerOnly: true },
+    { name: 'guest-file-restore', group: 'infrastructure', label: t('guestFileRestore.tabLabel'), icon: 'ri-folder-transfer-line', component: GuestFileRestoreTab, providerOnly: true },
+    { name: 'ldap', group: 'access', label: 'LDAP / Active Directory', icon: 'ri-server-line', component: LdapConfigTab, requiredFeature: Features.LDAP, providerOnly: true },
+    { name: 'oidc', group: 'access', label: 'OIDC / SSO', icon: 'ri-shield-keyhole-line', component: OidcConfigTab, requiredFeature: Features.OIDC, providerOnly: true },
+    // communityOnly carries the FeatureId whose Enterprise tab replaces this
+    // one: the entry stays visible only while that feature is NOT licensed.
+    { name: 'oidc-community', group: 'access', label: 'OIDC / SSO', icon: 'ri-shield-keyhole-line', component: OidcConfigTab, providerOnly: true, communityOnly: Features.OIDC },
+    { name: 'api', group: 'access', label: t('settings.apiTokens.tabLabel'), icon: 'ri-code-box-line', component: ApiTokensTab, providerOnly: true },
+    { name: 'tls', group: 'access', label: t('settings.tls.tabLabel'), icon: 'ri-lock-line', component: TlsTab, providerOnly: true },
+    { name: 'alert-thresholds', group: 'monitoring', label: t('settings.alertThresholds.title'), icon: 'ri-alarm-warning-line', component: AlertThresholdsTab, providerOnly: true },
+    { name: 'notifications', group: 'monitoring', label: t('settings.notifications'), icon: 'ri-notification-3-line', component: NotificationsTab, requiredFeature: Features.NOTIFICATIONS, providerOnly: true },
+    { name: 'syslog', group: 'monitoring', label: t('settings.syslog.tabLabel'), icon: 'ri-broadcast-line', component: SyslogTab, requiredFeature: Features.SYSLOG_FORWARDING, providerOnly: true },
+    { name: 'availability', group: 'monitoring', label: t('availability.settings.tabLabel'), icon: 'ri-heart-pulse-line', component: AvailabilitySettingsTab, requiredFeature: Features.SLA_MONITORING, providerOnly: true },
+    { name: 'broadcast', group: 'monitoring', label: t('settings.broadcast.tabLabel'), icon: 'ri-megaphone-line', component: BroadcastTab, providerOnly: true },
+    { name: 'ai', group: 'insights', label: t('settings.ai'), icon: 'ri-robot-line', component: AITab, requiredFeature: Features.AI_INSIGHTS, providerOnly: true },
+    { name: 'green', group: 'insights', label: 'RSE / Green IT', icon: 'ri-leaf-line', component: GreenTab, requiredFeature: Features.GREEN_METRICS, providerOnly: true },
+    { name: 'appearance', group: 'personalization', label: t('settings.appearance'), icon: 'ri-palette-line', component: AppearanceTab },
+    { name: 'white-label', group: 'personalization', label: 'White Label', icon: 'ri-pantone-line', component: WhiteLabelTab, requiredFeature: Features.WHITE_LABEL, superAdminOnly: true },
+    { name: 'license', group: 'system', label: t('settings.license'), icon: 'ri-award-line', component: LicenseTab, providerOnly: true },
+    { name: 'backup', group: 'system', label: t('settings.configBackup.tabLabel'), icon: 'ri-save-3-line', component: ConfigBackupTab, providerOnly: true },
+  ]
+
+  // Two different gates, deliberately:
+  //   providerOnly   — the tab configures the provider itself (connections,
+  //                    license, tenants, vDC…), so it needs a super admin
+  //                    standing in the provider tenant.
+  //   superAdminOnly — the tab configures the CURRENT tenant, whichever it
+  //                    is, and only a super admin may do it. White Label is
+  //                    the case: the branding row is keyed by tenant, so a
+  //                    super admin brands a tenant by switching onto it.
+  //                    Marking it providerOnly (a55c3856) left no UI path to
+  //                    brand a tenant at all.
+  // License-gated tabs are also filtered out entirely when the feature is
+  // missing — same UX as the inventory detail tabs: the user only sees what
+  // they can actually use, no greyed-out chips. While the license is still
+  // loading we keep gated tabs visible to avoid a visible→hidden flicker
+  // once the response lands.
+  const tabs = allTabs.filter(tab => {
+    if (tab.providerOnly && !(isSuperAdmin && isProviderTenant)) return false
+    if (tab.superAdminOnly && !isSuperAdmin) return false
+    if (!licenseLoading && tab.requiredFeature && !hasFeature(tab.requiredFeature)) return false
+    // communityOnly tabs exist only while the matching Enterprise feature is
+    // NOT licensed (mirror of the requiredFeature rule above); once licensed
+    // the official feature-gated tab replaces them.
+    if (!licenseLoading && tab.communityOnly && hasFeature(tab.communityOnly)) return false
+    return true
+  })
+
+  const tabNames = tabs.map(tab => tab.name)
+
+  // Resolve tab index from URL param
+  const resolveTabIndex = () => {
+    if (!tabParam) return 0
+    const idx = tabNames.indexOf(tabParam)
+    return idx >= 0 ? idx : 0
+  }
+
+  const [mainTab, setMainTab] = useState(resolveTabIndex)
+
+  // Sync tab from URL changes or when visible tabs change (license loaded)
+  useEffect(() => {
+    if (tabParam) {
+      const idx = tabNames.indexOf(tabParam)
+      if (idx >= 0 && idx !== mainTab) setMainTab(idx)
+    }
+  }, [tabParam, tabNames.join(',')])
+
+  // Update URL when tab changes
+  const handleTabChange = (newIndex) => {
+    setMainTab(newIndex)
+    const name = tabNames[newIndex] || 'connections'
+    const params = new URLSearchParams(searchParams.toString())
+    params.set('tab', name)
+    router.replace(`/settings?${params.toString()}`, { scroll: false })
+  }
+
+  return (
+    <Box sx={{ p: 0 }}>
+      {/* Onboarding Banner */}
+      {isOnboarding && (
+        <Alert
+          severity="info"
+          sx={{
+            mb: 2,
+            borderRadius: 2,
+            '& .MuiAlert-icon': { fontSize: 28 }
+          }}
+          icon={<i className="ri-rocket-line" style={{ fontSize: 24 }} />}
+        >
+          <Typography variant="subtitle1" fontWeight={600}>
+            {t('settings.onboardingTitle')}
+          </Typography>
+          <Typography variant="body2">
+            {t('settings.onboardingMessage')}
+          </Typography>
+        </Alert>
+      )}
+
+      <Card variant='outlined' sx={{ height: isOnboarding ? 'calc(100vh - 220px)' : 'calc(100vh - 145px)' }}>
+        <CardContent sx={{ height: '100%', display: 'flex', flexDirection: { xs: 'column', md: 'row' }, p: 0, '&:last-child': { pb: 0 } }}>
+          <SettingsNav tabs={tabs} value={mainTab} onChange={handleTabChange} />
+
+          {/* Tab Content */}
+          <Box sx={{ flex: 1, minWidth: 0, overflow: 'auto', p: 3 }}>
+            {tabs.map((tab, idx) => {
+              if (mainTab !== idx) return null
+              const TabComponent = tab.component
+              return (
+                <Box key={tabNames[idx]}>
+                  <TabComponent />
+                </Box>
+              )
+            })}
+          </Box>
+        </CardContent>
+      </Card>
+    </Box>
+  )
+}

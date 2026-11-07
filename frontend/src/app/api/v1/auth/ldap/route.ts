@@ -1,0 +1,215 @@
+// src/app/api/v1/auth/ldap/route.ts
+import { NextResponse } from "next/server"
+
+import { normalizeGroupRoleEntries, protectedRoleTargets } from "@/lib/auth/groupMapping"
+import { prisma } from "@/lib/db/prisma"
+import { encryptSecret } from "@/lib/crypto/secret"
+import { getRBACContext, PERMISSIONS } from "@/lib/rbac"
+import { requireProviderAdmin } from "@/lib/tenant/providerGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+// GET /api/v1/auth/ldap — fetch the singleton LDAP config
+export async function GET() {
+  try {
+    // Platform-wide row (id "default"): provider tenant only, not just
+    // admin.settings, which every tenant admin holds.
+    const denied = await requireProviderAdmin(PERMISSIONS.ADMIN_SETTINGS)
+    if (denied) return denied
+
+    const config = await prisma.ldapConfig.findUnique({ where: { id: "default" } })
+
+    if (!config) {
+      return NextResponse.json({
+        data: {
+          enabled: false,
+          url: "",
+          bind_dn: "",
+          base_dn: "",
+          user_filter: "(uid={{username}})",
+          email_attribute: "mail",
+          name_attribute: "cn",
+          tls_insecure: false,
+          ca_cert: "",
+          group_attribute: "memberOf",
+          // Frontend expects a string here (it does JSON.parse with a string|object guard).
+          // Returning the canonical empty-list string keeps the response shape stable.
+          group_role_mapping: "[]",
+          default_role: "role_viewer",
+          require_group: false,
+          allowed_groups: [],
+        },
+      })
+    }
+
+    // Always answer the ordered entry list, whatever the row holds: a config
+    // written before v1.5 is still a flat { group: role } object and must reach
+    // the form as entries so its order stops moving on every save (issue #992).
+    const groupRoleMappingStr = JSON.stringify(
+      normalizeGroupRoleEntries(config.groupRoleMapping),
+    )
+
+    const allowedGroupsArr: string[] = Array.isArray(config.allowedGroups)
+      ? (config.allowedGroups as string[])
+      : []
+
+    return NextResponse.json({
+      data: {
+        enabled: config.enabled,
+        url: config.url,
+        bind_dn: config.bindDn || "",
+        base_dn: config.baseDn,
+        user_filter: config.userFilter,
+        email_attribute: config.emailAttribute,
+        name_attribute: config.nameAttribute,
+        tls_insecure: config.tlsInsecure,
+        // A CA certificate is public material, so unlike the bind password it
+        // goes back to the form as-is and can be re-submitted on a test.
+        ca_cert: config.caCert || "",
+        hasBindPassword: !!config.bindPasswordEnc,
+        group_attribute: config.groupAttribute || "memberOf",
+        group_role_mapping: groupRoleMappingStr,
+        default_role: config.defaultRole || "role_viewer",
+        require_group: config.requireGroup,
+        allowed_groups: allowedGroupsArr,
+      },
+    })
+  } catch (error: any) {
+    console.error("GET LDAP config error:", error)
+    return NextResponse.json({ error: error?.message || "Server error" }, { status: 500 })
+  }
+}
+
+// PUT /api/v1/auth/ldap — save the singleton LDAP config (insert or update)
+async function handlePut(req: Request) {
+  try {
+    const denied = await requireProviderAdmin(PERMISSIONS.ADMIN_SETTINGS)
+    if (denied) return denied
+
+    const body = await req.json()
+
+    const {
+      enabled,
+      url,
+      bind_dn,
+      bind_password,
+      base_dn,
+      user_filter,
+      email_attribute,
+      name_attribute,
+      tls_insecure,
+      ca_cert,
+      group_attribute,
+      group_role_mapping,
+      default_role,
+      require_group,
+      allowed_groups,
+    } = body
+
+    if (enabled) {
+      if (!url) {
+        return NextResponse.json({ error: "LDAP URL is required" }, { status: 400 })
+      }
+      if (!base_dn) {
+        return NextResponse.json({ error: "Base DN is required" }, { status: 400 })
+      }
+    }
+
+    // Reject anything that is not a PEM certificate bundle before it reaches
+    // the orchestrator, where a bad paste would only show up as a failed bind.
+    const caCert = typeof ca_cert === "string" ? ca_cert.trim() : ""
+    if (caCert && !/-----BEGIN CERTIFICATE-----/.test(caCert)) {
+      return NextResponse.json(
+        { error: "The CA certificate must be in PEM format (-----BEGIN CERTIFICATE-----)" },
+        { status: 400 },
+      )
+    }
+
+    const mappingEntries = normalizeGroupRoleEntries(group_role_mapping)
+
+    // Same rule as POST /rbac/assignments: only a super admin hands out the
+    // wildcard roles. Through LDAP the grant lands on whoever the directory
+    // sends next, so a provider admin saving such a mapping would mint super
+    // admins.
+    const protectedRoles = protectedRoleTargets([default_role, ...mappingEntries.map(e => e.role)])
+    if (protectedRoles.length > 0) {
+      const ctx = await getRBACContext()
+      if (!ctx?.isAdmin) {
+        return NextResponse.json(
+          { error: `Only a super admin can set ${protectedRoles.join(", ")} as the LDAP default role or a group mapping target` },
+          { status: 403 },
+        )
+      }
+    }
+
+    const allowedGroupsArr: string[] = Array.isArray(allowed_groups)
+      ? allowed_groups.map((g: unknown) => String(g).trim()).filter(Boolean)
+      : []
+
+    const now = new Date()
+    const baseData = {
+      enabled: !!enabled,
+      url: url || "",
+      bindDn: bind_dn || null,
+      baseDn: base_dn || "",
+      userFilter: user_filter || "(uid={{username}})",
+      emailAttribute: email_attribute || "mail",
+      nameAttribute: name_attribute || "cn",
+      tlsInsecure: !!tls_insecure,
+      caCert: caCert || null,
+      groupAttribute: group_attribute || "memberOf",
+      groupRoleMapping: mappingEntries,
+      defaultRole: default_role || "role_viewer",
+      requireGroup: !!require_group,
+      allowedGroups: allowedGroupsArr,
+      updatedAt: now,
+    }
+
+    // Encrypt the bind password only when the form submitted a non-empty
+    // value: leaving the field blank preserves the previously-saved secret
+    // (the GET response only exposes a `hasBindPassword` boolean).
+    const update: Record<string, unknown> = { ...baseData }
+    const create: Record<string, unknown> = {
+      id: "default",
+      ...baseData,
+      createdAt: now,
+      bindPasswordEnc: null as string | null,
+    }
+    if (bind_password) {
+      const enc = encryptSecret(bind_password)
+      update.bindPasswordEnc = enc
+      create.bindPasswordEnc = enc
+    }
+
+    await prisma.ldapConfig.upsert({
+      where: { id: "default" },
+      update,
+      create: create as any,
+    })
+
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "update",
+      category: "settings",
+      resourceType: "ldap_config",
+      resourceId: "default",
+      resourceName: "LDAP configuration",
+      details: {
+        enabled,
+        url: url || null,
+        base_dn: base_dn || null,
+        bindPasswordChanged: !!bind_password,
+        caCert: !!caCert,
+      },
+      status: "success",
+    })
+
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    console.error("PUT LDAP config error:", error)
+    return NextResponse.json({ error: error?.message || "Server error" }, { status: 500 })
+  }
+}
+
+export const PUT = withAudit({ category: "settings", resourceType: "ldap" }, handlePut)

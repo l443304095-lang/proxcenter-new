@@ -1,0 +1,2948 @@
+'use client'
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { paletteColor } from '@/utils/paletteColor'
+import { useLocale, useTranslations } from 'next-intl'
+import { formatBytes } from '@/utils/format'
+import { getDateLocale } from '@/lib/i18n/date'
+
+import { useDRSStatus, useDRSRecommendations as useDRSRecsHook, useDRSMigrations, useDRSAllMigrations, useDRSMetrics, useDRSSettings, useDRSRules, useMigrationProgress } from '@/hooks/useDRS'
+import useSWR from 'swr'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Cell } from 'recharts'
+import type { XAxisTickContentProps } from 'recharts'
+import ChartContainer from '@/components/ChartContainer'
+import { computeNodeAxisLayout, createTextMeasurer, truncateToWidth, NODE_AXIS_ANGLE, NODE_AXIS_FONT_SIZE } from './nodeAxisLayout'
+
+import EnterpriseGuard from '@/components/guards/EnterpriseGuard'
+import ProviderTenantGuard from '@/components/guards/ProviderTenantGuard'
+import { Features, useLicense } from '@/contexts/LicenseContext'
+
+
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Divider,
+  Drawer,
+  FormControl,
+  IconButton,
+  InputLabel,
+  LinearProgress,
+  MenuItem,
+  Paper,
+  Select,
+  Skeleton,
+  Snackbar,
+  Stack,
+  Switch,
+  Tab,
+  Tabs,
+  Tooltip,
+  Typography,
+  alpha,
+  useTheme
+} from '@mui/material'
+
+// RemixIcon replacements for @mui/icons-material
+const RefreshIcon = (props: any) => <i className="ri-refresh-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const PlayArrowIcon = (props: any) => <i className="ri-play-fill" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const CheckIcon = (props: any) => <i className="ri-check-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const CloseIcon = (props: any) => <i className="ri-close-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const ExpandMoreIcon = (props: any) => <i className="ri-arrow-down-s-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const ExpandLessIcon = (props: any) => <i className="ri-arrow-up-s-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const StorageIcon = (props: any) => <i className="ri-hard-drive-2-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const MemoryIcon = (props: any) => <i className="ri-cpu-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const DnsIcon = (props: any) => <i className="ri-server-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const TrendingUpIcon = (props: any) => <i className="ri-arrow-up-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const TrendingDownIcon = (props: any) => <i className="ri-arrow-down-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const SwapHorizIcon = (props: any) => <i className="ri-arrow-left-right-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const WarningAmberIcon = (props: any) => <i className="ri-alert-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const CheckCircleIcon = (props: any) => <i className="ri-checkbox-circle-fill" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const BuildIcon = (props: any) => <i className="ri-hammer-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const AccessTimeIcon = (props: any) => <i className="ri-time-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+const HardwareIcon = (props: any) => <i className="ri-cpu-line" style={{ fontSize: props?.fontSize === 'small' ? 18 : 20, color: paletteColor(props?.sx?.color), ...props?.style }} />
+
+import { computeDrsHealthScore, type DrsHealthBreakdown } from '@/lib/utils/drs-health'
+
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import EmptyState from '@/components/EmptyState'
+import DRSBalancingIllustration from '@/components/illustrations/DRSBalancingIllustration'
+import { CardsSkeleton } from '@/components/skeletons'
+
+// Import des nouveaux composants DRS
+import DRSSettingsPanel, { 
+  defaultDRSSettings, 
+  type DRSSettings
+} from '@/components/automation/drs/DRSSettingsPanel'
+import PlacementConstraintsCard, {
+  type PinnedGuest,
+  type BalancingDomain,
+  type RestrictedGuest,
+  type ExcludedGuest
+} from '@/components/automation/drs/PlacementConstraintsCard'
+import MigrationHistoryTab from '@/components/automation/drs/MigrationHistoryTab'
+import { GuestGlyph, NodeGlyph } from '@/components/ui/glyphs'
+import { migrationProgressMessage } from '@/components/automation/drs/migrationProgress'
+import { drsReasonText } from '@/components/automation/drs/drsReason'
+import { excessRecommendations, firstRejections, keptRecommendations, staleRecommendations } from '@/components/automation/drs/recommendationPruning'
+import DrsActionNoticeDialog from '@/components/automation/drs/DrsActionNoticeDialog'
+import AffinityRulesManager, {
+  type AffinityRule, 
+  type VMInfo as AffinityVMInfo 
+} from '@/components/automation/drs/AffinityRulesManager'
+
+// ============================================
+// Types
+// ============================================
+
+// Type pour les VMs retournées par /api/v1/vms
+interface VMFromAPI {
+  id: string
+  connId: string
+  connectionName: string
+  type: 'qemu' | 'lxc'
+  node: string
+  host: string
+  vmid: string
+  name: string
+  status: string
+  tags: string[]
+}
+
+// Type pour les connexions
+interface Connection {
+  id: string
+  name: string
+  type: 'pve' | 'pbs'
+  baseUrl: string
+  hasCeph: boolean
+}
+
+interface DRSStatus {
+  enabled: boolean
+  mode: 'manual' | 'partial' | 'automatic'
+  recommendations: number
+  active_migrations: number
+  pending_count: number
+  approved_count: number
+  // Optional: an orchestrator older than the placement filter does not send
+  // them, and the tenant-scoped proxy can legitimately return them empty.
+  pinned_guests?: PinnedGuest[]
+  pinned_guest_count?: number
+  balancing_domains?: BalancingDomain[]
+  restricted_guests?: RestrictedGuest[]
+  excluded_guests?: ExcludedGuest[]
+}
+
+interface DRSRecommendation {
+  id: string
+  connection_id: string
+  vmid: number
+  vm_name: string
+  guest_type?: 'qemu' | 'lxc'
+  source_node: string
+  target_node: string
+  reason: string
+  reason_code?: string
+  reason_params?: Record<string, string>
+  priority: number | 'low' | 'medium' | 'high' | 'critical'
+  score: number
+  created_at: string
+  status: 'pending' | 'approved' | 'rejected' | 'executed' | 'stale'
+  confirmation_count?: number
+  last_seen_at?: string
+  maintenance_evacuation?: boolean
+  rule_violation?: boolean
+}
+
+interface DRSMigration {
+  id: string
+  recommendation_id?: string
+  connection_id: string
+  vmid: number
+  vm_name: string
+  guest_type?: 'qemu' | 'lxc'
+  source_node: string
+  target_node: string
+  task_id: string
+  started_at: string
+  completed_at?: string
+  status: 'running' | 'completed' | 'failed'
+  error?: string
+  // Copied from the recommendation by the orchestrator when the migration
+  // starts. Absent on rows written by an orchestrator older than that.
+  reason?: string
+  maintenance_evacuation?: boolean
+}
+
+// Current status of the guest and of both ends of a migration, for the dots
+// of their glyphs.
+interface GlyphStatuses {
+  guest?: string
+  source?: string
+  target?: string
+}
+
+// Type pour la progression d'une migration
+interface MigrationProgress {
+  migration_id: string
+  vmid: number
+  vm_name: string
+  guest_type?: string
+  source_node: string
+  target_node: string
+  status: string
+  progress: number
+  message: string
+  step?: string
+  step_detail?: string
+  started_at: string
+}
+
+interface ClusterMetrics {
+  connection_id: string
+  connection_name?: string
+  collected_at: string
+  nodes: NodeMetrics[]
+  summary: ClusterSummary
+  pve_version?: number
+}
+
+interface NodeMetrics {
+  node: string
+  status: string
+  cpu_usage: number
+  memory_usage: number
+  vm_count: number
+  ct_count?: number
+  running_vms: number
+  in_maintenance?: boolean
+}
+
+interface ClusterSummary {
+  total_nodes: number
+  online_nodes: number
+  total_vms: number
+  running_vms: number
+  avg_cpu_usage: number
+  avg_memory_usage: number
+  imbalance: number
+}
+
+// Type pour le résultat de check-migration
+interface LocalDiskInfo {
+  device: string
+  storage: string
+  volume: string
+  size: number
+  size_str: string
+  is_shared: boolean
+  storage_type: string
+}
+
+// Type pour les infos du stockage cible
+interface TargetStorageInfo {
+  storage: string           // nom du stockage (ex: "local")
+  node: string              // nœud cible
+  total_size: number        // taille totale en bytes
+  used_size: number         // espace utilisé en bytes
+  avail_size: number        // espace disponible en bytes
+  usage_percent: number     // % utilisé actuel
+  
+  // Après migration
+  used_after: number        // espace utilisé après migration
+  avail_after: number       // espace dispo après migration
+  usage_after_pct: number   // % utilisé après migration
+  
+  // Alertes
+  will_exceed: boolean      // true si espace insuffisant
+  warning_level: 'ok' | 'warning' | 'critical' | 'full'  // niveau d'alerte
+}
+
+interface MigrationCheckResult {
+  can_migrate: boolean
+  migration_safe: boolean
+  warning?: string
+  local_disks: LocalDiskInfo[]
+  shared_disks: LocalDiskInfo[]
+  total_local_size: number
+  total_shared_size: number
+  estimated_time?: string
+  target_storage?: TargetStorageInfo  // Nouveau: infos stockage cible
+}
+
+// ============================================
+// Fetcher & API calls
+// ============================================
+
+const fetcher = (url: string) => fetch(url).then(res => {
+  if (!res.ok) throw new Error('Failed to fetch')
+  
+return res.json()
+})
+
+async function apiAction(url: string, method = 'POST', body?: any) {
+  const res = await fetch(url, { 
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  })
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+
+    throw new Error(data.error || 'Action failed')
+  }
+
+  
+return res.json()
+}
+
+// ============================================
+// Helpers
+// ============================================
+
+const pct = (v: number) => Math.max(0, Math.min(100, Number(v ?? 0)))
+
+const formatDate = (iso: string, locale?: string) => {
+  if (!iso) return '—'
+
+return new Date(iso).toLocaleString(locale, {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+const getPriorityLabel = (priority: number | string): string => {
+  const labels: Record<number, string> = { 0: 'low', 1: 'medium', 2: 'high', 3: 'critical' }
+
+  
+return typeof priority === 'number' ? labels[priority] || 'low' : priority
+}
+
+const getPriorityColor = (priority: number | string): 'error' | 'warning' | 'info' | 'default' => {
+  const p = getPriorityLabel(priority)
+
+  const colors: Record<string, 'error' | 'warning' | 'info' | 'default'> = {
+    critical: 'error',
+    high: 'warning',
+    medium: 'info',
+    low: 'default'
+  }
+
+  
+return colors[p] || 'default'
+}
+
+
+// Helper pour s'assurer qu'on a un tableau (évite les erreurs .filter is not a function)
+const ensureArray = <T,>(data: T[] | undefined | null | { error?: string }): T[] => {
+  if (Array.isArray(data)) return data
+  
+return []
+}
+
+// ============================================
+// Sub Components
+// ============================================
+
+// Status dot of a node: maintenance first, then online or not
+const nodeDotColor = (node: NodeMetrics): string => {
+  if (node.in_maintenance) return 'warning.main'
+
+  return node.status === 'online' ? 'success.main' : 'error.main'
+}
+
+// Usage meter: label and value on one line, a thin bar underneath. The value
+// sits beside the bar rather than on it, so it stays readable whatever the fill.
+const UsageMeter = ({
+  value,
+  label,
+  width,
+  barHeight = 4,
+  thresholds = { warning: 70, critical: 85 }
+}: {
+  value: number
+  label: string
+  width?: number
+  barHeight?: number
+  thresholds?: { warning: number, critical: number }
+}) => {
+  const theme = useTheme()
+
+  let color = theme.palette.success.main
+
+  if (value >= thresholds.critical) color = theme.palette.error.main
+  else if (value >= thresholds.warning) color = theme.palette.warning.main
+
+  return (
+    <Box sx={{ width: width ?? '100%', minWidth: 0 }}>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', mb: 0.5 }}>
+        <Typography variant="caption" sx={{ color: 'text.secondary', lineHeight: 1.2 }}>{label}</Typography>
+        <Typography variant="caption" sx={{ fontWeight: 600, lineHeight: 1.2, fontVariantNumeric: 'tabular-nums' }}>
+          {value.toFixed(width ? 0 : 1)}%
+        </Typography>
+      </Box>
+      <LinearProgress
+        variant="determinate"
+        value={pct(value)}
+        aria-label={label}
+        sx={{
+          height: barHeight,
+          borderRadius: barHeight,
+          bgcolor: alpha(color, 0.15),
+          '& .MuiLinearProgress-bar': { borderRadius: barHeight, bgcolor: color }
+        }}
+      />
+    </Box>
+  )
+}
+
+// Cluster Card - Affiche un cluster avec ses nœuds
+const ClusterCard = ({
+  clusterId,
+  clusterName,
+  metrics,
+  recommendations,
+  expanded,
+  onToggle,
+  excludedNodeNames = [],
+  isClusterExcluded = false,
+  drsMode = 'manual',
+  balancingDomains = [],
+  onShowRecommendations
+}: {
+  clusterId: string
+  clusterName: string
+  metrics: ClusterMetrics
+  recommendations: DRSRecommendation[]
+  expanded: boolean
+  onToggle: () => void
+  excludedNodeNames?: string[]
+  isClusterExcluded?: boolean
+  drsMode?: string
+  balancingDomains?: BalancingDomain[]
+  onShowRecommendations?: () => void
+}) => {
+  const theme = useTheme()
+  const clusterRecs = recommendations.filter(r => r.connection_id === clusterId)
+
+  // What shapes placement on this cluster, if anything. Some guests can only
+  // move within part of the nodes because a bridge, an SDN zone or a storage
+  // they use exists there only: a valid, often intentional shape. The chip
+  // says how many guests that concerns and points at the placement card,
+  // where each one is named with its limiting resource.
+  const placementConstraint = useMemo(() => {
+    const domains = balancingDomains.filter(d => d.connection_id === clusterId)
+
+    if (domains.length < 2) return null
+
+    const kinds = new Set(domains.flatMap(d => d.constraints || []))
+
+    if (kinds.size === 0) return null
+
+    const network = kinds.has('network')
+    const storage = kinds.has('storage')
+
+    // The guests outside the widest domain are the ones with fewer places to
+    // go; the widest domain is where the free guests live.
+    const widest = Math.max(...domains.map(d => d.nodes.length))
+    const restricted = domains.filter(d => d.nodes.length < widest).reduce((sum, d) => sum + d.guests, 0)
+
+    return {
+      count: domains.length,
+      restricted,
+      icon: network ? 'ri-git-branch-line' : 'ri-hard-drive-2-line',
+      labelKey:
+        network && storage
+          ? 'drsPage.placementConstrainedBoth'
+          : network
+            ? 'drsPage.placementConstrainedSdn'
+            : 'drsPage.placementConstrainedStorage'
+    }
+  }, [balancingDomains, clusterId])
+  
+  // Calculer le spread (écart max-min) de mémoire
+  const memorySpread = useMemo(() => {
+    if (!metrics?.nodes || metrics.nodes.length < 2) return 0
+    const memValues = metrics.nodes.map(n => n.memory_usage)
+    const max = Math.max(...memValues)
+    const min = Math.min(...memValues)
+
+    
+return max - min
+  }, [metrics.nodes])
+
+  // Calculer le score de santé du cluster avec breakdown
+  const healthBreakdown = useMemo(() => computeDrsHealthScore(metrics?.summary, metrics?.nodes), [metrics])
+  const healthScore = healthBreakdown.score
+
+  const t = useTranslations()
+  const healthColor = healthScore >= 85 ? 'success' : healthScore >= 60 ? 'warning' : 'error'
+  const healthLabel = healthScore >= 85 ? t('drsPage.balanced') : healthScore >= 60 ? t('drsPage.toOptimize') : t('drsPage.unbalanced')
+  
+  // Couleur du spread selon le seuil (10% = warning)
+  const spreadColor = memorySpread > 10 ? 'error' : memorySpread > 6 ? 'warning' : 'success'
+
+  // Trier les nœuds par mémoire décroissante
+  const sortedNodes = useMemo(() => 
+    [...(metrics.nodes || [])].sort((a, b) => b.memory_usage - a.memory_usage),
+    [metrics.nodes]
+  )
+
+  // Identifier sources et cibles potentielles
+  const avgMem = metrics?.summary?.avg_memory_usage ?? 0
+
+  const getNodeRole = (node: NodeMetrics) => {
+    if (excludedNodeNames.includes(node.node)) return 'excluded'
+    if (node.in_maintenance) return 'maintenance'
+    const diff = node.memory_usage - avgMem
+
+    if (diff > 5) return 'source'
+    if (diff < -5) return 'target'
+
+return 'neutral'
+  }
+
+  const roleIcon: Record<string, React.ReactNode> = {
+    excluded: <i className="ri-filter-off-line" style={{ fontSize: 16, color: theme.palette.text.disabled }} />,
+    maintenance: <BuildIcon sx={{ fontSize: 16, color: 'warning.main' }} />,
+    source: <TrendingUpIcon sx={{ fontSize: 16, color: 'error.main' }} />,
+    target: <TrendingDownIcon sx={{ fontSize: 16, color: 'success.main' }} />
+  }
+
+  const roleTint: Record<string, string> = {
+    excluded: alpha(theme.palette.action.disabled, 0.06),
+    maintenance: alpha(theme.palette.warning.main, 0.07),
+    source: alpha(theme.palette.error.main, 0.05),
+    target: alpha(theme.palette.success.main, 0.05),
+    neutral: 'transparent'
+  }
+
+  return (
+    <Card
+      variant="outlined"
+      sx={{
+        borderRadius: 2,
+        overflow: 'hidden',
+        opacity: isClusterExcluded ? 0.6 : 1,
+        borderColor: isClusterExcluded ? 'text.disabled' : clusterRecs.length > 0 ? alpha(theme.palette.warning.main, 0.5) : 'divider'
+      }}
+    >
+      {/* Header cliquable */}
+      <Box
+        onClick={onToggle}
+        sx={{
+          px: 2,
+          py: 1.5,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: { xs: 'wrap', md: 'nowrap' },
+          rowGap: 1.5,
+          columnGap: 2,
+          cursor: 'pointer',
+          bgcolor: isClusterExcluded ? alpha(theme.palette.action.disabled, 0.06) : 'transparent',
+          '&:hover': { bgcolor: isClusterExcluded ? alpha(theme.palette.action.disabled, 0.1) : alpha(theme.palette.primary.main, 0.04) },
+          borderBottom: expanded ? '1px solid' : 'none',
+          borderColor: 'divider'
+        }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minWidth: 0 }}>
+          <DnsIcon sx={{ color: theme.palette.text.secondary }} />
+          <Box sx={{ minWidth: 0 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 700, lineHeight: 1.3, color: 'text.primary' }} noWrap>
+                {clusterName || clusterId.slice(0, 12)}
+              </Typography>
+              {!!metrics.pve_version && (
+                <Chip
+                  label={`PVE ${metrics.pve_version}`}
+                  size="small"
+                  variant="outlined"
+                  sx={{ height: 20, fontSize: '0.65rem' }}
+                />
+              )}
+              <Chip
+                size="small"
+                variant="outlined"
+                label={drsMode.toUpperCase()}
+                color={drsMode === 'automatic' ? 'success' : drsMode === 'partial' ? 'warning' : 'info'}
+                sx={{ height: 20, fontSize: '0.65rem', fontWeight: 600 }}
+              />
+              {isClusterExcluded && (
+                <Chip
+                  icon={<i className="ri-filter-off-line" style={{ fontSize: 14 }} />}
+                  label={t('drsPage.excludedFromDRS')}
+                  size="small"
+                  variant="outlined"
+                  sx={{ height: 22, fontSize: '0.7rem', color: 'text.disabled', borderColor: 'text.disabled' }}
+                />
+              )}
+              {placementConstraint && (
+                <Tooltip
+                  arrow
+                  title={t('drsPage.placementConstrainedTooltip', {
+                    count: placementConstraint.count,
+                    restricted: placementConstraint.restricted
+                  })}
+                >
+                  <Chip
+                    icon={<i className={placementConstraint.icon} style={{ fontSize: 14 }} />}
+                    label={t(placementConstraint.labelKey)}
+                    size="small"
+                    color="info"
+                    variant="outlined"
+                    sx={{ height: 22, fontSize: '0.7rem', fontWeight: 600 }}
+                  />
+                </Tooltip>
+              )}
+            </Box>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              {metrics?.summary?.online_nodes ?? 0} {t('drsPage.nodesLabel')} • {metrics?.summary?.running_vms ?? 0} VMs
+            </Typography>
+          </Box>
+        </Box>
+
+        {/* Fixed-width slots so the figures line up from one cluster card to the next */}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, ml: 'auto' }}>
+          <Box sx={{ width: 72, display: { xs: 'none', sm: 'flex' }, justifyContent: 'flex-end' }}>
+            {clusterRecs.length > 0 && (
+              <Tooltip title={t('drsPage.showRecommendations')} arrow disableInteractive>
+                <Chip
+                  size="small"
+                  label={t('drsPage.recShort', { count: clusterRecs.length })}
+                  color="warning"
+                  variant="outlined"
+                  clickable
+                  onClick={(e) => { e.stopPropagation(); onShowRecommendations?.() }}
+                  sx={{ fontWeight: 600 }}
+                />
+              </Tooltip>
+            )}
+          </Box>
+
+          {/* Health score */}
+          <Tooltip title={
+            <Box sx={{ fontSize: '0.75rem' }}>
+              <Typography variant="caption" sx={{ fontWeight: 700, display: 'block', mb: 0.5 }}>{t('drsPage.healthScore')}: {healthScore}/100</Typography>
+              {healthBreakdown.memSpreadPenalty !== 0 && <Box>RAM spread {healthBreakdown.memSpread.toFixed(1)}pp → {healthBreakdown.memSpreadPenalty}</Box>}
+              {healthBreakdown.cpuSpreadPenalty !== 0 && <Box>CPU spread {healthBreakdown.cpuSpread.toFixed(1)}pp → {healthBreakdown.cpuSpreadPenalty}</Box>}
+              {healthBreakdown.memPenalty !== 0 && <Box>RAM avg {Math.round(healthBreakdown.avgMem)}% → {healthBreakdown.memPenalty}</Box>}
+              {healthBreakdown.cpuPenalty !== 0 && <Box>CPU avg {Math.round(healthBreakdown.avgCpu)}% → {healthBreakdown.cpuPenalty}</Box>}
+              {healthBreakdown.imbalancePenalty !== 0 && <Box>CV {healthBreakdown.imbalance.toFixed(1)}% → {healthBreakdown.imbalancePenalty}</Box>}
+              {healthScore === 100 && <Box>{t('drsPage.balanced')}</Box>}
+            </Box>
+          } arrow disableInteractive>
+            <Box sx={{
+              width: { xs: 'auto', md: 140 },
+              display: 'flex',
+              alignItems: 'center',
+              gap: 1,
+              px: 1,
+              py: 0.5,
+              borderRadius: 1,
+              bgcolor: alpha(theme.palette[healthColor].main, 0.1),
+              cursor: 'help'
+            }}>
+              <Typography sx={{ fontWeight: 700, fontSize: '0.875rem', lineHeight: 1.2, color: `${healthColor}.main`, fontVariantNumeric: 'tabular-nums' }}>
+                {healthScore}
+              </Typography>
+              <Typography variant="caption" fontWeight={600} color={`${healthColor}.main`} noWrap sx={{ display: { xs: 'none', md: 'block' } }}>
+                {healthLabel}
+              </Typography>
+            </Box>
+          </Tooltip>
+
+          {/* Spread indicator */}
+          <Tooltip title={t('drsPage.memorySpreadBetweenNodes', { pct: memorySpread.toFixed(1) })} disableInteractive>
+            <Box sx={{
+              width: 64,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 0.5,
+              py: 0.5,
+              borderRadius: 1,
+              bgcolor: alpha(theme.palette[spreadColor].main, 0.1),
+              cursor: 'help'
+            }}>
+              <SwapHorizIcon sx={{ fontSize: 16, color: `${spreadColor}.main` }} />
+              <Typography
+                variant="caption"
+                sx={{ fontWeight: 600, color: `${spreadColor}.main`, lineHeight: 1.2, fontVariantNumeric: 'tabular-nums' }}
+              >
+                {memorySpread.toFixed(0)}%
+              </Typography>
+            </Box>
+          </Tooltip>
+
+          {/* Cluster averages */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            <UsageMeter value={metrics?.summary?.avg_cpu_usage ?? 0} label="CPU" width={96} />
+            <UsageMeter value={metrics?.summary?.avg_memory_usage ?? 0} label="RAM" width={96} />
+          </Box>
+
+          <IconButton
+            size="small"
+            aria-label={expanded ? t('common.showLess') : t('common.showMore')}
+            onClick={(e) => { e.stopPropagation(); onToggle() }}
+          >
+            {expanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+          </IconButton>
+        </Box>
+      </Box>
+
+      {/* Contenu expandable - Liste des nœuds */}
+      <Collapse in={expanded}>
+        <Box sx={{ px: 2, pt: 1.5, pb: 2 }}>
+          {/* Légende */}
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: 2.5, rowGap: 0.5, mb: 1.5, color: 'text.secondary' }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <TrendingUpIcon sx={{ fontSize: 14, color: 'error.main' }} />
+              <Typography variant="caption">{t('drsPage.sourceToUnload')}</Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <TrendingDownIcon sx={{ fontSize: 14, color: 'success.main' }} />
+              <Typography variant="caption">{t('drsPage.targetCanReceive')}</Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <BuildIcon sx={{ fontSize: 14, color: 'warning.main' }} />
+              <Typography variant="caption">{t('drsPage.maintenance')}</Typography>
+            </Box>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <i className="ri-filter-off-line" style={{ fontSize: 14, color: theme.palette.text.disabled }} />
+              <Typography variant="caption">{t('drsPage.excludedFromDRS')}</Typography>
+            </Box>
+          </Box>
+
+          {/* Liste des nœuds */}
+          <Stack spacing={0.5}>
+            {sortedNodes.map(node => {
+              const role = getNodeRole(node)
+              const isMaintenance = role === 'maintenance'
+              const isExcluded = role === 'excluded'
+
+              return (
+                <Box
+                  key={node.node}
+                  sx={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 2,
+                    px: 1.5,
+                    py: 1,
+                    borderRadius: 1,
+                    opacity: isExcluded ? 0.5 : 1,
+                    bgcolor: roleTint[role],
+                    transition: 'background-color 0.15s ease',
+                    '&:hover': { bgcolor: alpha(theme.palette.action.hover, 0.08) }
+                  }}
+                >
+                  {/* Indicateur de rôle */}
+                  <Box sx={{ width: 16, display: 'flex', flexShrink: 0 }}>{roleIcon[role]}</Box>
+
+                  {/* Nom du nœud */}
+                  <Box sx={{ width: { xs: 120, md: 200 }, flexShrink: 0, minWidth: 0, display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                    <Box sx={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: 14, height: 14, flexShrink: 0 }}>
+                      <img
+                        src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'}
+                        alt=""
+                        width={14}
+                        height={14}
+                        style={{ opacity: isExcluded ? 0.4 : 0.8 }}
+                      />
+                      <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 7, height: 7, borderRadius: '50%', bgcolor: nodeDotColor(node), border: '1.5px solid', borderColor: 'background.paper' }} />
+                    </Box>
+                    <Typography
+                      noWrap
+                      sx={{
+                        fontWeight: 600,
+                        fontSize: '0.875rem',
+                        color: isExcluded ? 'text.disabled' : 'text.primary'
+                      }}
+                    >
+                      {node.node}
+                    </Typography>
+                    {isExcluded && (
+                      <Chip
+                        label={t('drsPage.excludedFromDRS')}
+                        size="small"
+                        sx={{ height: 18, fontSize: '0.65rem', color: 'text.disabled', borderColor: 'text.disabled' }}
+                        variant="outlined"
+                      />
+                    )}
+                    {isMaintenance && (
+                      <Chip
+                        label={t('drsPage.inMaintenance')}
+                        size="small"
+                        color="warning"
+                        sx={{ height: 18, fontSize: '0.65rem' }}
+                      />
+                    )}
+                  </Box>
+
+                  {/* Barres CPU & RAM */}
+                  <Box sx={{ flex: 1, minWidth: 0, display: 'flex', gap: 3 }}>
+                    <UsageMeter value={node.cpu_usage} label="CPU" barHeight={6} />
+                    <UsageMeter value={node.memory_usage} label="RAM" barHeight={6} />
+                  </Box>
+
+                  {/* VMs count */}
+                  <Box sx={{ width: 72, flexShrink: 0, textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <Typography component="span" variant="body2" sx={{ fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
+                      {node.running_vms}/{node.vm_count}
+                    </Typography>
+                    <Typography component="span" variant="caption" sx={{ color: 'text.secondary', ml: 0.5 }}>VMs</Typography>
+                  </Box>
+                </Box>
+              )
+            })}
+          </Stack>
+        </Box>
+      </Collapse>
+    </Card>
+  )
+}
+
+// Active Migration Row - Affiche une migration en cours avec barre de progression
+const ActiveMigrationRow = ({
+  migration,
+  progress,
+  statuses = {}
+}: {
+  migration: DRSMigration
+  progress: MigrationProgress | null
+  statuses?: GlyphStatuses
+}) => {
+  const theme = useTheme()
+  const t = useTranslations()
+  const dark = theme.palette.mode === 'dark'
+  const dotBorder = theme.palette.background.paper
+  const pct = progress?.progress ?? 0
+  const message = progress ? migrationProgressMessage(progress, t) : t('drsPage.loading')
+  const isComplete = migration.status === 'completed'
+  const isFailed = migration.status === 'failed'
+  
+  const progressColor = isFailed 
+    ? theme.palette.error.main 
+    : isComplete 
+      ? theme.palette.success.main 
+      : theme.palette.info.main
+
+  return (
+    <Box
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 1,
+        py: 1.5,
+        px: 2,
+        borderRadius: 1,
+        border: '1px solid',
+        borderColor: alpha(progressColor, 0.5),
+        bgcolor: alpha(progressColor, 0.05),
+      }}
+    >
+      {/* Header row */}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+        {/* Icône avec animation */}
+        <Box sx={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+          {!isComplete && !isFailed ? (
+            <CircularProgress size={20} thickness={5} sx={{ color: progressColor }} />
+          ) : isComplete ? (
+            <CheckCircleIcon sx={{ color: 'success.main', fontSize: 20 }} />
+          ) : (
+            <WarningAmberIcon sx={{ color: 'error.main', fontSize: 20 }} />
+          )}
+        </Box>
+
+        {/* VM Name + Type */}
+        <Box sx={{ minWidth: 140, display: 'flex', alignItems: 'center', gap: 1 }}>
+          <GuestGlyph type={migration.guest_type} status={statuses.guest} dotBorder={dotBorder} />
+          <Typography sx={{ fontWeight: 600, fontSize: '0.875rem' }} noWrap>
+            {migration.vm_name || `VM ${migration.vmid}`}
+          </Typography>
+        </Box>
+
+        {/* Migration path */}
+        <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+          <Chip
+            size="small"
+            icon={<NodeGlyph status={statuses.source} dark={dark} dotBorder={dotBorder} />}
+            label={migration.source_node}
+            sx={{
+              bgcolor: alpha(theme.palette.error.main, 0.1),
+              color: 'error.main',
+              fontWeight: 500,
+              fontSize: '0.75rem'
+            }} 
+          />
+          <Typography sx={{ opacity: 0.4 }}>→</Typography>
+          <Chip
+            size="small"
+            icon={<NodeGlyph status={statuses.target} dark={dark} dotBorder={dotBorder} />}
+            label={migration.target_node}
+            sx={{ 
+              bgcolor: alpha(theme.palette.success.main, 0.1),
+              color: 'success.main',
+              fontWeight: 500,
+              fontSize: '0.75rem'
+            }} 
+          />
+        </Box>
+
+      </Box>
+
+      {/* Progress bar */}
+      <Box sx={{ width: '100%' }}>
+        <Box sx={{ position: 'relative' }}>
+          <LinearProgress
+            variant="determinate"
+            value={pct}
+            sx={{
+              height: 14,
+              borderRadius: 0,
+              bgcolor: alpha(progressColor, 0.15),
+              '& .MuiLinearProgress-bar': {
+                borderRadius: 0,
+                bgcolor: progressColor,
+                transition: 'transform 0.5s ease-in-out'
+              }
+            }}
+          />
+          <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>
+            {pct.toFixed(0)}%
+          </Typography>
+        </Box>
+        <Typography variant="caption" sx={{ opacity: 0.7, mt: 0.5, display: 'block' }}>
+          {message}
+        </Typography>
+      </Box>
+    </Box>
+  )
+}
+
+// Recommendation Row - Ligne compacte pour une recommandation
+const RecommendationRow = React.memo(({
+  rec,
+  onClick,
+  haConflict = false,
+  statuses = {}
+}: {
+  rec: DRSRecommendation
+  onClick: () => void
+  haConflict?: boolean
+  statuses?: GlyphStatuses
+}) => {
+  const theme = useTheme()
+  const t = useTranslations()
+  const dark = theme.palette.mode === 'dark'
+  const dotBorder = theme.palette.background.paper
+  const priorityLabel = getPriorityLabel(rec.priority)
+  const priorityColor = getPriorityColor(rec.priority)
+
+  const nodeChipSx = (color: string) => ({
+    bgcolor: alpha(color, 0.1),
+    color: 'text.primary',
+    fontWeight: 500,
+    fontSize: '0.75rem',
+    maxWidth: 130
+  })
+
+  return (
+    <Box
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() } }}
+      sx={{
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: { xs: 'wrap', md: 'nowrap' },
+        columnGap: 2,
+        rowGap: 1,
+        py: 1,
+        px: 1.5,
+        borderRadius: 1,
+        cursor: 'pointer',
+        border: '1px solid',
+        borderColor: rec.maintenance_evacuation ? alpha(theme.palette.warning.main, 0.5) : 'divider',
+        bgcolor: rec.maintenance_evacuation ? alpha(theme.palette.warning.main, 0.03) : 'transparent',
+        transition: 'border-color 0.15s ease, background-color 0.15s ease',
+        '&:hover, &:focus-visible': {
+          borderColor: 'primary.main',
+          bgcolor: alpha(theme.palette.primary.main, 0.03)
+        },
+        '&:focus-visible': { outline: 'none' }
+      }}
+    >
+      {/* Guest: type glyph with its status dot, name, vmid */}
+      <Box sx={{ width: { xs: 'auto', md: 220 }, flexShrink: 0, minWidth: 0, display: 'flex', alignItems: 'center', gap: 1 }}>
+        <GuestGlyph type={rec.guest_type} status={statuses.guest} dotBorder={dotBorder} />
+        <Typography sx={{ fontWeight: 600, fontSize: '0.875rem' }} noWrap>
+          {rec.vm_name || `VM ${rec.vmid}`}
+        </Typography>
+        <Typography variant="caption" sx={{ color: 'text.secondary', flexShrink: 0 }}>#{rec.vmid}</Typography>
+      </Box>
+
+      {/* Migration path */}
+      <Box sx={{ width: { xs: 'auto', md: 290 }, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Chip
+          size="small"
+          icon={<NodeGlyph status={statuses.source} dark={dark} dotBorder={dotBorder} />}
+          label={rec.source_node}
+          sx={nodeChipSx(theme.palette.error.main)}
+        />
+        <i className="ri-arrow-right-line" style={{ fontSize: 14, color: theme.palette.text.secondary }} />
+        <Chip
+          size="small"
+          icon={<NodeGlyph status={statuses.target} dark={dark} dotBorder={dotBorder} />}
+          label={rec.target_node}
+          sx={nodeChipSx(theme.palette.success.main)}
+        />
+      </Box>
+
+      {/* Reason: the free-text column, takes what is left */}
+      <Typography
+        variant="caption"
+        noWrap
+        sx={{ flex: 1, minWidth: 0, color: 'text.secondary', display: { xs: 'none', lg: 'block' } }}
+      >
+        {drsReasonText(rec, t)}
+      </Typography>
+
+      {/* Priority & Score */}
+      <Stack direction="row" spacing={1} alignItems="center" sx={{ ml: 'auto', flexShrink: 0 }}>
+        {rec.maintenance_evacuation && (
+          <Chip label={t('drsPage.evacuation')} size="small" color="warning" variant="outlined" sx={{ height: 22, fontSize: '0.7rem' }} />
+        )}
+        {haConflict && (
+          <Tooltip title={t('drsPage.haWarningVm')} arrow>
+            <Chip
+              icon={<i className="ri-shield-star-line" style={{ fontSize: 12 }} />}
+              label="HA"
+              size="small"
+              color="warning"
+              variant="outlined"
+              sx={{ height: 22, fontSize: '0.7rem', cursor: 'help' }}
+            />
+          </Tooltip>
+        )}
+        {(rec.confirmation_count ?? 0) > 1 && (
+          <Tooltip title={t('drsPage.confirmationTooltip', { count: rec.confirmation_count })} arrow>
+            <Chip
+              size="small"
+              variant="outlined"
+              color="info"
+              label={`${rec.confirmation_count}\u00d7`}
+              icon={<CheckCircleIcon fontSize="small" />}
+              sx={{ height: 22, cursor: 'help' }}
+            />
+          </Tooltip>
+        )}
+        <Chip
+          size="small"
+          label={priorityLabel.toUpperCase()}
+          color={priorityColor}
+          sx={{ minWidth: 76, height: 22, fontSize: '0.7rem', fontWeight: 700 }}
+        />
+        <Tooltip title={t('drsPage.scoreTooltip', { score: rec.score.toFixed(1) })} arrow>
+          <Chip
+            size="small"
+            variant="outlined"
+            label={`+${rec.score.toFixed(0)}%`}
+            sx={{ minWidth: 56, height: 22, fontVariantNumeric: 'tabular-nums', cursor: 'help' }}
+          />
+        </Tooltip>
+        <i className="ri-arrow-right-s-line" style={{ fontSize: 18, color: theme.palette.text.secondary }} />
+      </Stack>
+    </Box>
+  )
+})
+
+// ============================================
+// Storage Warning Component pour le Drawer
+// ============================================
+
+const StorageWarningPanel = ({
+  migrationCheck,
+  loading,
+  targetNode
+}: {
+  migrationCheck: MigrationCheckResult | null
+  loading: boolean
+  targetNode?: string
+}) => {
+  const theme = useTheme()
+  const t = useTranslations()
+
+  if (loading) {
+    return (
+      <Box sx={{ py: 2 }}>
+        <Skeleton variant="rectangular" height={80} sx={{ borderRadius: 1 }} />
+      </Box>
+    )
+  }
+
+  if (!migrationCheck) return null
+
+  const hasLocalDisks = migrationCheck.local_disks && migrationCheck.local_disks.length > 0
+  const targetStorage = migrationCheck.target_storage
+
+  // Fonction pour obtenir la couleur selon le niveau d'alerte
+  const getWarningColor = (level?: string) => {
+    switch (level) {
+      case 'full': return theme.palette.error.main
+      case 'critical': return theme.palette.error.main
+      case 'warning': return theme.palette.warning.main
+      default: return theme.palette.success.main
+    }
+  }
+
+  if (!hasLocalDisks) {
+    // Stockage partagé - migration sûre
+    return (
+      <Alert
+        severity="success"
+        icon={<CheckCircleIcon />}
+        sx={{ mb: 2 }}
+      >
+        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+          {t('drsPage.sharedStorageOnly')}
+        </Typography>
+        <Typography variant="caption">
+          {t('drsPage.sharedStorageSafe')}
+        </Typography>
+      </Alert>
+    )
+  }
+
+  // Stockage local détecté - afficher le warning
+  return (
+    <Stack spacing={2} sx={{ mb: 2 }}>
+      {/* Alert stockage local */}
+      <Alert
+        severity="warning"
+        icon={<WarningAmberIcon />}
+      >
+        <Typography variant="body2" sx={{ fontWeight: 600, mb: 1 }}>
+          {t('drsPage.localStorageDetected')}
+        </Typography>
+        <Typography variant="caption" component="div" sx={{ mb: 1.5 }}>
+          {migrationCheck.warning}
+        </Typography>
+
+        {/* Liste des disques locaux */}
+        <Box sx={{ mb: 1.5 }}>
+          {migrationCheck.local_disks.map((disk, idx) => (
+            <Box
+              key={idx}
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                py: 0.75,
+                px: 1,
+                mb: 0.5,
+                bgcolor: alpha(theme.palette.warning.main, 0.1),
+                borderRadius: 0.5,
+                fontSize: '0.75rem'
+              }}
+            >
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <HardwareIcon sx={{ fontSize: 14, opacity: 0.7 }} />
+                <Typography variant="caption" sx={{ fontWeight: 500 }}>
+                  {disk.device}
+                </Typography>
+                <Chip 
+                  label={disk.storage} 
+                  size="small" 
+                  sx={{ 
+                    height: 18, 
+                    fontSize: '0.65rem',
+                    bgcolor: alpha(theme.palette.warning.main, 0.2)
+                  }} 
+                />
+              </Box>
+              <Typography variant="caption" sx={{ fontWeight: 600 }}>
+                {disk.size_str || formatBytes(disk.size)}
+              </Typography>
+            </Box>
+          ))}
+        </Box>
+
+        {/* Stats totales */}
+        <Box sx={{ 
+          display: 'flex', 
+          gap: 2, 
+          pt: 1, 
+          borderTop: '1px dashed',
+          borderColor: alpha(theme.palette.warning.main, 0.3)
+        }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <StorageIcon sx={{ fontSize: 14, opacity: 0.7 }} />
+            <Typography variant="caption">
+              {t('drsPage.totalSize')}: <strong>{formatBytes(migrationCheck.total_local_size)}</strong>
+            </Typography>
+          </Box>
+          {migrationCheck.estimated_time && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <AccessTimeIcon sx={{ fontSize: 14, opacity: 0.7 }} />
+              <Typography variant="caption">
+                {t('drsPage.estimatedDuration')}: <strong>{migrationCheck.estimated_time}</strong>
+              </Typography>
+            </Box>
+          )}
+        </Box>
+      </Alert>
+
+      {/* Info stockage cible */}
+      {targetStorage && (
+        <Alert 
+          severity={targetStorage.will_exceed ? 'error' : targetStorage.warning_level === 'critical' ? 'error' : targetStorage.warning_level === 'warning' ? 'warning' : 'info'}
+          icon={<StorageIcon />}
+        >
+          <Typography variant="body2" sx={{ fontWeight: 600, mb: 1 }}>
+            {t('drsPage.targetStorageLabel', { storage: targetStorage.storage, node: targetStorage.node })}
+          </Typography>
+
+          {/* Barre de progression actuelle vs après migration */}
+          <Box sx={{ mb: 1.5 }}>
+            {/* État actuel */}
+            <Box sx={{ mb: 1 }}>
+              <Typography variant="caption" sx={{ opacity: 0.7, mb: 0.5, display: 'block' }}>{t('drsPage.currently')} — {formatBytes(targetStorage.used_size)} / {formatBytes(targetStorage.total_size)}</Typography>
+              <Box sx={{ position: 'relative' }}>
+                <LinearProgress
+                  variant="determinate"
+                  value={pct(targetStorage.usage_percent)}
+                  sx={{
+                    height: 14,
+                    borderRadius: 0,
+                    bgcolor: alpha(theme.palette.grey[500], 0.2),
+                    '& .MuiLinearProgress-bar': { borderRadius: 0, bgcolor: targetStorage.usage_percent >= 90 ? 'error.main' : 'primary.main' }
+                  }}
+                />
+                <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>
+                  {targetStorage.usage_percent.toFixed(1)}%
+                </Typography>
+              </Box>
+            </Box>
+
+            {/* Après migration */}
+            <Box>
+              <Typography variant="caption" sx={{ opacity: 0.7, mb: 0.5, display: 'block', color: getWarningColor(targetStorage.warning_level) }}>{t('drsPage.afterMigration')} — {formatBytes(targetStorage.used_after)} / {formatBytes(targetStorage.total_size)}</Typography>
+              <Box sx={{ position: 'relative' }}>
+                <LinearProgress
+                  variant="determinate"
+                  value={pct(targetStorage.usage_after_pct)}
+                  sx={{
+                    height: 14,
+                    borderRadius: 0,
+                    bgcolor: alpha(theme.palette.grey[500], 0.2),
+                    '& .MuiLinearProgress-bar': { borderRadius: 0, bgcolor: getWarningColor(targetStorage.warning_level) }
+                  }}
+                />
+                <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.6rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>
+                  {targetStorage.usage_after_pct.toFixed(1)}%
+                </Typography>
+              </Box>
+            </Box>
+          </Box>
+
+          {/* Message de warning/erreur */}
+          {targetStorage.will_exceed ? (
+            <Box sx={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: 1,
+              p: 1,
+              bgcolor: alpha(theme.palette.error.main, 0.1),
+              borderRadius: 1
+            }}>
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'error.main' }} />
+              <Typography variant="caption" sx={{ color: 'error.main', fontWeight: 600 }}>
+                {t('drsPage.insufficientSpace')}
+              </Typography>
+            </Box>
+          ) : targetStorage.warning_level === 'critical' ? (
+            <Box sx={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: 1,
+              p: 1,
+              bgcolor: alpha(theme.palette.error.main, 0.1),
+              borderRadius: 1
+            }}>
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'error.main' }} />
+              <Typography variant="caption" sx={{ color: 'error.main', fontWeight: 600 }}>
+                {t('drsPage.storageCriticalAfter')}
+              </Typography>
+            </Box>
+          ) : targetStorage.warning_level === 'warning' ? (
+            <Box sx={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: 1,
+              p: 1,
+              bgcolor: alpha(theme.palette.warning.main, 0.1),
+              borderRadius: 1
+            }}>
+              <WarningAmberIcon sx={{ fontSize: 18, color: 'warning.main' }} />
+              <Typography variant="caption" sx={{ color: 'warning.main', fontWeight: 600 }}>
+                {t('drsPage.storageHighAfter')}
+              </Typography>
+            </Box>
+          ) : (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />
+              <Typography variant="caption" sx={{ color: 'success.main' }}>
+                {t('drsPage.spaceAvailable', { space: formatBytes(targetStorage.avail_after) })}
+              </Typography>
+            </Box>
+          )}
+        </Alert>
+      )}
+
+      {/* Message si pas d'info stockage cible (backend pas encore mis à jour) */}
+      {!targetStorage && hasLocalDisks && (
+        <Alert severity="info" icon={<StorageIcon />}>
+          {/* t.rich renders the catalogue's <strong> tag as an element and the
+              node name as text, so a hostile node name is never parsed as HTML. */}
+          <Typography variant="caption">
+            {t.rich('drsPage.checkStorageManually', { node: targetNode, strong: (chunks) => <strong>{chunks}</strong> })}
+          </Typography>
+        </Alert>
+      )}
+    </Stack>
+  )
+}
+
+// ============================================
+// HA Conflict Detection Helper
+// ============================================
+
+/**
+ * Determines if a DRS recommendation conflicts with HA group node restrictions.
+ * Returns 'conflict' only when the target node is NOT in the restricted group's allowed nodes.
+ * Returns 'none' if the VM is not HA-managed, the group is not restricted, or the target is allowed.
+ */
+function getHAConflictStatus(
+  vmid: number,
+  targetNode: string,
+  connectionId: string,
+  haDataMap: Record<string, {
+    groups: any[]
+    restrictedGroups: number
+    rules: number
+    majorVersion: number
+    haVmids: Set<number>
+    vmGroupMap: Map<number, string>
+  }> | undefined
+): 'none' | 'conflict' {
+  if (!haDataMap) return 'none'
+  const ha = haDataMap[connectionId]
+  if (!ha) return 'none'
+
+  // VM not HA-managed
+  if (!ha.haVmids.has(vmid)) return 'none'
+
+  // Get the group name assigned to this VM
+  const groupName = ha.vmGroupMap.get(vmid)
+  if (!groupName) return 'none' // no group assigned → default group, no restriction
+
+  // Find the group definition
+  const group = ha.groups.find((g: any) => g.group === groupName)
+  if (!group) return 'none'
+
+  // Group not restricted → no conflict possible
+  if (group.restricted !== 1) return 'none'
+
+  // Parse allowed nodes: format "node1:priority,node2:priority" or "node1,node2"
+  if (!group.nodes) return 'none'
+  const allowedNodes = (group.nodes as string).split(',').map((entry: string) => entry.split(':')[0].trim())
+
+  // Target node is in the allowed list → no conflict
+  if (allowedNodes.includes(targetNode)) return 'none'
+
+  return 'conflict'
+}
+
+// ============================================
+// Main Page Component
+// ============================================
+
+export default function DRSPage() {
+  const theme = useTheme()
+  const t = useTranslations()
+  const dateLocale = getDateLocale(useLocale())
+  const { isEnterprise } = useLicense()
+  const [tab, setTab] = useState(0)
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set())
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  // Why the last recommendation action did not go through, shown in a dialog.
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
+  const [selectedRec, setSelectedRec] = useState<DRSRecommendation | null>(null)
+  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: 'success' | 'warning' | 'error' }>({ open: false, message: '', severity: 'success' })
+  const [selectedCluster, setSelectedCluster] = useState<string>('')
+  const [executedRecIds, setExecutedRecIds] = useState<Set<string>>(new Set())
+  const [visibleRecCount, setVisibleRecCount] = useState(8)
+
+  const { setPageInfo } = usePageTitle()
+
+  useEffect(() => {
+    setPageInfo(t('drs.title'), t('drs.subtitle'), 'ri-loop-left-fill')
+
+return () => setPageInfo('', '', '')
+  }, [setPageInfo, t])
+  
+  // État pour la vérification de migration
+  const [migrationCheck, setMigrationCheck] = useState<MigrationCheckResult | null>(null)
+  const [migrationCheckLoading, setMigrationCheckLoading] = useState(false)
+  
+  // État pour la progression des migrations actives
+  const [migrationsProgress, setMigrationsProgress] = useState<Record<string, MigrationProgress>>({})
+
+  // Data fetching (only when Enterprise mode is active)
+  const { data: status, mutate: mutateStatus, isLoading: statusLoading } = useDRSStatus(isEnterprise)
+
+  // Already tenant-filtered by /api/v1/orchestrator/drs/status; default to
+  // empty so an older orchestrator simply renders nothing extra.
+  const pinnedGuests: PinnedGuest[] = status?.pinned_guests ?? []
+  const balancingDomains: BalancingDomain[] = status?.balancing_domains ?? []
+  const restrictedGuests: RestrictedGuest[] = status?.restricted_guests ?? []
+  const excludedGuests: ExcludedGuest[] = status?.excluded_guests ?? []
+
+  const { data: recommendationsRaw, mutate: mutateRecs, isLoading: recsLoading } = useDRSRecsHook(isEnterprise)
+
+  const recommendations: DRSRecommendation[] = (ensureArray(recommendationsRaw as any) as DRSRecommendation[])
+    .filter(r => !executedRecIds.has(r.id))
+    .filter((r, i, arr) => arr.findIndex(x => x.id === r.id) === i)
+
+  const { data: migrationsRaw, mutate: mutateMigrations, isLoading: migrationsLoading } = useDRSMigrations(isEnterprise)
+
+  const { data: allMigrationsRaw, isLoading: historyLoading } = useDRSAllMigrations(isEnterprise)
+
+  // Garder toutes les migrations non-null (useMemo pour éviter les re-renders inutiles)
+  const migrations = useMemo(() =>
+    ensureArray(migrationsRaw as any).filter((m: any) => m != null) as DRSMigration[],
+    [migrationsRaw]
+  )
+
+  // Every migration the orchestrator still holds (the last 200), for the
+  // History tab, which does its own sorting, grouping and filtering.
+  const historyMigrations = useMemo(() =>
+    ensureArray(allMigrationsRaw as any).filter((m: any) => m != null) as DRSMigration[],
+    [allMigrationsRaw]
+  )
+
+  const { data: metricsData, error: metricsError, mutate: mutateMetrics } = useDRSMetrics(isEnterprise)
+
+  const { data: drsSettings, mutate: mutateSettings } = useDRSSettings(isEnterprise)
+
+  const { data: affinityRulesRaw, mutate: mutateRules } = useDRSRules(isEnterprise)
+
+  const affinityRules: any[] = ensureArray(affinityRulesRaw as any).map((r: any) => {
+    // Parse vmids: could be an array, a JSON string (vm_ids_json), or undefined
+    let vmids = r.vmids || r.vm_ids || []
+    if (typeof vmids === 'string') {
+      try { vmids = JSON.parse(vmids) } catch { vmids = [] }
+    }
+
+    // Parse nodes: could be an array, a JSON string (nodes_json), or undefined
+    let nodes = r.nodes || []
+    if (typeof nodes === 'string') {
+      try { nodes = JSON.parse(nodes) } catch { nodes = [] }
+    }
+
+    return {
+      ...r,
+      connectionId: r.connectionId || r.connection_id,
+      vmids,
+      nodes,
+      fromTag: r.fromTag || r.from_tag || false,
+      fromPool: r.fromPool || r.from_pool || false,
+    }
+  })
+
+  // Récupérer les connexions PVE pour avoir les noms
+  const { data: connectionsData } =
+    useSWR<{ data: Connection[] }>('/api/v1/connections?type=pve', fetcher)
+  
+  // Map connectionId -> name
+  const connectionNames = useMemo(() => {
+    const map: Record<string, string> = {}
+
+    if (connectionsData?.data) {
+      connectionsData.data.forEach(c => {
+        map[c.id] = c.name
+      })
+    }
+
+    
+return map
+  }, [connectionsData])
+
+  const { data: allVMsData } =
+    useSWR<{ data: { vms: VMFromAPI[] } }>('/api/v1/vms', fetcher)
+  
+  // Extraire les VMs du format de réponse existant et les convertir pour AffinityRulesManager
+  const allVMs: AffinityVMInfo[] = useMemo(() => {
+    if (!allVMsData?.data?.vms) return []
+    
+return allVMsData.data.vms.map(vm => ({
+      vmid: Number.parseInt(vm.vmid, 10) || 0,
+      name: vm.name,
+      node: vm.node || vm.host,
+      type: vm.type,
+      connectionId: vm.connId,
+    }))
+  }, [allVMsData])
+
+  // Current guest and node statuses, for the status dots of every guest and
+  // node glyph of the page (recommendations, active migrations, drawer,
+  // History). Keyed with the connection: two clusters may both have a "pve1".
+  const historyVmStatus = useMemo(() => {
+    const map: Record<string, string> = {}
+
+    for (const vm of allVMsData?.data?.vms || []) {
+      map[`${vm.connId}:${vm.vmid}`] = vm.status
+    }
+
+    return map
+  }, [allVMsData])
+
+  const historyNodeStatus = useMemo(() => {
+    const map: Record<string, string> = {}
+
+    for (const [connId, metrics] of Object.entries((metricsData || {}) as Record<string, any>)) {
+      for (const n of (metrics?.nodes || [])) {
+        map[`${connId}:${n.node}`] = n.in_maintenance ? 'maintenance' : (n.status || 'unknown')
+      }
+    }
+
+    return map
+  }, [metricsData])
+
+  const glyphStatuses = useCallback((m: { connection_id: string; vmid: number; source_node: string; target_node: string }): GlyphStatuses => ({
+    guest: historyVmStatus[`${m.connection_id}:${m.vmid}`],
+    source: historyNodeStatus[`${m.connection_id}:${m.source_node}`],
+    target: historyNodeStatus[`${m.connection_id}:${m.target_node}`]
+  }), [historyVmStatus, historyNodeStatus])
+
+  // Computed
+  // Set of node names currently in maintenance — used to filter out bad targets
+  // Combines: orchestrator metrics (in_maintenance) + DRS settings (maintenance_nodes)
+  const maintenanceNodeNames = useMemo(() => {
+    const set = new Set<string>()
+
+    // Source 1: orchestrator metrics
+    if (metricsData) {
+      for (const [, metrics] of Object.entries(metricsData as Record<string, any>)) {
+        for (const n of (metrics?.nodes || [])) {
+          if (n.in_maintenance) set.add(n.node)
+        }
+      }
+    }
+
+    // Source 2: DRS settings maintenance_nodes list
+    if (drsSettings?.maintenance_nodes) {
+      for (const name of drsSettings.maintenance_nodes) {
+        set.add(name)
+      }
+    }
+
+    return set
+  }, [metricsData, drsSettings])
+
+  const maxPending = drsSettings?.max_pending_recommendations || 10
+
+  const allPendingRecs = useMemo(() =>
+    recommendations.filter(r =>
+      (r.status === 'pending' || r.status === 'approved') &&
+      !maintenanceNodeNames.has(r.target_node)
+    ).sort((a, b) => b.score - a.score),
+    [recommendations, maintenanceNodeNames]
+  )
+
+  // Recommendations the page already rejected on its own, never sent twice
+  const autoRejectedIds = useRef(new Set<string>())
+
+  const autoReject = useCallback((recs: DRSRecommendation[]) => {
+    const fresh = firstRejections(recs, autoRejectedIds.current)
+    fresh.forEach(rec => {
+      fetch(`/api/v1/orchestrator/drs/recommendations/${rec.id}/reject`, { method: 'POST' }).catch(() => {})
+    })
+    return fresh.length
+  }, [])
+
+  // Auto-reject excess recommendations per cluster (lowest score first),
+  // never an evacuation or a rule violation
+  useEffect(() => {
+    if (autoReject(excessRecommendations(allPendingRecs, maxPending)) === 0) return
+    // Refresh after cleanup
+    const timer = setTimeout(() => mutateRecs(), 1000)
+    return () => clearTimeout(timer)
+  }, [allPendingRecs.length, maxPending])
+
+  // Auto-reject load-balancing recommendations whose source node is no longer above cluster average,
+  // so they stay in sync with live cluster state. An evacuation or a rule violation was not raised by load.
+  useEffect(() => {
+    if (!metricsData || allPendingRecs.length === 0) return
+    const rejected = autoReject(staleRecommendations(allPendingRecs, metricsData as any))
+    if (rejected === 0) return
+    console.log(`[DRS] Auto-rejecting ${rejected} stale recommendation(s) — source node(s) no longer above cluster average`)
+    const timer = setTimeout(() => mutateRecs(), 1000)
+    return () => clearTimeout(timer)
+  }, [allPendingRecs, metricsData])
+
+  // Limit per cluster, every evacuation and rule violation shown
+  const pendingRecs = useMemo(() => keptRecommendations(allPendingRecs, maxPending), [allPendingRecs, maxPending])
+
+  // Group recommendations by cluster for display
+  const pendingRecsByCluster = useMemo(() => {
+    const grouped = new Map()
+    for (const rec of pendingRecs) {
+      const cid = rec.connection_id
+      if (!grouped.has(cid)) grouped.set(cid, [])
+      grouped.get(cid).push(rec)
+    }
+    return Array.from(grouped.entries()) as [string, DRSRecommendation[]][]
+  }, [pendingRecs])
+
+  const clusters = useMemo(() => {
+    if (!metricsData) return []
+    
+return Object.entries(metricsData as any)
+
+      // Filtrer pour ne garder que les vrais clusters (plus d'un nœud)
+      .filter(([_, metrics]: [string, any]) => (metrics.nodes?.length || 0) > 1)
+      .map(([id, metrics]: [string, any]) => ({
+        id,
+        name: connectionNames[id] || metrics.connection_name || id.slice(0, 12),
+        metrics,
+        recommendations: pendingRecs.filter(r => r.connection_id === id)
+      }))
+  }, [metricsData, pendingRecs, connectionNames])
+
+  // Cluster versions for PSI support check
+  // All nodes list
+  const allNodes = useMemo(() => {
+    return clusters.flatMap(c => c.metrics.nodes?.map(n => n.node) || [])
+  }, [clusters])
+
+  // Set default selected cluster
+  useEffect(() => {
+    if (clusters.length > 0 && !selectedCluster) {
+      setSelectedCluster(clusters[0].id)
+    }
+  }, [clusters, selectedCluster])
+
+  // All clusters collapsed by default — no auto-expand
+
+  // Detect PVE HA groups / affinity rules that may conflict with DRS
+  const clusterIds = useMemo(() => clusters.map(c => c.id).sort((a, b) => a.localeCompare(b)).join(','), [clusters])
+
+  const { data: haDataMap } = useSWR(
+    clusterIds ? `ha-check:${clusterIds}` : null,
+    async () => {
+      const results: Record<string, {
+        groups: any[]
+        restrictedGroups: number
+        rules: number
+        majorVersion: number
+        haVmids: Set<number>
+        vmGroupMap: Map<number, string>
+      }> = {}
+      await Promise.all(clusters.map(async (c) => {
+        try {
+          const res = await fetch(`/api/v1/connections/${c.id}/ha`)
+          if (!res.ok) return
+          const { data } = await res.json()
+          const groups = data?.groups || []
+          // Count groups that have node restrictions (restricted flag or limited node list)
+          const restrictedGroups = groups.filter((g: any) =>
+            g.restricted === 1 || (g.nodes && g.nodes.split(',').length > 0 && g.nodes.split(',').length < 99)
+          ).length
+          // Build set of HA-managed VMIDs and map VMID -> group name
+          const haVmids = new Set<number>()
+          const vmGroupMap = new Map<number, string>()
+          for (const r of (data?.resources || [])) {
+            // sid format: "vm:100" or "ct:200"
+            const match = r.sid?.match(/^(?:vm|ct):(\d+)$/)
+            if (match) {
+              const vmid = Number.parseInt(match[1], 10)
+              haVmids.add(vmid)
+              if (r.group) vmGroupMap.set(vmid, r.group)
+            }
+          }
+          results[c.id] = {
+            groups,
+            restrictedGroups,
+            rules: data?.rules?.length || 0,
+            majorVersion: data?.majorVersion || 8,
+            haVmids,
+            vmGroupMap,
+          }
+        } catch { /* ignore */ }
+      }))
+      return results
+    },
+    { revalidateOnFocus: false }
+  )
+
+  // Warn for PVE 9+ clusters with native affinity rules AND PVE 8 clusters with restricted HA groups
+  const haWarnings = useMemo(() => {
+    if (!haDataMap) return []
+    const warnings: { clusterId: string; clusterName: string; majorVersion: number; restrictedGroups: number; rules: number }[] = []
+    for (const c of clusters) {
+      const ha = haDataMap[c.id]
+      if (!ha) continue
+      const hasConflict = (ha.majorVersion >= 9 && ha.rules > 0) || ha.restrictedGroups > 0
+      if (hasConflict) {
+        warnings.push({ clusterId: c.id, clusterName: c.name, majorVersion: ha.majorVersion, restrictedGroups: ha.restrictedGroups, rules: ha.rules })
+      }
+    }
+    return warnings
+  }, [haDataMap, clusters])
+
+  // Récupérer la progression des migrations actives
+  const activeMigrations = useMemo(() =>
+    migrations.filter(m => m.status === 'running'),
+    [migrations]
+  )
+
+  // IDs des migrations actives (string stable pour la dépendance)
+  const activeMigrationIds = useMemo(() =>
+    activeMigrations.map(m => m.id).sort((a, b) => a.localeCompare(b)).join(','),
+    [activeMigrations]
+  )
+
+  // Effet pour mettre à jour la progression des migrations actives
+  useEffect(() => {
+    if (!activeMigrationIds) {
+      // Seulement réinitialiser si l'objet n'est pas déjà vide
+      setMigrationsProgress(prev => {
+        if (Object.keys(prev).length === 0) return prev
+        return {}
+      })
+      return
+    }
+
+    const migrationIds = activeMigrationIds.split(',')
+
+    // Fonction pour récupérer la progression d'une migration
+    let needsRefresh = false
+    const fetchProgress = async (migrationId: string) => {
+      try {
+        const res = await fetch(`/api/v1/orchestrator/drs/migrations/${migrationId}/progress`)
+
+        if (res.ok) {
+          const data = await res.json()
+
+          setMigrationsProgress(prev => ({ ...prev, [migrationId]: data }))
+
+          // If progress shows task is done, trigger a migrations list refresh
+          // so the "running" migration gets updated to completed/failed
+          if (data.progress >= 100 || data.status === 'stopped') {
+            needsRefresh = true
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching migration progress:', err)
+      }
+    }
+
+    // Récupérer la progression de toutes les migrations actives
+    const fetchAll = async () => {
+      needsRefresh = false
+      await Promise.all(migrationIds.map(id => fetchProgress(id)))
+      if (needsRefresh) void mutateMigrations()
+    }
+
+    void fetchAll()
+
+    // Rafraîchir toutes les 2 secondes
+    const interval = setInterval(fetchAll, 2000)
+
+    return () => clearInterval(interval)
+  }, [activeMigrationIds])
+
+  // Fonction pour vérifier la migration quand on ouvre le drawer
+  const checkMigration = useCallback(async (rec: DRSRecommendation) => {
+    setMigrationCheckLoading(true)
+    setMigrationCheck(null)
+    
+    try {
+      const guestType = rec.guest_type || 'qemu'
+
+      // Inclure le nœud cible pour vérifier l'espace disponible
+      const url = `/api/v1/orchestrator/drs/check-migration/${rec.vmid}?connection_id=${rec.connection_id}&node=${rec.source_node}&target_node=${rec.target_node}&type=${guestType}`
+      const res = await fetch(url)
+      
+      if (res.ok) {
+        const data = await res.json()
+
+        setMigrationCheck(data)
+      } else {
+        console.error('Failed to check migration:', res.status, res.statusText)
+      }
+    } catch (err) {
+      console.error('Error checking migration:', err)
+    } finally {
+      setMigrationCheckLoading(false)
+    }
+  }, [])
+
+  // Handlers
+  const toggleCluster = (id: string) => {
+    setExpandedClusters(prev => {
+      const next = new Set(prev)
+
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+
+      
+return next
+    })
+  }
+
+  const handleRefresh = useCallback(async () => {
+    await Promise.all([mutateStatus(), mutateRecs(), mutateMigrations(), mutateMetrics()])
+  }, [mutateStatus, mutateRecs, mutateMigrations, mutateMetrics])
+
+  const handleTriggerEvaluation = useCallback(async () => {
+    try {
+      setActionLoading('evaluate')
+      await apiAction('/api/v1/orchestrator/drs/evaluate', 'POST')
+      await new Promise(r => setTimeout(r, 2000))
+      await Promise.all([mutateRecs(), mutateMetrics()])
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setActionLoading(null)
+    }
+  }, [mutateRecs, mutateMetrics])
+
+  const handleEnforceRule = useCallback(async (ruleId: string) => {
+    try {
+      setActionLoading('enforce-rules')
+      const result = await apiAction(`/api/v1/orchestrator/drs/rules/${ruleId}/enforce`, 'POST')
+      if (result.violations_found === 0) {
+        setSnackbar({ open: true, message: t('drsPage.enforceRulesNoViolation'), severity: 'success' })
+      } else {
+        setSnackbar({
+          open: true,
+          message: t('drsPage.enforceRulesSuccess', { violations: result.violations_found, migrations: result.migrations_started }),
+          severity: result.migrations_started > 0 ? 'warning' : 'success'
+        })
+      }
+      await mutateRecs()
+    } catch (e) {
+      console.error(e)
+      setSnackbar({ open: true, message: String(e), severity: 'error' })
+    } finally {
+      setActionLoading(null)
+    }
+  }, [mutateRecs, t])
+
+  const openRecommendation = useCallback(async (rec: DRSRecommendation) => {
+    setSelectedRec(rec)
+    setDrawerOpen(true)
+
+    // Lancer la vérification de migration
+    void checkMigration(rec)
+
+    // Valider que la recommandation est toujours valide (VM toujours sur le bon nœud)
+    // Ne pas appeler mutateRecs ici — ça provoquerait un flash "clusters équilibrés"
+    // si la validation retourne moins de recs (stale). Le SWR auto-refresh s'en charge.
+    try {
+      const res = await fetch(`/api/v1/orchestrator/drs/recommendations?validate=true`)
+      const validated = await res.json()
+      const updatedRec = Array.isArray(validated) ? validated.find((r: DRSRecommendation) => r.id === rec.id) : null
+
+      if (updatedRec) {
+        setSelectedRec(updatedRec)
+      }
+    } catch (e) {
+      console.error('Error validating recommendation:', e)
+    }
+  }, [checkMigration])
+
+  const handleRecommendationAction = useCallback(async (id: string, action: 'approve' | 'reject' | 'execute') => {
+    try {
+      setActionLoading(`${action}-${id}`)
+      await apiAction(`/api/v1/orchestrator/drs/recommendations/${id}/${action}`, 'POST')
+
+      if (action === 'execute') {
+        // Track executed recommendation so it stays hidden even after SWR revalidation
+        setExecutedRecIds(prev => new Set(prev).add(id))
+
+        await mutateMigrations()
+        setDrawerOpen(false)
+        setSelectedRec(null)
+
+        // Re-evaluate after migration — cluster balance has changed, old recs may be stale
+        setTimeout(async () => {
+          try {
+            await fetch('/api/v1/orchestrator/drs/evaluate', { method: 'POST' })
+            setTimeout(() => mutateRecs(), 3000)
+          } catch {}
+        }, 5000)
+      } else {
+        // For approve/reject, refresh with validation
+        const res = await fetch(`/api/v1/orchestrator/drs/recommendations?validate=true`)
+        const validated = await res.json()
+        void mutateRecs(validated, false)
+        setDrawerOpen(false)
+      }
+    } catch (e: any) {
+      // Expected outcomes (moved guest, refusal): shown in the notice dialog
+      console.warn('Recommendation action not applied:', e)
+
+      // Gérer les différents cas d'erreur
+      const errorMsg = e.message || ''
+      
+      if (errorMsg.includes('has moved') || errorMsg.includes('stale') || errorMsg.includes('does not exist') || errorMsg.includes('Configuration file')) {
+        // VM a bougé ou n'existe plus sur le nœud source
+        setDrawerOpen(false)
+        setSelectedRec(null)
+
+        // Rafraîchir avec validation
+        const res = await fetch(`/api/v1/orchestrator/drs/recommendations?validate=true`)
+        const validated = await res.json()
+
+        void mutateRecs(validated, false)
+        setActionNotice(t('drsPage.vmMovedAlert'))
+      } else if (errorMsg.includes('404') || errorMsg.includes('not found') || errorMsg.includes('Recommendation not found')) {
+        // Recommandation n'existe plus
+        setDrawerOpen(false)
+        setSelectedRec(null)
+        await mutateRecs()
+        setActionNotice(t('drsPage.recommendationExpiredAlert'))
+      } else if (errorMsg.includes('already on target')) {
+        // VM déjà sur la cible
+        setDrawerOpen(false)
+        setSelectedRec(null)
+        const res = await fetch(`/api/v1/orchestrator/drs/recommendations?validate=true`)
+        const validated = await res.json()
+
+        void mutateRecs(validated, false)
+        setActionNotice(t('drsPage.vmAlreadyOnTargetAlert'))
+      } else {
+        // Any other refusal (rolling update in progress, node being drained,
+        // placement, too many migrations): say why rather than nothing.
+        setDrawerOpen(false)
+        setSelectedRec(null)
+        await mutateRecs()
+        setActionNotice(errorMsg)
+      }
+    } finally {
+      setActionLoading(null)
+    }
+  }, [mutateRecs, mutateMigrations])
+
+  const handleExecuteAll = useCallback(async () => {
+    setActionLoading('execute-all')
+    try {
+      for (const rec of pendingRecs) {
+        try {
+          await apiAction(`/api/v1/orchestrator/drs/recommendations/${rec.id}/execute`, 'POST')
+          setExecutedRecIds(prev => new Set(prev).add(rec.id))
+        } catch {
+          // Skip stale/moved/already-on-target — continue with next
+        }
+      }
+      await mutateMigrations()
+      await mutateRecs()
+    } finally {
+      setActionLoading(null)
+    }
+  }, [pendingRecs, mutateMigrations, mutateRecs])
+
+  const handleClearRecs = useCallback(async () => {
+    setActionLoading('clear-recs')
+    try {
+      for (const rec of pendingRecs) {
+        try {
+          await apiAction(`/api/v1/orchestrator/drs/recommendations/${rec.id}/reject`, 'POST')
+        } catch {}
+      }
+      await mutateRecs()
+    } finally {
+      setActionLoading(null)
+    }
+  }, [pendingRecs, mutateRecs])
+
+  // Fermer le drawer et nettoyer
+  const handleCloseDrawer = useCallback(() => {
+    setDrawerOpen(false)
+    setMigrationCheck(null)
+    setSelectedRec(null)
+  }, [])
+
+  // Settings handlers
+  const handleSaveSettings = useCallback(async (settings: DRSSettings) => {
+    // Strip DRS knobs the engine ignores (backend "DEAD KNOBS"): sending them is
+    // a no-op and makes the backend log a warning for each. The settings object
+    // is hydrated from GET, so it can carry these even when no UI control sets them.
+    const DEAD_KNOBS = ['balancing_method', 'balancing_mode', 'maintenance_nodes', 'ignore_nodes', 'storage_high_threshold', 'balance_larger_first']
+    const body = Object.fromEntries(Object.entries(settings).filter(([k]) => !DEAD_KNOBS.includes(k)))
+    await apiAction('/api/v1/orchestrator/drs/settings', 'PUT', body)
+    await mutateSettings()
+  }, [mutateSettings])
+
+  // Affinity rules handlers
+  const handleCreateRule = useCallback(async (rule: Omit<AffinityRule, 'id'>) => {
+    await apiAction('/api/v1/orchestrator/drs/rules', 'POST', rule)
+    await mutateRules()
+  }, [mutateRules])
+
+  const handleUpdateRule = useCallback(async (id: string, rule: Partial<AffinityRule>) => {
+    await apiAction(`/api/v1/orchestrator/drs/rules/${id}`, 'PUT', rule)
+    await mutateRules()
+  }, [mutateRules])
+
+  const handleDeleteRule = useCallback(async (id: string) => {
+    await apiAction(`/api/v1/orchestrator/drs/rules/${id}`, 'DELETE')
+    await mutateRules()
+  }, [mutateRules])
+
+  // Stats globales
+  const globalStats = useMemo(() => {
+    const allNodesArr = clusters.flatMap(c => c.metrics.nodes || [])
+    const totalVMs = clusters.reduce((acc, c) => acc + (c.metrics.summary?.running_vms || 0), 0)
+
+    // Compute weighted health score across all clusters with breakdown
+    let healthSum = 0
+    let clusterCount = 0
+    let maxImbalance = 0
+    let totalMemPenalty = 0, totalCpuPenalty = 0, totalImbalancePenalty = 0
+    let totalMemSpreadPenalty = 0, totalCpuSpreadPenalty = 0
+    let avgMemAll = 0, avgCpuAll = 0, avgImbalanceAll = 0
+    let avgMemSpreadAll = 0, avgCpuSpreadAll = 0
+    for (const c of clusters) {
+      const b = computeDrsHealthScore(c.metrics?.summary, c.metrics?.nodes)
+      healthSum += b.score
+      totalMemPenalty += b.memPenalty
+      totalCpuPenalty += b.cpuPenalty
+      totalImbalancePenalty += b.imbalancePenalty
+      totalMemSpreadPenalty += b.memSpreadPenalty
+      totalCpuSpreadPenalty += b.cpuSpreadPenalty
+      avgMemAll += b.avgMem
+      avgCpuAll += b.avgCpu
+      avgImbalanceAll += b.imbalance
+      avgMemSpreadAll += b.memSpread
+      avgCpuSpreadAll += b.cpuSpread
+      clusterCount++
+      if (b.imbalance > maxImbalance) maxImbalance = b.imbalance
+    }
+
+    return {
+      clusters: clusters.length,
+      nodes: allNodesArr.length,
+      vms: totalVMs,
+      recommendations: pendingRecs.length,
+      migrations: migrations.filter(m => m.status === 'running').length,
+      healthScore: clusterCount > 0 ? Math.round(healthSum / clusterCount) : 100,
+      maxImbalance,
+      breakdown: clusterCount > 0 ? {
+        avgMem: avgMemAll / clusterCount,
+        memPenalty: Math.round(totalMemPenalty / clusterCount),
+        avgCpu: avgCpuAll / clusterCount,
+        cpuPenalty: Math.round(totalCpuPenalty / clusterCount),
+        imbalance: avgImbalanceAll / clusterCount,
+        imbalancePenalty: Math.round(totalImbalancePenalty / clusterCount),
+        memSpread: avgMemSpreadAll / clusterCount,
+        memSpreadPenalty: Math.round(totalMemSpreadPenalty / clusterCount),
+        cpuSpread: avgCpuSpreadAll / clusterCount,
+        cpuSpreadPenalty: Math.round(totalCpuSpreadPenalty / clusterCount),
+      } : null,
+    }
+  }, [clusters, pendingRecs, migrations])
+
+  const lineColors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#14b8a6']
+
+  // Bar chart data: per-node RAM and CPU from live metrics, grouped by cluster.
+  // Node names repeat across clusters, so each bar is keyed by cluster and node.
+  const nodeBarData = useMemo(() => {
+    return clusters.flatMap((c, ci) =>
+      (c.metrics?.nodes || []).map((n: NodeMetrics) => ({
+        key: `${c.id}:${n.node}`,
+        name: n.node,
+        RAM: Math.round(n.memory_usage * 10) / 10,
+        CPU: Math.round(n.cpu_usage * 10) / 10,
+        clusterName: c.name,
+        clusterIdx: ci,
+      }))
+    )
+  }, [clusters])
+
+  // Width of the bar chart, to decide whether node names fit side by side
+  const [nodeChartWidth, setNodeChartWidth] = useState(0)
+  const nodeChartObserver = useRef<ResizeObserver | null>(null)
+
+  const nodeChartRef = useCallback((el: HTMLDivElement | null) => {
+    nodeChartObserver.current?.disconnect()
+    nodeChartObserver.current = null
+    if (!el) return
+    setNodeChartWidth(el.getBoundingClientRect().width)
+    if (typeof ResizeObserver === 'undefined') return
+    nodeChartObserver.current = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect.width
+
+      if (w) setNodeChartWidth(w)
+    })
+    nodeChartObserver.current.observe(el)
+  }, [])
+
+  const measureNodeLabel = useMemo(
+    () => createTextMeasurer(`${NODE_AXIS_FONT_SIZE}px ${theme.typography.fontFamily}`),
+    [theme.typography.fontFamily]
+  )
+
+  // Y axis (40px) and right margin (8px) are not part of the bar area
+  const nodeAxisLayout = useMemo(
+    () => computeNodeAxisLayout(nodeBarData.map(d => measureNodeLabel(d.name)), nodeChartWidth - 48, 40),
+    [nodeBarData, nodeChartWidth, measureNodeLabel]
+  )
+
+  // The level DRS balances each cluster towards, shown in the chart tooltip
+  const clusterAverages = useMemo(() => clusters.map(c => ({
+    RAM: c.metrics?.summary?.avg_memory_usage ?? 0,
+    CPU: c.metrics?.summary?.avg_cpu_usage ?? 0
+  })), [clusters])
+
+  const metricsLoading = !metricsData && !metricsError
+
+  // From a cluster card to its own recommendations
+  const showClusterRecommendations = useCallback((clusterId?: string) => {
+    setTab(1)
+
+    if (!clusterId) return
+    setTimeout(() => {
+      document.getElementById(`drs-recs-${clusterId}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, 150)
+  }, [])
+
+  return (
+    <ProviderTenantGuard>
+    <EnterpriseGuard requiredFeature={Features.DRS} featureName={`${t('drs.title')} (${t('drs.subtitle')})`}>
+      <Box sx={{ p: 3 }}>
+      {/* Tabs */}
+      <Tabs
+        value={tab}
+        onChange={(_, v) => setTab(v)}
+        variant="scrollable"
+        scrollButtons="auto"
+        sx={{
+          mb: 3,
+          borderBottom: 1,
+          borderColor: 'divider',
+          '& .MuiTab-root': { textTransform: 'none', fontSize: 13, minHeight: 48 },
+          '& .MuiTab-iconWrapper': { fontSize: 18, mr: 1 }
+        }}
+      >
+        <Tab icon={<i className="ri-bar-chart-2-line" />} iconPosition="start" label={t('drsPage.clustersTab')} />
+        <Tab
+          icon={<i className="ri-arrow-left-right-line" />}
+          iconPosition="start"
+          label={
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              {t('drsPage.recommendationsTab')}
+              {activeMigrations.length > 0 && (
+                <Chip size="small" label={activeMigrations.length} color="info" sx={{ height: 20, minWidth: 20, fontSize: 11, fontWeight: 700 }} />
+              )}
+              {pendingRecs.length > 0 && (
+                <Chip size="small" label={pendingRecs.length} color="warning" sx={{ height: 20, minWidth: 20, fontSize: 11, fontWeight: 700 }} />
+              )}
+            </Box>
+          }
+        />
+        <Tab icon={<i className="ri-history-line" />} iconPosition="start" label={t('drsPage.history')} />
+        <Tab icon={<i className="ri-price-tag-3-line" />} iconPosition="start" label={t('drsPage.affinity')} />
+        <Tab icon={<i className="ri-settings-3-line" />} iconPosition="start" label={t('drsPage.configuration')} />
+      </Tabs>
+
+      {/* Tab: Load Overview */}
+      {/* While the first metrics load, the layout's shape rather than an empty verdict */}
+      {tab === 0 && metricsLoading && (
+        <Stack spacing={2} aria-busy="true">
+          <Card variant="outlined">
+            <CardContent sx={{ py: 2, '&:last-child': { pb: 2 } }}>
+              <Skeleton variant="text" width={180} height={28} />
+              <Skeleton variant="text" width={240} height={18} />
+              <Divider sx={{ my: 2 }} />
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'auto 1fr' }, gap: 3, alignItems: 'center' }}>
+                <Skeleton variant="circular" width={80} height={80} sx={{ mx: 'auto' }} />
+                <Skeleton variant="rounded" height={200} />
+              </Box>
+            </CardContent>
+          </Card>
+          {[0, 1].map(i => <Skeleton key={i} variant="rounded" height={66} />)}
+        </Stack>
+      )}
+
+      {tab === 0 && !metricsLoading && (
+        <Stack spacing={2}>
+          {/* DRS Health Banner */}
+          <Card variant="outlined">
+            <CardContent sx={{ py: 2, '&:last-child': { pb: 2 } }}>
+              {/* Top: Title + badges + stats */}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 2 }}>
+                <Box sx={{ minWidth: 0 }}>
+                  <Stack direction="row" alignItems="center" gap={1.5} flexWrap="wrap">
+                    <Typography variant="h6" fontWeight={600} noWrap>{t('drsPage.drsHealth')}</Typography>
+                    {globalStats.recommendations > 0 && (
+                      <Stack
+                        direction="row"
+                        alignItems="center"
+                        spacing={0.5}
+                        component="button"
+                        type="button"
+                        title={t('drsPage.showRecommendations')}
+                        onClick={() => showClusterRecommendations()}
+                        sx={{
+                          bgcolor: alpha(theme.palette.warning.main, 0.1),
+                          px: 1,
+                          py: 0.25,
+                          borderRadius: 1,
+                          border: 'none',
+                          font: 'inherit',
+                          cursor: 'pointer',
+                          '&:hover': { bgcolor: alpha(theme.palette.warning.main, 0.2) },
+                          '&:focus-visible': { outline: `2px solid ${theme.palette.warning.main}`, outlineOffset: 1 }
+                        }}
+                      >
+                        <i className="ri-alarm-warning-line" style={{ fontSize: 13, color: theme.palette.warning.main }} />
+                        <Typography variant="caption" fontWeight={600} sx={{ color: 'warning.main', fontSize: 11 }}>
+                          {t('drsPage.recShort', { count: globalStats.recommendations })}
+                        </Typography>
+                      </Stack>
+                    )}
+                    {globalStats.migrations > 0 && (
+                      <Stack direction="row" alignItems="center" spacing={0.5} sx={{ bgcolor: alpha(theme.palette.info.main, 0.1), px: 1, py: 0.25, borderRadius: 1 }}>
+                        <i className="ri-swap-box-line" style={{ fontSize: 13, color: theme.palette.info.main }} />
+                        <Typography variant="caption" fontWeight={600} sx={{ color: 'info.main', fontSize: 11 }}>
+                          {t('drsPage.migShort', { count: globalStats.migrations })}
+                        </Typography>
+                      </Stack>
+                    )}
+                  </Stack>
+                  <Stack direction="row" flexWrap="wrap" gap={1.5} sx={{ mt: 0.5 }}>
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                      <i className="ri-server-line" style={{ fontSize: 13, marginRight: 4, verticalAlign: 'middle' }} />
+                      {globalStats.clusters} {t('drsPage.clustersLabel')}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                      <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={12} height={12} style={{ marginRight: 4, verticalAlign: 'middle', opacity: 0.8 }} />
+                      {globalStats.nodes} {t('drsPage.nodesLabel')}
+                    </Typography>
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                      <i className="ri-play-fill" style={{ fontSize: 13, marginRight: 4, verticalAlign: 'middle', color: theme.palette.success.main }} />
+                      {globalStats.vms} VMs
+                    </Typography>
+                  </Stack>
+                </Box>
+                <Stack direction="row" alignItems="center" spacing={2}>
+                  <Stack spacing={0.75} sx={{ width: 200 }}>
+                    {clusters.slice(0, 4).map((c, i) => {
+                      const avgRam = c.metrics?.summary?.avg_memory_usage ?? 0
+                      return (
+                        <Tooltip key={c.id} title={`${c.name} · ${t('drsPage.clusterAverage')} RAM ${avgRam.toFixed(1)}%`} arrow placement="left">
+                          <Stack direction="row" alignItems="center" spacing={0.75}>
+                            <Typography variant="caption" sx={{ width: 84, flexShrink: 0, color: 'text.secondary', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name}</Typography>
+                            <Box sx={{ flex: 1, height: 6, borderRadius: 3, bgcolor: theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)', overflow: 'hidden' }}>
+                              <Box sx={{ width: `${Math.min(100, avgRam)}%`, height: '100%', bgcolor: lineColors[i % lineColors.length], borderRadius: 3 }} />
+                            </Box>
+                            <Typography variant="caption" fontWeight={600} sx={{ minWidth: 32, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{avgRam.toFixed(0)}%</Typography>
+                          </Stack>
+                        </Tooltip>
+                      )
+                    })}
+                  </Stack>
+                  <Tooltip title={t('drsPage.evaluate')} arrow>
+                    <span>
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        onClick={handleTriggerEvaluation}
+                        disabled={!!actionLoading}
+                        sx={actionLoading === 'evaluate' ? {
+                          '@keyframes drsEvalSpin': { to: { transform: 'rotate(360deg)' } },
+                          '& i': { animation: 'drsEvalSpin 0.9s linear infinite' },
+                        } : undefined}
+                      >
+                        <RefreshIcon />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </Stack>
+              </Box>
+
+              <Divider sx={{ my: 2 }} />
+
+              {/* Bottom: Score donut + Bar chart side by side */}
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'auto 1fr' }, gap: 3, alignItems: 'center' }}>
+                {/* Score Ring */}
+                {(() => {
+                  const scoreColor = globalStats.healthScore >= 85 ? theme.palette.success.main
+                    : globalStats.healthScore >= 60 ? theme.palette.warning.main
+                    : theme.palette.error.main
+                  const circumference = 2 * Math.PI * 14
+                  const dashLen = (globalStats.healthScore / 100) * circumference
+                  return (
+                    <Tooltip title={globalStats.breakdown ? (
+                      <Box sx={{ fontSize: '0.75rem' }}>
+                        <Typography variant="caption" sx={{ fontWeight: 700, display: 'block', mb: 0.5 }}>{t('drsPage.scoreCalculation')}</Typography>
+                        <Box>RAM {Math.round(globalStats.breakdown.avgMem)}% → {globalStats.breakdown.memPenalty === 0 ? 'OK' : globalStats.breakdown.memPenalty} pts</Box>
+                        <Box>CPU {Math.round(globalStats.breakdown.avgCpu)}% → {globalStats.breakdown.cpuPenalty === 0 ? 'OK' : globalStats.breakdown.cpuPenalty} pts</Box>
+                        <Box>{t('drsPage.imbalanceLabel')} {globalStats.breakdown.imbalance.toFixed(1)}% → {globalStats.breakdown.imbalancePenalty === 0 ? 'OK' : globalStats.breakdown.imbalancePenalty} pts</Box>
+                        <Divider sx={{ my: 0.5, borderColor: 'rgba(255,255,255,0.2)' }} />
+                        <Box sx={{ fontWeight: 600 }}>{t('drsPage.scoreFormula')}</Box>
+                      </Box>
+                    ) : ''} arrow placement="right">
+                      <Stack alignItems="center" spacing={0.5} sx={{ cursor: 'help' }}>
+                        <Box sx={{ position: 'relative', width: 80, height: 80, flexShrink: 0 }}>
+                          <svg viewBox="0 0 36 36" style={{ width: '100%', height: '100%', transform: 'rotate(-90deg)' }}>
+                            <circle cx="18" cy="18" r="14" fill="none" stroke={theme.palette.divider} strokeWidth="2.5" opacity={0.3} />
+                            <circle cx="18" cy="18" r="14" fill="none" stroke={scoreColor} strokeWidth="2.5"
+                              strokeDasharray={`${dashLen} ${circumference}`} strokeLinecap="round"
+                              style={{ transition: 'stroke-dasharray 0.6s ease' }} />
+                          </svg>
+                          <Box sx={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Typography sx={{ fontWeight: 700, fontSize: 20, color: scoreColor }}>{globalStats.healthScore}</Typography>
+                          </Box>
+                        </Box>
+                        <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center', maxWidth: 96 }}>{t('drsPage.healthScore')}</Typography>
+                      </Stack>
+                    </Tooltip>
+                  )
+                })()}
+
+                {/* Bar chart */}
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="caption" fontWeight={600} sx={{ color: 'text.secondary', mb: 1, display: 'block' }}>
+                    {t('drsPage.cpuRamPerNode')}
+                  </Typography>
+                  {nodeBarData.length > 0 ? (
+                    <>
+                      <Box ref={nodeChartRef} sx={{ height: 170 + nodeAxisLayout.height }}>
+                        <ChartContainer>
+                          <BarChart data={nodeBarData} barCategoryGap="20%" barGap={2} margin={{ top: 8, right: 8, bottom: 0, left: nodeAxisLayout.mode === 'tilted' ? nodeAxisLayout.leftPad : 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={theme.palette.divider} vertical={false} />
+                            <XAxis
+                              dataKey="key"
+                              interval={0}
+                              height={nodeAxisLayout.height}
+                              tickLine={false}
+                              axisLine={{ stroke: theme.palette.divider }}
+                              tick={(props: XAxisTickContentProps) => {
+                                const x = Number(props.x)
+                                const y = Number(props.y)
+                                const { payload } = props
+                                const key = String(payload.value)
+                                const name = key.slice(key.indexOf(':') + 1)
+                                const common = { fontSize: NODE_AXIS_FONT_SIZE, fill: theme.palette.text.secondary }
+
+                                if (nodeAxisLayout.mode === 'hidden') return <g />
+                                if (nodeAxisLayout.mode === 'horizontal') {
+                                  return <text x={x} y={y + 4} dy="0.71em" textAnchor="middle" {...common}>{name}</text>
+                                }
+
+                                const label = truncateToWidth(name, nodeAxisLayout.maxLabelWidth, measureNodeLabel)
+
+                                return (
+                                  <text x={x} y={y + 4} dy="0.71em" textAnchor="end" transform={`rotate(${NODE_AXIS_ANGLE}, ${x}, ${y + 4})`} {...common}>
+                                    {label !== name && <title>{name}</title>}
+                                    {label}
+                                  </text>
+                                )
+                              }}
+                            />
+                            <YAxis domain={[0, 100]} ticks={[0, 25, 50, 75, 100]} tickFormatter={v => `${v}%`} tick={{ fontSize: 10, fill: theme.palette.text.secondary }} axisLine={false} tickLine={false} width={40} />
+                            <RechartsTooltip
+                              cursor={false}
+                              wrapperStyle={{ backgroundColor: 'transparent', boxShadow: 'none' }}
+                              content={({ active, payload }) => {
+                                if (!active || !payload?.[0]) return null
+                                const d = payload[0].payload
+                                const avg = clusterAverages[d.clusterIdx]
+                                return (
+                                  <Box sx={{ bgcolor: 'background.paper', border: 1, borderColor: 'divider', borderRadius: 2, px: 1.5, py: 1, fontSize: 11, color: 'text.primary' }}>
+                                    <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mb: 0.5 }}>
+                                      <img src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'} alt="" width={14} height={14} style={{ opacity: 0.8 }} />
+                                      <span style={{ fontWeight: 600 }}>{d.name}</span>
+                                      <span style={{ color: theme.palette.text.secondary }}>· {d.clusterName}</span>
+                                    </Stack>
+                                    {(['CPU', 'RAM'] as const).map(m => (
+                                      <Box key={m} sx={{ display: 'grid', gridTemplateColumns: '32px 48px auto', alignItems: 'baseline', fontVariantNumeric: 'tabular-nums' }}>
+                                        <span style={{ color: theme.palette.text.secondary }}>{m}</span>
+                                        <span style={{ fontWeight: 600, textAlign: 'right' }}>{d[m].toFixed(1)}%</span>
+                                        {avg && (
+                                          <span style={{ color: theme.palette.text.secondary, paddingLeft: 8 }}>
+                                            {t('drsPage.clusterAverage')} {avg[m].toFixed(1)}%
+                                          </span>
+                                        )}
+                                      </Box>
+                                    ))}
+                                  </Box>
+                                )
+                              }}
+                            />
+                            {/* CPU and RAM side by side: same cluster hue, CPU lighter */}
+                            <Bar dataKey="CPU" radius={[3, 3, 0, 0]} maxBarSize={28} isAnimationActive={false}>
+                              {nodeBarData.map((entry, idx) => (
+                                <Cell key={idx} fill={lineColors[entry.clusterIdx % lineColors.length]} fillOpacity={0.4} />
+                              ))}
+                            </Bar>
+                            <Bar dataKey="RAM" radius={[3, 3, 0, 0]} maxBarSize={28} isAnimationActive={false}>
+                              {nodeBarData.map((entry, idx) => (
+                                <Cell key={idx} fill={lineColors[entry.clusterIdx % lineColors.length]} fillOpacity={0.9} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ChartContainer>
+                      </Box>
+                      <Stack direction="row" columnGap={2} rowGap={0.5} justifyContent="center" flexWrap="wrap" sx={{ mt: 1 }}>
+                        {clusters.length > 1 && clusters.map((c, i) => (
+                          <Stack key={c.id} direction="row" alignItems="center" spacing={0.5}>
+                            <Box sx={{ width: 10, height: 10, bgcolor: lineColors[i % lineColors.length], borderRadius: 0.5 }} />
+                            <Typography variant="caption" sx={{ color: 'text.secondary' }}>{c.name}</Typography>
+                          </Stack>
+                        ))}
+                        <Stack direction="row" alignItems="center" spacing={0.5}>
+                          <Box sx={{ width: 10, height: 10, bgcolor: 'text.secondary', opacity: 0.4, borderRadius: 0.5 }} />
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }}>CPU</Typography>
+                        </Stack>
+                        <Stack direction="row" alignItems="center" spacing={0.5}>
+                          <Box sx={{ width: 10, height: 10, bgcolor: 'text.secondary', borderRadius: 0.5 }} />
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }}>RAM</Typography>
+                        </Stack>
+                      </Stack>
+                    </>
+                  ) : (
+                    <Box sx={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Typography variant="caption" sx={{ color: 'text.secondary' }}>{t('drsPage.noClusterConnected')}</Typography>
+                    </Box>
+                  )}
+                </Box>
+              </Box>
+            </CardContent>
+          </Card>
+          {clusters.length === 0 ? (
+            <EmptyState
+              illustration={<DRSBalancingIllustration />}
+              title={t('emptyState.noDrs')}
+              description={t('emptyState.noDrsDesc')}
+              size="large"
+            />
+          ) : (
+            clusters.map(cluster => (
+              <ClusterCard
+                key={cluster.id}
+                clusterId={cluster.id}
+                clusterName={cluster.name}
+                metrics={cluster.metrics}
+                recommendations={pendingRecs}
+                expanded={expandedClusters.has(cluster.id)}
+                onToggle={() => toggleCluster(cluster.id)}
+                excludedNodeNames={drsSettings?.excluded_nodes?.[cluster.id] || []}
+                isClusterExcluded={drsSettings?.excluded_clusters?.includes(cluster.id) || false}
+                drsMode={drsSettings?.cluster_modes?.[cluster.id] || status?.mode || 'manual'}
+                balancingDomains={balancingDomains}
+                onShowRecommendations={() => showClusterRecommendations(cluster.id)}
+              />
+            ))
+          )}
+        </Stack>
+      )}
+
+      {/* Tab: Recommendations */}
+      {tab === 1 && (
+        <Stack spacing={2}>
+          {/* How placement is shaped here, guest by guest, on a heterogeneous cluster */}
+          <PlacementConstraintsCard
+            pinnedGuests={pinnedGuests}
+            balancingDomains={balancingDomains}
+            restrictedGuests={restrictedGuests}
+            excludedGuests={excludedGuests}
+            connectionNames={connectionNames}
+            vmStatus={historyVmStatus}
+            nodeStatus={historyNodeStatus}
+          />
+
+          {/* Migrations actives en cours */}
+          {activeMigrations.length > 0 && (
+            <Card variant="outlined" sx={{ borderRadius: 2, borderColor: 'info.main' }}>
+              <CardContent>
+                <Typography variant="subtitle2" sx={{ mb: 2, display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <CircularProgress size={16} />
+                  {t('drsPage.migrationsInProgress', { count: activeMigrations.length })}
+                </Typography>
+                <Stack spacing={1}>
+                  {activeMigrations.map(m => (
+                    <ActiveMigrationRow
+                      key={m.id}
+                      migration={m}
+                      progress={migrationsProgress[m.id] || null}
+                      statuses={glyphStatuses(m)}
+                    />
+                  ))}
+                </Stack>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Recommandations en attente */}
+          <Card variant="outlined" sx={{ borderRadius: 2 }}>
+            <CardContent>
+              {recsLoading ? (
+                <Stack spacing={1}>
+                  {[1, 2, 3].map(i => <Skeleton key={i} height={56} />)}
+                </Stack>
+              ) : pendingRecs.length === 0 && activeMigrations.length === 0 ? (
+                pinnedGuests.length > 0 ? (
+                  <Alert severity="info">
+                    {t('drsPage.someGuestsCannotMove')}
+                  </Alert>
+                ) : (
+                  <Alert severity="success" icon={<CheckCircleIcon />}>
+                    {t('drsPage.clustersEquilibrated')}
+                  </Alert>
+                )
+              ) : pendingRecs.length === 0 ? (
+                <Alert severity="info">
+                  {t('drsPage.noNewRecommendation', { count: activeMigrations.length })}
+                </Alert>
+              ) : (
+                <>
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                      {t('drsPage.pendingRecommendations', { count: pendingRecs.length })}
+                    </Typography>
+                    <Button
+                      variant="outlined"
+                      color="inherit"
+                      size="small"
+                      startIcon={actionLoading === 'clear-recs' ? <CircularProgress size={16} /> : <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />}
+                      onClick={handleClearRecs}
+                      disabled={!!actionLoading || pendingRecs.length === 0}
+                    >
+                      {t('drsPage.clearRecommendations')}
+                    </Button>
+                  </Box>
+                  <Stack spacing={2}>
+                    {pendingRecsByCluster.map(([clusterId, clusterRecsGroup]) => (
+                      <Box key={clusterId} id={`drs-recs-${clusterId}`} sx={{ scrollMarginTop: 80 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                          <i className="ri-server-line" style={{ fontSize: 14, color: theme.palette.text.secondary }} />
+                          <Typography variant="caption" fontWeight={700} sx={{ color: 'text.secondary' }}>
+                            {connectionNames[clusterId] || clusterId.slice(0, 12)}
+                          </Typography>
+                          <Chip size="small" label={clusterRecsGroup.length} sx={{ height: 18, fontSize: 10, fontWeight: 700 }} />
+                        </Box>
+                        <Stack spacing={1}>
+                          {clusterRecsGroup.map(rec => (
+                            <RecommendationRow
+                              key={rec.id}
+                              rec={rec}
+                              onClick={() => openRecommendation(rec)}
+                              haConflict={getHAConflictStatus(rec.vmid, rec.target_node, rec.connection_id, haDataMap) === 'conflict'}
+                              statuses={glyphStatuses(rec)}
+                            />
+                          ))}
+                        </Stack>
+                      </Box>
+                    ))}
+                  </Stack>
+                  {pendingRecs.length > 8 && (
+                    <Box sx={{ display: 'flex', justifyContent: 'center', mt: 2 }}>
+                      <Button
+                        size="small"
+                        variant="text"
+                        onClick={() => setVisibleRecCount(prev => prev >= pendingRecs.length ? 8 : pendingRecs.length)}
+                        startIcon={visibleRecCount >= pendingRecs.length ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                      >
+                        {visibleRecCount >= pendingRecs.length
+                          ? t('common.showLess')
+                          : `${t('common.showMore')} (+${pendingRecs.length - visibleRecCount})`
+                        }
+                      </Button>
+                    </Box>
+                  )}
+                </>
+              )}
+            </CardContent>
+          </Card>
+        </Stack>
+      )}
+
+      {/* Tab: History */}
+      {tab === 2 && (
+        <MigrationHistoryTab
+          migrations={historyMigrations}
+          connectionNames={connectionNames}
+          vmStatus={historyVmStatus}
+          nodeStatus={historyNodeStatus}
+          loading={historyLoading}
+        />
+      )}
+
+      {/* Tab: Affinity Rules */}
+      {tab === 3 && (
+        <Box>
+          {/* Cluster selector */}
+          {clusters.length > 1 && (
+            <FormControl size="small" sx={{ mb: 2, minWidth: 250 }}>
+              <InputLabel>{t('drsPage.clusterLabel')}</InputLabel>
+              <Select
+                value={selectedCluster}
+                label={t('drsPage.clusterLabel')}
+                onChange={(e) => setSelectedCluster(e.target.value)}
+              >
+                {clusters.map(c => (
+                    <MenuItem key={c.id} value={c.id}>
+                      {c.name}
+                    </MenuItem>
+                  ))}
+              </Select>
+            </FormControl>
+          )}
+          
+          <AffinityRulesManager
+            rules={affinityRules.filter(r => r.connectionId === selectedCluster)}
+            vms={allVMs.filter(v => v.connectionId === selectedCluster)}
+            nodes={clusters.find(c => c.id === selectedCluster)?.metrics.nodes?.map(n => n.node) || []}
+            connectionId={selectedCluster}
+            onCreateRule={handleCreateRule}
+            onUpdateRule={handleUpdateRule}
+            onDeleteRule={handleDeleteRule}
+            onEnforceRule={handleEnforceRule}
+            loading={!affinityRulesRaw}
+          />
+        </Box>
+      )}
+
+      {/* Tab: Configuration */}
+      {tab === 4 && (
+        <Card variant="outlined" sx={{ borderRadius: 2 }}>
+          <CardContent>
+            <DRSSettingsPanel
+              settings={drsSettings || defaultDRSSettings}
+              clusterNodes={Object.fromEntries(clusters.map(c => [c.id, c.metrics.nodes?.map(n => n.node) || []]))}
+              clusters={clusters.map(c => ({
+                id: c.id,
+                name: c.name,
+                nodes: c.metrics.nodes?.map(n => ({ node: n.node, status: n.status, maintenance: n.in_maintenance })) || []
+              }))}
+              onSave={handleSaveSettings}
+              loading={!drsSettings}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Drawer for recommendation details */}
+      <Drawer
+        anchor="right"
+        open={drawerOpen}
+        onClose={handleCloseDrawer}
+        PaperProps={{ sx: { width: { xs: '100%', sm: 420 }, p: 3 } }}
+      >
+        {selectedRec && (
+          <Stack spacing={3}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Typography variant="h6" sx={{ fontWeight: 700 }}>
+                {t('drsPage.recommendedMigration')}
+              </Typography>
+              <IconButton onClick={handleCloseDrawer} size="small">
+                <CloseIcon />
+              </IconButton>
+            </Box>
+
+            <Divider />
+
+            {/* Maintenance badge */}
+            {selectedRec.maintenance_evacuation && (
+              <Alert severity="warning" icon={<BuildIcon />}>
+                {t('drsPage.evacuationForMaintenance')}
+              </Alert>
+            )}
+
+            {/* ⚠️ Warning stockage local + vérification stockage cible */}
+            <StorageWarningPanel 
+              migrationCheck={migrationCheck} 
+              loading={migrationCheckLoading}
+              targetNode={selectedRec.target_node}
+            />
+
+            {/* VM Info */}
+            <Box>
+              <Typography variant="overline" sx={{ opacity: 0.5 }}>
+                {selectedRec.guest_type === 'lxc' ? t('drsPage.container') : t('drsPage.vm')}
+              </Typography>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <GuestGlyph type={selectedRec.guest_type} status={glyphStatuses(selectedRec).guest} dotBorder={theme.palette.background.paper} />
+                <Typography variant="h5" sx={{ fontWeight: 700 }}>
+                  {selectedRec.vm_name || `VM ${selectedRec.vmid}`}
+                </Typography>
+              </Box>
+              <Typography variant="body2" sx={{ opacity: 0.6 }}>
+                {selectedRec.guest_type === 'lxc' ? t('drsPage.ctidLabel') : t('drsPage.vmidLabel')}: {selectedRec.vmid}
+              </Typography>
+            </Box>
+
+            {/* HA warning */}
+            {selectedRec && getHAConflictStatus(selectedRec.vmid, selectedRec.target_node, selectedRec.connection_id, haDataMap) === 'conflict' && (
+              <Alert severity="warning" icon={<i className="ri-shield-star-line" style={{ fontSize: 20 }} />}>
+                <Typography variant="subtitle2" sx={{ fontWeight: 600 }}>
+                  {t('drsPage.haWarningTitle')}
+                </Typography>
+                <Typography variant="body2">
+                  {t('drsPage.haWarningDetail')}
+                </Typography>
+              </Alert>
+            )}
+
+            {/* Migration visualization */}
+            <Paper sx={{ p: 2, bgcolor: alpha(theme.palette.primary.main, 0.03) }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2 }}>
+                <Box sx={{ textAlign: 'center' }}>
+                  <Typography variant="caption" sx={{ opacity: 0.5 }}>{t('drsPage.source')}</Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 0.75 }}>
+                    <NodeGlyph status={glyphStatuses(selectedRec).source} dark={theme.palette.mode === 'dark'} dotBorder={theme.palette.background.paper} />
+                    <Typography sx={{ fontWeight: 600, color: 'error.main' }}>
+                      {selectedRec.source_node}
+                    </Typography>
+                  </Box>
+                </Box>
+                <SwapHorizIcon sx={{ fontSize: 32, opacity: 0.3 }} />
+                <Box sx={{ textAlign: 'center' }}>
+                  <Typography variant="caption" sx={{ opacity: 0.5 }}>{t('drsPage.target')}</Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 0.75 }}>
+                    <NodeGlyph status={glyphStatuses(selectedRec).target} dark={theme.palette.mode === 'dark'} dotBorder={theme.palette.background.paper} />
+                    <Typography sx={{ fontWeight: 600, color: 'success.main' }}>
+                      {selectedRec.target_node}
+                    </Typography>
+                  </Box>
+                </Box>
+              </Box>
+            </Paper>
+
+            {/* Cluster memory balance — all nodes, highlighting source/target */}
+            {(() => {
+              const clusterMetrics = (metricsData as any)?.[selectedRec.connection_id]
+              if (!clusterMetrics?.nodes || clusterMetrics.nodes.length < 2) return null
+              const nodes = (clusterMetrics.nodes as NodeMetrics[]).slice().sort((a, b) => b.memory_usage - a.memory_usage)
+              const avgMem = nodes.reduce((s, n) => s + n.memory_usage, 0) / nodes.length
+
+              const chartNodes = nodes.map(n => ({
+                name: n.node.length > 10 ? n.node.slice(0, 10) + '…' : n.node,
+                fullName: n.node,
+                RAM: Math.round(n.memory_usage * 10) / 10,
+                isSource: n.node === selectedRec.source_node,
+                isTarget: n.node === selectedRec.target_node,
+              }))
+
+              return (
+                <Paper sx={{ p: 2, bgcolor: alpha(theme.palette.primary.main, 0.02) }} variant="outlined">
+                  <Typography variant="caption" fontWeight={600} sx={{ display: 'block', mb: 1 }}>
+                    {t('drsPage.clusterBalance')}
+                  </Typography>
+                  <ChartContainer height={140}>
+                    <BarChart data={chartNodes} barCategoryGap="20%">
+                      <XAxis dataKey="name" tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <YAxis domain={[0, 100]} tickFormatter={v => `${v}%`} tick={{ fontSize: 10 }} axisLine={false} tickLine={false} />
+                      {/* Average line */}
+                      <Bar dataKey="RAM" radius={[4, 4, 0, 0]} animationDuration={600}>
+                        {chartNodes.map((entry, i) => (
+                          <Cell
+                            key={i}
+                            fill={entry.isSource ? theme.palette.error.main : entry.isTarget ? theme.palette.success.main : theme.palette.primary.main}
+                            fillOpacity={entry.isSource || entry.isTarget ? 0.9 : 0.3}
+                          />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ChartContainer>
+                  <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, mt: 0.5 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Box sx={{ width: 8, height: 8, borderRadius: 1, bgcolor: theme.palette.error.main }} />
+                      <Typography variant="caption" sx={{ fontSize: 10 }}>{t('drsPage.source')}</Typography>
+                    </Box>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Box sx={{ width: 8, height: 8, borderRadius: 1, bgcolor: theme.palette.success.main }} />
+                      <Typography variant="caption" sx={{ fontSize: 10 }}>{t('drsPage.target')}</Typography>
+                    </Box>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Box sx={{ width: 8, height: 8, borderRadius: 1, bgcolor: theme.palette.primary.main, opacity: 0.3 }} />
+                      <Typography variant="caption" sx={{ fontSize: 10 }}>{t('drsPage.otherNodes')}</Typography>
+                    </Box>
+                    <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.5 }}>
+                      Avg: {avgMem.toFixed(1)}%
+                    </Typography>
+                  </Box>
+                </Paper>
+              )
+            })()}
+
+            {/* Details */}
+            <Stack spacing={1.5}>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('drsPage.priority')}</Typography>
+                <Chip
+                  size="small"
+                  label={getPriorityLabel(selectedRec.priority).toUpperCase()}
+                  color={getPriorityColor(selectedRec.priority)}
+                />
+              </Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('drsPage.estimatedImprovement')}</Typography>
+                <Typography variant="body2" sx={{ fontWeight: 600, color: 'success.main' }}>
+                  +{selectedRec.score.toFixed(1)}%
+                </Typography>
+              </Box>
+              {(selectedRec.confirmation_count ?? 0) > 1 && (
+                <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('drsPage.confirmations')}</Typography>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    color="info"
+                    label={t('drsPage.confirmationTooltip', { count: selectedRec.confirmation_count })}
+                  />
+                </Box>
+              )}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('drsPage.reason')}</Typography>
+                <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                  {drsReasonText(selectedRec, t)}
+                </Typography>
+              </Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('common.status')}</Typography>
+                <Chip size="small" label={selectedRec.status} variant="outlined" />
+              </Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2" sx={{ opacity: 0.6 }}>{t('drsPage.createdOn')}</Typography>
+                <Typography variant="body2">{formatDate(selectedRec.created_at, dateLocale)}</Typography>
+              </Box>
+            </Stack>
+
+            <Divider />
+
+            {/* Actions */}
+            {(selectedRec.status === 'pending' || selectedRec.status === 'approved') && (
+              <Stack spacing={1.5}>
+                <Button
+                  fullWidth
+                  variant="contained"
+                  color="primary"
+                  size="large"
+                  startIcon={actionLoading === `execute-${selectedRec.id}` ? <CircularProgress size={20} /> : <PlayArrowIcon />}
+                  onClick={() => handleRecommendationAction(selectedRec.id, 'execute')}
+                  disabled={!!actionLoading}
+                >
+                  {t('drsPage.executeMigration')}
+                </Button>
+
+                {selectedRec.status === 'pending' && (
+                  <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Button
+                      fullWidth
+                      variant="outlined"
+                      color="success"
+                      startIcon={actionLoading === `approve-${selectedRec.id}` ? <CircularProgress size={16} /> : <CheckIcon />}
+                      onClick={() => handleRecommendationAction(selectedRec.id, 'approve')}
+                      disabled={!!actionLoading}
+                    >
+                      {t('drsPage.approve')}
+                    </Button>
+                    <Button
+                      fullWidth
+                      variant="outlined"
+                      color="error"
+                      startIcon={actionLoading === `reject-${selectedRec.id}` ? <CircularProgress size={16} /> : <CloseIcon />}
+                      onClick={() => handleRecommendationAction(selectedRec.id, 'reject')}
+                      disabled={!!actionLoading}
+                    >
+                      {t('drsPage.reject')}
+                    </Button>
+                  </Box>
+                )}
+              </Stack>
+            )}
+
+            {selectedRec.status === 'executed' && (
+              <Alert severity="success">{t('drsPage.migrationExecuted')}</Alert>
+            )}
+            {selectedRec.status === 'rejected' && (
+              <Alert severity="warning">{t('drsPage.recommendationRejected')}</Alert>
+            )}
+            {selectedRec.status === 'stale' && (
+              <Box>
+                <Alert severity="error" icon={<WarningAmberIcon />} sx={{ mb: 2 }}>
+                  {t('drsPage.recommendationStale')}
+                </Alert>
+                <Button
+                  variant="outlined"
+                  color="warning"
+                  fullWidth
+                  startIcon={<i className="ri-delete-bin-line" />}
+                  disabled={actionLoading === `dismiss-${selectedRec.id}`}
+                  onClick={async () => {
+                    try {
+                      setActionLoading(`dismiss-${selectedRec.id}`)
+                      await apiAction(`/api/v1/orchestrator/drs/recommendations/${selectedRec.id}/reject`, 'POST')
+                      setDrawerOpen(false)
+                      setSelectedRec(null)
+                      await mutateRecs()
+                      setSnackbar({ open: true, message: t('drsPage.recommendationDismissed'), severity: 'success' })
+                    } catch (e) {
+                      console.error('Error dismissing stale recommendation:', e)
+                    } finally {
+                      setActionLoading(null)
+                    }
+                  }}
+                >
+                  {t('drsPage.dismissRecommendation')}
+                </Button>
+              </Box>
+            )}
+          </Stack>
+        )}
+      </Drawer>
+      <DrsActionNoticeDialog message={actionNotice} onClose={() => setActionNotice(null)} />
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={6000}
+        onClose={() => setSnackbar(s => ({ ...s, open: false }))}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert
+          onClose={() => setSnackbar(s => ({ ...s, open: false }))}
+          severity={snackbar.severity}
+          variant="filled"
+          sx={{ width: '100%' }}
+        >
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
+    </Box>
+    </EnterpriseGuard>
+    </ProviderTenantGuard>
+  )
+}

@@ -1,0 +1,1397 @@
+import type { Drill, DrillEvent, DrillRequest, DrillSettings, Preflight, Schedule, ScheduleInput, ScheduleRun } from '@/lib/backups/restoreDrills/types'
+import type { CleanupStarted, RecoveryExecutionEvent, ReplicationJob, ReplicationCheckRequest, ReplicationHealthStatus, SnapshotIdentity, SSHConnectivityResult } from './site-recovery.types'
+import { actorHeaders } from './actor'
+
+// src/lib/orchestrator/client.ts
+// Client pour communiquer avec le backend Go d'orchestration
+
+const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080'
+// DRS metrics and recommendations live in the memory of the single leader
+// orchestrator. In HA, ORCHESTRATOR_LEADER_URL points at an HAProxy frontend
+// that forwards to whichever node currently holds leadership, so the DRS page
+// is populated no matter which node serves the request (e.g. the VIP holder is
+// not always the leader — ui#803, defect 2). Outside HA it is unset and falls
+// back to the local orchestrator, so behaviour is unchanged.
+const ORCHESTRATOR_LEADER_URL = process.env.ORCHESTRATOR_LEADER_URL || ORCHESTRATOR_URL
+const ORCHESTRATOR_API_KEY = process.env.ORCHESTRATOR_API_KEY || ''
+
+// Leader-only endpoints: DRS (/drs/*), metrics (/metrics/*) and availability
+// (/availability/*, which reads the latest metrics sample) read or act on
+// state that only the leader holds. Everything else stays on the local
+// orchestrator (ORCHESTRATOR_URL).
+function orchestratorBaseUrlForPath(path: string): string {
+  return /^\/(metrics|drs|availability)(\/|$|\?)/.test(path) ? ORCHESTRATOR_LEADER_URL : ORCHESTRATOR_URL
+}
+
+export interface OrchestratorRequestOptions {
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  body?: any
+  timeout?: number
+}
+
+/**
+ * A value refused as an orchestrator path segment. Carries the 400 the
+ * proxies answer with: the call is refused here, before anything is sent.
+ */
+export class OrchestratorPathError extends Error {
+  readonly status = 400
+  constructor(message: string) {
+    super(message)
+    this.name = 'OrchestratorPathError'
+  }
+}
+
+// What an identifier may look like once it sits in an orchestrator path: a
+// UUID, a cuid, a number, a slug. Every character here is left as is by
+// encodeURIComponent, so the segment reaches the orchestrator exactly as
+// validated, and `.` or `..` cannot start the segment.
+const PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/
+
+/**
+ * One segment of an orchestrator path, validated and encoded. Throws
+ * OrchestratorPathError for anything that is not a plain identifier.
+ */
+export function orchestratorSegment(value: unknown, name = 'id'): string {
+  const text = typeof value === 'number' && Number.isFinite(value) ? String(value) : value
+  if (typeof text !== 'string' || !PATH_SEGMENT.test(text)) {
+    throw new OrchestratorPathError(`Invalid ${name}`)
+  }
+  return encodeURIComponent(text)
+}
+
+/**
+ * Tagged template building an orchestrator path: every interpolated value is
+ * a path segment and goes through orchestratorSegment(). Query strings are not
+ * values of this template; append them with URLSearchParams.
+ *
+ *   orchestratorPath`/reports/${id}/download`
+ */
+export function orchestratorPath(strings: TemplateStringsArray, ...values: unknown[]): string {
+  let out = ''
+  for (let i = 0; i < strings.length; i++) {
+    out += strings[i]
+    if (i < values.length) out += orchestratorSegment(values[i])
+  }
+  return out
+}
+
+/**
+ * Refuses a path whose segments would be re-interpreted on the way: a dot
+ * segment, an empty segment or an encoded separator. The typed methods below
+ * build their paths through orchestratorPath(); this is the net under them.
+ */
+function assertOrchestratorPath(path: string): void {
+  const pathname = path.split(/[?#]/, 1)[0]
+  if (!pathname.startsWith('/') || /%2f/i.test(pathname)) throw new OrchestratorPathError('Invalid orchestrator path')
+  for (const segment of pathname.slice(1).split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') throw new OrchestratorPathError('Invalid orchestrator path')
+  }
+}
+
+/**
+ * Fait une requête vers le backend Go d'orchestration
+ */
+export async function orchestratorFetch<T>(
+  path: string,
+  options: OrchestratorRequestOptions = {}
+): Promise<T> {
+  const { method = 'GET', body, timeout = 30000 } = options
+
+  assertOrchestratorPath(path)
+  const url = `${orchestratorBaseUrlForPath(path)}/api/v1${path}`
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+
+  if (ORCHESTRATOR_API_KEY) {
+    headers['X-API-Key'] = ORCHESTRATOR_API_KEY
+  }
+
+  // Forward the current tenant so backend endpoints that scope by tenant
+  // (reports, schedules) can filter results. Skipped for the provider
+  // tenant ('default') so super-admin / provider sessions keep the
+  // unrestricted view of legacy data without a tenant_id.
+  // Lazy import to keep this module free of an upfront dependency on the
+  // tenant/auth chain (callers running outside a request context — e.g.
+  // background jobs — silently get the no-tenant fallback).
+  try {
+    const { getCurrentTenantId, DEFAULT_TENANT_ID } = await import('@/lib/tenant')
+    const tid = await getCurrentTenantId()
+    if (tid && tid !== DEFAULT_TENANT_ID) {
+      headers['X-Tenant-ID'] = tid
+    }
+  } catch (e) {
+    // A session refused its tenant must not reach the orchestrator in
+    // provider mode (roadmap#79).
+    if ((e as Error)?.name === 'TenantAccessError') throw e
+    // No session / not in a request: send without tenant header (provider mode)
+  }
+
+  // Who is behind the call, for the orchestrator's own audit rows (#1105).
+  // Left out outside a request, where the orchestrator names itself.
+  Object.assign(headers, await actorHeaders())
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+
+    clearTimeout(timeoutId)
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+
+      throw new Error(`Orchestrator ${res.status}: ${text}`)
+    }
+
+    // No content (a DELETE answered 204): nothing to parse.
+    if (res.status === 204) return undefined as T
+
+    return (await res.json()) as T
+  } catch (error: any) {
+    clearTimeout(timeoutId)
+
+    if (error.name === 'AbortError') {
+      throw new Error('Orchestrator request timeout')
+    }
+
+    // Tag connection errors so API routes can avoid noisy logging
+    const isConnError = error?.cause?.code === 'ECONNREFUSED' || error?.cause?.code === 'ENOTFOUND' || error?.message?.includes('fetch failed')
+    if (isConnError) {
+      const err: any = new Error('Orchestrator unavailable')
+      err.code = 'ORCHESTRATOR_UNAVAILABLE'
+      throw err
+    }
+
+    throw error
+  }
+}
+
+/**
+ * Extract the upstream HTTP status and error message from an Error thrown by
+ * orchestratorFetch on a non-OK response (message shape:
+ * `Orchestrator ${status}: ${rawBody}`). Route handlers use this to pass an
+ * upstream conflict/validation response (e.g. 409 `{error: "..."}`) straight
+ * through instead of collapsing everything to a generic 500.
+ *
+ * Returns null when the error doesn't match that shape (timeouts, connection
+ * failures, etc.) — callers should fall back to a 500 in that case.
+ */
+export function parseOrchestratorError(error: unknown): { status: number; message: string; details?: Record<string, unknown> } | null {
+  // A path refused before any call: answered 400 like an upstream validation error.
+  if (error instanceof OrchestratorPathError) return { status: error.status, message: error.message }
+
+  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  const match = /^Orchestrator (\d+): ([\s\S]*)$/.exec(raw)
+
+  if (!match) return null
+
+  const status = Number(match[1])
+  const body = match[2].trim()
+
+  try {
+    const parsed = JSON.parse(body)
+
+    if (parsed && typeof parsed.error === 'string' && parsed.error) {
+      // The body may carry more than the message (a code, the plans that
+      // block a deletion): relays pass it through, see replicationErrorResponse.
+      return { status, message: parsed.error, details: parsed }
+    }
+  } catch {
+    // Not JSON — fall through to the raw body text below
+  }
+
+  return { status, message: body || `Orchestrator error ${status}` }
+}
+
+// ============================================
+// Types DRS
+// ============================================
+
+export interface DRSStatus {
+  enabled: boolean
+  mode: 'manual' | 'partial' | 'automatic'
+  recommendations: number
+  active_migrations: number
+  pending_count: number
+  approved_count: number
+}
+
+export interface DRSRecommendation {
+  id: string
+  connection_id: string
+  vmid: number
+  vm_name: string
+  guest_type?: string
+  source_node: string
+  target_node: string
+  reason: string
+  reason_code?: string
+  reason_params?: Record<string, string>
+  priority: 'low' | 'medium' | 'high' | 'critical'
+  score: number
+  created_at: string
+  status: 'pending' | 'approved' | 'rejected' | 'executed' | 'stale'
+  confirmation_count?: number
+  last_seen_at?: string
+  maintenance_evacuation?: boolean
+}
+
+export interface DRSMigration {
+  id: string
+  recommendation_id?: string
+  connection_id: string
+  vmid: number
+  vm_name: string
+  source_node: string
+  target_node: string
+  task_id: string
+  started_at: string
+  completed_at?: string
+  status: 'running' | 'completed' | 'failed'
+  error?: string
+  reason?: string
+  maintenance_evacuation?: boolean
+}
+
+export interface AffinityRule {
+  id: string
+  name: string
+  type: 'affinity' | 'anti-affinity' | 'node-affinity'
+  connection_id: string
+  enabled: boolean
+  required: boolean
+  vmids?: number[]
+  nodes?: string[]
+  from_tag?: boolean
+  from_pool?: boolean
+}
+
+export interface ClusterMetrics {
+  connection_id: string
+  collected_at: string
+  nodes: NodeMetrics[]
+  vms: VMMetrics[]
+  summary: ClusterSummary
+  /** Per-storage guest disk latency, aggregated over every disk on it (#881). */
+  storages?: StorageLatency[]
+  /** Length of the sliding window behind the window_* latency fields (#881). */
+  disk_latency_window_minutes?: number
+}
+
+/** Latency of one virtual disk, derived from QEMU block statistics (#881). */
+export interface DiskLatency {
+  disk: string
+  storage?: string
+  read_ms: number
+  write_ms: number
+  latency_ms: number
+  read_ops: number
+  write_ops: number
+  /** Bytes per second over the last interval (#1011); absent from an orchestrator that predates them. */
+  read_bps?: number
+  write_bps?: number
+  window_avg_ms: number
+  window_max_ms: number
+  window_full: boolean
+}
+
+/** One bucket of a guest's disk latency history (#881); `time` is the bucket start in Unix seconds. */
+export interface DiskLatencySeriesPoint {
+  time: number
+  disk: string
+  storage?: string
+  latency_ms: number
+  max_ms: number
+  read_ops: number
+  write_ops: number
+}
+
+export interface DiskLatencySeries {
+  from?: string
+  to?: string
+  step: number
+  points: DiskLatencySeriesPoint[]
+}
+
+/** One bucket of the Ceph history (Enterprise); `time` is the bucket start in Unix seconds. Latencies are null when the bucket has no OSD sample. */
+export interface CephHistoryPoint {
+  time: number
+  /** Worst health of the bucket: 0 OK, 1 WARN, 2 ERR. */
+  health: 0 | 1 | 2
+  read_ops: number
+  write_ops: number
+  read_bytes: number
+  write_bytes: number
+  recovering_bytes: number
+  degraded_objects: number
+  misplaced_objects: number
+  pgs_total: number
+  pgs_clean: number
+  raw_used_bytes: number
+  raw_total_bytes: number
+  osd_total: number
+  osd_up: number
+  osd_in: number
+  osd_lat_avg_ms: number | null
+  osd_lat_max_ms: number | null
+}
+
+export interface CephHistory {
+  from: string
+  to: string
+  step: number
+  points: CephHistoryPoint[]
+  slowest_osds: { osd_id: number; avg_ms: number; max_ms: number }[]
+  /** Latency curve per OSD (<= 60 points, `time` in Unix seconds), only when `osds` was asked; an OSD with no sample is absent. */
+  osd_series?: Record<string, CephOsdSeriesPoint[]>
+  /** I/O rates per OSD (<= 60 points, `time` in Unix seconds), only when `osd_io` and `osds` were asked (ceph-exporter). */
+  osd_io_series?: Record<string, CephOsdIoPoint[]>
+  /** State of the ceph-exporter of each node, only with `osd_io`. */
+  exporter?: { nodes: Record<string, { ok: boolean; last_ok: number | null }> }
+}
+
+export interface CephOsdIoPoint {
+  time: number
+  read_ops: number
+  write_ops: number
+  read_bytes: number
+  write_bytes: number
+}
+
+export interface CephOsdSeriesPoint {
+  time: number
+  avg_ms: number
+  max_ms: number
+}
+
+/** Latency of a storage, aggregated over the guest disks it backs (#881). */
+export interface StorageLatency {
+  storage: string
+  read_ms: number
+  write_ms: number
+  latency_ms: number
+  /** Bytes per second summed over the storage's measured guest disks (#1011); absent from an older orchestrator. */
+  read_bps?: number
+  write_bps?: number
+  window_avg_ms: number
+  window_max_ms: number
+  window_full: boolean
+  /** False on the orchestrator's first round after a start, or when every read failed: nothing to show yet. */
+  measured?: boolean
+  disks: number
+  vms: number
+}
+
+/** Metric a top guests ranking is built on (#1129): percentages for cpu/ram, byte rates for the four IO counters. */
+export type TopGuestsMetric = 'cpu' | 'ram' | 'diskread' | 'diskwrite' | 'netin' | 'netout'
+export type TopGuestsAgg = 'avg' | 'max'
+
+export interface TopGuestItem {
+  vmid: number
+  name: string
+  node: string
+  /** `type`, `pool` and `tags` come from the latest sample of the window; absent on rows written before #1129. */
+  type?: string
+  status: string
+  pool?: string
+  tags?: string
+  value: number
+  samples: number
+}
+
+/** One connection's guests ranked over a window, from the stored collections (#1129). */
+export interface TopGuests {
+  metric: TopGuestsMetric
+  agg: TopGuestsAgg
+  unit: 'percent' | 'bytes_per_second'
+  from: string
+  to: string
+  /** Oldest row of this connection in the whole table, null when none. */
+  first_sample_at: string | null
+  samples: number
+  stride: number
+  items: TopGuestItem[]
+}
+
+export interface NodeMetrics {
+  node: string
+  status: string
+  cpu_usage: number
+  cpu_cores: number
+  memory_used: number
+  memory_total: number
+  memory_usage: number
+  disk_used: number
+  disk_total: number
+  disk_usage: number
+  uptime: number
+  vm_count: number
+  running_vms: number
+}
+
+export interface VMMetrics {
+  vmid: number
+  name: string
+  node: string
+  status: string
+  cpu_usage: number
+  cpus: number
+  memory_used: number
+  memory_total: number
+  memory_usage: number
+  uptime: number
+  /** Worst disk, ops-weighted read+write ms per I/O at the last collection (#881). Absent for LXC or before two samples exist. */
+  disk_latency_ms?: number
+  /** Worst disk's max per-collection latency over the window (#881). */
+  disk_latency_window_max_ms?: number
+  disk_latency?: DiskLatency[]
+  /** Bytes per second summed over the disks above (#1011); absent from an older orchestrator. */
+  disk_read_bps?: number
+  disk_write_bps?: number
+  /** Only for guests whose PVE reports one (PVE 9): absent is "not reported", not 0 % (#1011). */
+  io_pressure?: IoPressure
+}
+
+/**
+ * IO pressure stall of a guest (#1011): the kernel's PSI avg10 of its cgroup,
+ * in percent of the last ten seconds. `some`: at least one task waited on
+ * I/O; `full`: all of them did.
+ */
+export interface IoPressure {
+  some: number
+  full: number
+}
+
+export interface ClusterSummary {
+  total_nodes: number
+  online_nodes: number
+  total_vms: number
+  running_vms: number
+  total_cpu_cores: number
+  used_cpu_cores: number
+  avg_cpu_usage: number
+  total_memory: number
+  used_memory: number
+  avg_memory_usage: number
+  total_storage: number
+  used_storage: number
+  avg_storage_usage: number
+  imbalance: number
+}
+
+export interface DRSSettings {
+  enabled: boolean
+  mode: 'manual' | 'partial' | 'automatic'
+  evaluation_interval: number
+  cpu_threshold: number
+  memory_threshold: number
+  imbalance_threshold: number
+  min_improvement: number
+  max_concurrent_migrations: number
+  excluded_nodes: string[]
+  excluded_vms: number[]
+}
+
+// ============================================
+// Response wrapper (style Axios)
+// ============================================
+
+export interface OrchestratorResponse<T> {
+  data: T
+  status: number
+}
+
+// ============================================
+// Client class avec API style Axios
+// ============================================
+
+class OrchestratorClient {
+  /**
+   * GET request - retourne { data: T }
+   */
+  async get<T = any>(path: string, timeout?: number): Promise<OrchestratorResponse<T>> {
+    const data = await orchestratorFetch<T>(path, { method: 'GET', timeout })
+
+    
+return { data, status: 200 }
+  }
+
+  /**
+   * POST request - retourne { data: T }
+   */
+  async post<T = any>(path: string, body?: any, timeout?: number): Promise<OrchestratorResponse<T>> {
+    const data = await orchestratorFetch<T>(path, { method: 'POST', body, timeout })
+
+
+return { data, status: 200 }
+  }
+
+  /**
+   * PUT request - retourne { data: T }
+   */
+  async put<T = any>(path: string, body?: any): Promise<OrchestratorResponse<T>> {
+    const data = await orchestratorFetch<T>(path, { method: 'PUT', body })
+
+    
+return { data, status: 200 }
+  }
+
+  /**
+   * DELETE request - retourne { data: T }
+   */
+  async delete<T = any>(path: string): Promise<OrchestratorResponse<T>> {
+    const data = await orchestratorFetch<T>(path, { method: 'DELETE' })
+
+    
+return { data, status: 200 }
+  }
+
+  // ============================================
+  // Méthodes typées (raccourcis)
+  // ============================================
+
+  // DRS Status
+  getDRSStatus() {
+    return this.get<DRSStatus>('/drs/status')
+  }
+
+  // DRS Settings
+  getDRSSettings() {
+    return this.get<DRSSettings>('/drs/settings')
+  }
+
+  updateDRSSettings(settings: Partial<DRSSettings>) {
+    return this.put<DRSSettings>('/drs/settings', settings)
+  }
+
+  // Recommendations
+  getRecommendations(validate = false) {
+    const query = validate ? '?validate=true' : ''
+
+    
+return this.get<DRSRecommendation[]>(`/drs/recommendations${query}`)
+  }
+
+  approveRecommendation(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/drs/recommendations/${id}/approve`)
+  }
+
+  rejectRecommendation(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/drs/recommendations/${id}/reject`)
+  }
+
+  executeRecommendation(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/drs/recommendations/${id}/execute`)
+  }
+
+  // Migrations
+  getMigrations(limit?: number) {
+    return this.get<DRSMigration[]>(limit ? `/drs/migrations?${new URLSearchParams({ limit: String(limit) })}` : '/drs/migrations')
+  }
+
+  getActiveMigrations() {
+    return this.get<DRSMigration[]>('/drs/migrations/active')
+  }
+
+  // Manual evaluation trigger
+  triggerEvaluation() {
+    return this.post<{ status: string }>('/drs/evaluate')
+  }
+
+  // Force enforce all affinity rules
+  enforceRules() {
+    return this.post<{ violations_found: number; migrations_started: number; errors?: string[] }>('/drs/enforce-rules')
+  }
+
+  // Force enforce a single affinity rule
+  enforceRule(ruleId: string) {
+    return this.post<{ violations_found: number; migrations_started: number; errors?: string[] }>(
+      '/drs/enforce-rules', { rule_id: ruleId }
+    )
+  }
+
+  // Affinity Rules
+  getRules() {
+    return this.get<AffinityRule[]>('/rules')
+  }
+
+  createRule(rule: Omit<AffinityRule, 'id'>) {
+    return this.post<AffinityRule>('/rules', rule)
+  }
+
+  updateRule(id: string, rule: Partial<AffinityRule>) {
+    return this.put<AffinityRule>(orchestratorPath`/rules/${id}`, rule)
+  }
+
+  deleteRule(id: string) {
+    return this.delete<{ status: string }>(orchestratorPath`/rules/${id}`)
+  }
+
+  // Metrics
+  getAllMetrics() {
+    return this.get<Record<string, ClusterMetrics>>('/metrics')
+  }
+
+  getMetrics(connectionId: string) {
+    return this.get<ClusterMetrics>(orchestratorPath`/metrics/${connectionId}`)
+  }
+
+  /** Guest disk latency history, per disk and bucket, for the Disk I/O chart (#881). */
+  getVMDiskLatencySeries(connectionId: string, vmid: string | number, opts: { from?: string; to?: string; step?: number } = {}) {
+    const params = new URLSearchParams()
+
+    if (opts.from) params.set('from', opts.from)
+    if (opts.to) params.set('to', opts.to)
+    if (opts.step) params.set('step', String(opts.step))
+    const query = params.toString()
+
+    return this.get<DiskLatencySeries>(`${orchestratorPath`/metrics/${connectionId}/vms/${vmid}/disk-latency`}${query ? `?${query}` : ''}`)
+  }
+
+  /** Ceph history of a connection (Enterprise): cluster series per step and the slowest OSDs. */
+  getCephHistory(connectionId: string, opts: { from: string; to: string; step: number; top?: number; osds?: number[]; osdIo?: boolean }) {
+    const params = new URLSearchParams({ from: opts.from, to: opts.to, step: String(opts.step) })
+
+    if (opts.top !== undefined) params.set('top', String(opts.top))
+    if (opts.osds !== undefined) params.set('osds', opts.osds.join(','))
+    if (opts.osdIo) params.set('osd_io', '1')
+
+    return this.get<CephHistory>(`${orchestratorPath`/ceph/${connectionId}/history`}?${params.toString()}`)
+  }
+
+  /**
+   * Guests of a connection ranked by a metric over a window, for the dashboard top consumers (#1129). `limit` 0 = every guest.
+   * `pools` keeps only the samples taken while the guest sat in one of them (a vDC's perimeter); omitted = no filter.
+   */
+  getTopGuests(connectionId: string, opts: { metric: TopGuestsMetric; agg?: TopGuestsAgg; from?: string; to?: string; limit?: number; pools?: string[] }) {
+    const params = new URLSearchParams()
+
+    params.set('metric', opts.metric)
+    if (opts.agg) params.set('agg', opts.agg)
+    if (opts.from) params.set('from', opts.from)
+    if (opts.to) params.set('to', opts.to)
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit))
+    if (opts.pools) params.set('pools', opts.pools.join(','))
+
+    return this.get<TopGuests>(`${orchestratorPath`/metrics/${connectionId}/top`}?${params.toString()}`)
+  }
+
+  getMetricsHistory(connectionId: string, from?: string, to?: string) {
+    const params = new URLSearchParams()
+
+    if (from) params.set('from', from)
+    if (to) params.set('to', to)
+    const query = params.toString()
+
+    
+return this.get<ClusterMetrics[]>(`${orchestratorPath`/metrics/${connectionId}/history`}${query ? `?${query}` : ''}`)
+  }
+
+  // Clusters
+  getClusters() {
+    return this.get<Array<{ id: string; url: string; status: string }>>('/clusters')
+  }
+
+  getClusterNodes(connectionId: string) {
+    return this.get<any[]>(orchestratorPath`/clusters/${connectionId}/nodes`)
+  }
+
+  getClusterVMs(connectionId: string) {
+    return this.get<any[]>(orchestratorPath`/clusters/${connectionId}/vms`)
+  }
+
+  // Health check
+  health() {
+    return this.get<PulseHealth>('/health')
+  }
+
+  // SSH Connection Test
+  testSSHConnection(connectionId: string) {
+    return this.post<{
+      success: boolean
+      nodes?: Array<{
+        node: string
+        ip: string
+        status: 'ok' | 'error'
+        error?: string
+      }>
+      error?: string
+    }>(orchestratorPath`/connections/${connectionId}/test-ssh`)
+  }
+
+  // ============================================
+  // Site Recovery - Replication Jobs
+  // ============================================
+
+  getReplicationHealth() {
+    return this.get<ReplicationHealthStatus>('/replication/status')
+  }
+
+  getReplicationJobs() {
+    return this.get<any[]>('/replication/jobs')
+  }
+
+  getReplicationJob(id: string) {
+    return this.get<any>(orchestratorPath`/replication/jobs/${id}`)
+  }
+
+  createReplicationJob(body: any) {
+    return this.post<any>('/replication/jobs', body)
+  }
+
+  updateReplicationJob(id: string, body: any) {
+    return this.put<any>(orchestratorPath`/replication/jobs/${id}`, body)
+  }
+
+  deleteReplicationJob(id: string) {
+    return this.delete<{ status: string; purged_snapshots?: number }>(orchestratorPath`/replication/jobs/${id}`)
+  }
+
+  // The orchestrator applies these filters before touching any node, so passing
+  // them through is the difference between one `rbd ls` and a cluster-wide scan.
+  listMirrorSnapshots(filters: { clusterId?: string; vmid?: number } = {}) {
+    const q = new URLSearchParams()
+    if (filters.clusterId) q.set('cluster_id', filters.clusterId)
+    if (typeof filters.vmid === 'number') q.set('vmid', String(filters.vmid))
+    const suffix = q.toString() ? `?${q.toString()}` : ''
+
+    return this.get<any[]>(`/replication/snapshots${suffix}`)
+  }
+
+  getSnapshotUsage(cluster: string, pool: string, image: string, snap: string, storage_engine: 'rbd' | 'zfs' = 'rbd', node = '') {
+    const q = new URLSearchParams({ cluster, pool, image, snap, storage_engine, node }).toString()
+    return this.get<any>(`/replication/snapshots/usage?${q}`)
+  }
+
+  deleteMirrorSnapshots(items: SnapshotIdentity[]) {
+    return this.post<any>('/replication/snapshots/delete', { items })
+  }
+
+  syncReplicationJob(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/jobs/${id}/sync`)
+  }
+
+  pauseReplicationJob(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/jobs/${id}/pause`)
+  }
+
+  resumeReplicationJob(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/jobs/${id}/resume`)
+  }
+
+  /**
+   * Stop the sync a job is running right now (#974). Not the same thing as
+   * pausing it: a pause only clears the schedule and lets the run in flight
+   * finish. Answers 409 when no run is in flight on the instance that takes
+   * the call, which in HA can mean another one owns it.
+   */
+  cancelReplicationJob(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/jobs/${id}/cancel`)
+  }
+
+  /**
+   * Stop a recovery execution: a test failover at any point, a failback still
+   * in its reverse sync, a real failover only before it has fenced its first
+   * guest. Answers 409 with the reason otherwise.
+   */
+  cancelRecoveryExecution(id: string) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/executions/${id}/cancel`)
+  }
+
+  getReplicationJobLogs(id: string) {
+    return this.get<any[]>(orchestratorPath`/replication/jobs/${id}/logs`)
+  }
+
+  getReplicationJobVMs(id: string) {
+    return this.get<any[]>(orchestratorPath`/replication/jobs/${id}/vms`)
+  }
+
+  reseedReplicationJobVM(id: string, vmid: number) {
+    return this.post<{ status: string }>(orchestratorPath`/replication/jobs/${id}/vms/${vmid}/reseed`, { confirm: true })
+  }
+
+  getReplicationJobThroughput(id: string, window: string) {
+    return this.get<any[]>(`${orchestratorPath`/replication/jobs/${id}/throughput`}?${new URLSearchParams({ window })}`)
+  }
+
+  preflightReplication(body: ReplicationCheckRequest & { target_pool: string; estimated_size_bytes: number; rpo_target?: number; schedule_spec?: ReplicationJob['schedule_spec']; timezone?: string }) {
+    return this.post<any>('/replication/preflight', body)
+  }
+
+  checkSSHConnectivity(body: ReplicationCheckRequest) {
+    return this.post<SSHConnectivityResult>('/replication/check-ssh', body)
+  }
+
+  // ============================================
+  // Site Recovery - Recovery Plans
+  // ============================================
+
+  getRecoveryPlans() {
+    return this.get<any[]>('/replication/plans')
+  }
+
+  getRecoveryPlan(id: string) {
+    return this.get<any>(orchestratorPath`/replication/plans/${id}`)
+  }
+
+  getPlanRestorePoints(planId: string) {
+    return this.get<any>(orchestratorPath`/replication/plans/${planId}/restore-points`)
+  }
+
+  // Restore points of a single replicated guest, addressed by its job and its
+  // SOURCE vmid: the Emergency DR tab starts one replica at a time, and most
+  // of the guests it lists belong to no recovery plan.
+  getJobVMRestorePoints(jobId: string, vmId: number) {
+    return this.get<any>(orchestratorPath`/replication/jobs/${jobId}/vms/${vmId}/restore-points`)
+  }
+
+  createRecoveryPlan(body: any) {
+    return this.post<any>('/replication/plans', body)
+  }
+
+  updateRecoveryPlan(id: string, body: any) {
+    return this.put<any>(orchestratorPath`/replication/plans/${id}`, body)
+  }
+
+  deleteRecoveryPlan(id: string) {
+    return this.delete<{ status: string }>(orchestratorPath`/replication/plans/${id}`)
+  }
+
+  testFailover(planId: string, body?: { network_isolated?: boolean; restore_points?: Record<number, string>; screenshot_delay_seconds?: number }) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/test-failover`, body)
+  }
+
+  executeFailover(planId: string, body?: { restore_points?: Record<number, string> }) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/failover`, body)
+  }
+
+  executeFailback(planId: string) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/failback`)
+  }
+
+  failbackCutover(planId: string) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/failback-cutover`)
+  }
+
+  failbackCancel(planId: string) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/failback-cancel`)
+  }
+
+  // Per-guest failover and failback (ui#943): one guest of the plan, its
+  // siblings keep replicating. Each call only claims the guest and starts
+  // the work in the background, so the default budget is ample.
+  guestFailover(planId: string, vmid: number, body?: { restore_point?: string }) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/guests/${vmid}/failover`, body)
+  }
+
+  guestFailback(planId: string, vmid: number) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/guests/${vmid}/failback`)
+  }
+
+  guestFailbackCutover(planId: string, vmid: number) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/guests/${vmid}/failback-cutover`)
+  }
+
+  guestFailbackCancel(planId: string, vmid: number) {
+    return this.post<any>(orchestratorPath`/replication/plans/${planId}/guests/${vmid}/failback-cancel`)
+  }
+
+  cleanupTestFailover(planId: string) {
+    // The cleanup itself runs in the background on the orchestrator and this
+    // call only starts it, so the default budget is ample. It used to run
+    // inside this request: one guest costs a stop plus a per-disk rollback,
+    // ~46s measured at a customer site on terabyte-scale images, so the
+    // request was abandoned mid-rollback with guests still up and the partial
+    // result thrown away (ui#958). Progress is polled from the execution.
+    return this.post<CleanupStarted>(orchestratorPath`/replication/plans/${planId}/cleanup-test`)
+  }
+
+  startDRVM(body: { vm_id: number; target_cluster: string; replication_job_id: string; restore_point?: string }) {
+    // An emergency start waits for an in-flight sync of the job, pauses it,
+    // optionally rolls every disk back to a restore point, then boots the
+    // replica and waits for it to report running: measured at ~30s in the lab
+    // for a single-disk guest, and the 30s default expired mid-sequence,
+    // cancelling the boot AFTER the rollback had landed. Kept under the 60s
+    // nginx read timeout of a packaged install, like the test cleanup below.
+    return this.post<any>('/replication/emergency/start-vm', body, 55_000)
+  }
+
+  stopDRVM(body: { vm_id: number; target_cluster: string; replication_job_id: string; resume_replication?: boolean }) {
+    // Same budget as the start: stopping the replica and resuming its job is
+    // shorter, but it is the same SSH round trips to the same DR node.
+    return this.post<any>('/replication/emergency/stop-vm', body, 55_000)
+  }
+
+  getRecoveryHistory(planId: string) {
+    return this.get<any[]>(orchestratorPath`/replication/plans/${planId}/history`)
+  }
+
+  clearRecoveryHistory(planId: string) {
+    return this.delete<any>(orchestratorPath`/replication/plans/${planId}/history`)
+  }
+
+  getExecution(id: string) {
+    return this.get<any>(orchestratorPath`/replication/executions/${id}`)
+  }
+
+  // The step log of a failover or failback (ui#943), the lines after `after` when given.
+  getExecutionEvents(id: string, after = 0) {
+    return this.get<RecoveryExecutionEvent[]>(`${orchestratorPath`/replication/executions/${id}/events`}${after > 0 ? `?after=${Math.trunc(after)}` : ''}`)
+  }
+
+  getExecutionScreenshots(id: string) {
+    return this.get<{ vm_id: number; target_vmid: number; captured_at: string }[]>(orchestratorPath`/replication/executions/${id}/screenshots`)
+  }
+
+  // ============================================
+  // Restore drills (roadmap#35)
+  // ============================================
+
+  listRestoreDrills(limit = 20, offset = 0, scheduleId = '') {
+    const filter = scheduleId ? `&schedule_id=${encodeURIComponent(scheduleId)}` : ''
+    return this.get<{ data: Drill[]; total: number }>(`/restore-drills?limit=${limit}&offset=${offset}${filter}`)
+  }
+
+  preflightRestoreDrill(body: DrillRequest) {
+    return this.post<Preflight>('/restore-drills/preflight', body)
+  }
+
+  createRestoreDrill(body: DrillRequest) {
+    return this.post<{ drill: Drill }>('/restore-drills', body)
+  }
+
+  getRestoreDrill(id: string) {
+    return this.get<{ drill: Drill; events: DrillEvent[] }>(orchestratorPath`/restore-drills/${id}`)
+  }
+
+  cancelRestoreDrill(id: string) {
+    return this.post<{ drill: Drill }>(orchestratorPath`/restore-drills/${id}/cancel`)
+  }
+
+  cleanupRestoreDrill(id: string) {
+    return this.post<{ drill: Drill }>(orchestratorPath`/restore-drills/${id}/cleanup`)
+  }
+
+  getRestoreDrillSettings() {
+    return this.get<DrillSettings>('/restore-drills/settings')
+  }
+
+  updateRestoreDrillSettings(body: DrillSettings) {
+    return this.put<DrillSettings>('/restore-drills/settings', body)
+  }
+
+  listRestoreDrillSchedules(limit = 20, offset = 0) {
+    return this.get<{ data: Schedule[]; total: number }>(`/restore-drills/schedules?limit=${limit}&offset=${offset}`)
+  }
+
+  createRestoreDrillSchedule(body: ScheduleInput) {
+    return this.post<{ schedule: Schedule }>('/restore-drills/schedules', body)
+  }
+
+  getRestoreDrillSchedule(id: string) {
+    return this.get<{ schedule: Schedule; runs: ScheduleRun[]; events: DrillEvent[] }>(orchestratorPath`/restore-drills/schedules/${id}`)
+  }
+
+  updateRestoreDrillSchedule(id: string, body: ScheduleInput) {
+    return this.put<{ schedule: Schedule }>(orchestratorPath`/restore-drills/schedules/${id}`, body)
+  }
+
+  deleteRestoreDrillSchedule(id: string) {
+    return this.delete<void>(orchestratorPath`/restore-drills/schedules/${id}`)
+  }
+
+  runRestoreDrillSchedule(id: string) {
+    return this.post<{ run: ScheduleRun }>(orchestratorPath`/restore-drills/schedules/${id}/run`)
+  }
+}
+
+// ============================================
+// Types Pulse (Orchestrator Health)
+// ============================================
+
+export interface PulseHealth {
+  status: 'healthy' | 'degraded' | 'error'
+  time: string
+  version: string
+  components: {
+    drs: {
+      enabled: boolean
+      mode: string
+      active_migrations: number
+    }
+    connections: {
+      total: number
+      connected: number
+      details: Array<{ id: string; status: string }>
+    }
+    alerts?: {
+      active: number
+      critical: number
+      warning: number
+    }
+    database?: {
+      status: string
+    }
+  }
+}
+
+// ============================================
+// Singleton instance
+// ============================================
+
+const orchestratorClient = new OrchestratorClient()
+
+/**
+ * Factory function pour obtenir le client orchestrator
+ * Usage: const client = getOrchestratorClient()
+ *        const response = await client.get('/drs/settings')
+ *        console.log(response.data)
+ */
+export function getOrchestratorClient(): OrchestratorClient {
+  return orchestratorClient
+}
+
+// Export pour compatibilité
+export const orchestrator = orchestratorClient
+export default orchestratorClient
+
+// ============================================
+// Types Alerts
+// ============================================
+
+export interface Alert {
+  id: string
+  connection_id: string
+  type:
+    | 'cpu'
+    | 'memory'
+    | 'storage'
+    | 'node_down'
+    | 'vm_down'
+    | 'event'
+    | 'snapshot_stale'
+    | 'osd_latency'
+    | 'ceph_noout'
+    | 'disk_latency'
+    | 'disk_latency_peak'
+    | 'replication_rpo'
+    | 'replication_failed'
+    | 'backup_coverage'
+    | 'custom'
+  severity: 'info' | 'warning' | 'critical'
+  status: 'active' | 'acknowledged' | 'resolved' | 'silenced'
+  resource: string
+  resource_type: string
+  resource_id: number
+  message: string
+  current_value: number
+  threshold: number
+  unit: string
+  occurrences: number
+  first_seen_at: string
+  last_seen_at: string
+  acknowledged_at?: string
+  acknowledged_by?: string
+  resolved_at?: string
+  notified_at?: string
+  created_at: string
+  updated_at: string
+  silenced_until?: string | null
+  silenced_by?: string
+  _original_status?: string
+  _fingerprint?: string
+}
+
+export interface AlertSummary {
+  total_active: number
+  critical: number
+  warning: number
+  info: number
+  acknowledged: number
+  resolved_today: number
+}
+
+export interface AlertThresholds {
+  cpu_warning: number
+  cpu_critical: number
+  memory_warning: number
+  memory_critical: number
+  storage_warning: number
+  storage_critical: number
+  snapshot_max_age_days: number
+  /** RE2 regex naming the VMs and snapshots the stale-snapshot check skips (discussion #875). */
+  snapshot_exclude_pattern: string
+  /** Points below the warning threshold before a recovery is counted (#551). */
+  recovery_margin: number
+  /** Consecutive collections below the margin before the alert resolves. */
+  recovery_confirmations: number
+  /** Ceph OSD latency in ms that raises a warning (#721). 0 disables the check. */
+  osd_latency_warning: number
+  /** Ceph OSD latency in ms that raises a critical alert (#721). */
+  osd_latency_critical: number
+  /** Hours a per-host Ceph noout flag may stay set before it is reported (ui#1164). 0 disables the check. */
+  ceph_noout_max_hours: number
+  /** Minutes a per-host Ceph noout flag may exist while no node of the cluster is in maintenance (ui#1164). 0 disables the check. */
+  ceph_noout_orphan_minutes: number
+  /** Guest disk latency in ms that raises a warning (#881). 0 disables the check. */
+  disk_latency_warning: number
+  /** Guest disk latency in ms that raises a critical alert (#881). */
+  disk_latency_critical: number
+  /** Minutes a disk must stay above a threshold before it alerts (#881). */
+  disk_latency_window_minutes: number
+  /** Worst single collection interval of the window, in ms, that raises a warning (#881). 0 disables the peak check. */
+  disk_latency_peak_warning: number
+  /** Worst single collection interval of the window, in ms, that raises a critical alert (#881). */
+  disk_latency_peak_critical: number
+  /** Days of per-disk latency history kept for the Disk I/O charts (#881). */
+  disk_latency_retention_days: number
+  /** Days of Ceph cockpit history kept (Enterprise), 1 to 365; 0 or less falls back to 30 on the Go side. */
+  ceph_metrics_retention_days: number
+  /** Days of metrics collections kept, the history the dashboard top consumers and charts can look back on (#1129), 1 to 365. */
+  metrics_retention_days: number
+  /** 1 = the orchestrator reads QEMU block statistics of every running VM (#881); 0 stops the collection, charts and alert included. */
+  disk_latency_collection: number
+  /** Seconds between two metrics collections of the orchestrator (#881), 30 to 600; applied to the scheduler on save. */
+  metrics_interval_seconds: number
+  /**
+   * Tolerance above a replication job's own RPO target, in percent, before its
+   * last successful sync counts as late (#721). 0 disables replication alerts.
+   */
+  replication_rpo_grace_percent: number
+  /** Alert on a failed replication job (#721). 0 disables, 1 enables. */
+  replication_failure_alerts: number
+  /** Alert on every guest no enabled PVE backup job covers (roadmap#48). 0 disables (default), 1 enables. */
+  backup_coverage_alerts?: number
+  /** Hours a new guest may stay uncovered before it is reported (roadmap#48). 0 reports it at once. */
+  backup_coverage_grace_hours?: number
+  /** PVE tag that leaves a guest out of the coverage check on purpose (roadmap#48). Empty disables it. */
+  backup_coverage_exclude_tag?: string
+}
+
+export interface AlertsResponse {
+  data: Alert[]
+  total: number
+  limit: number
+  offset: number
+}
+
+// ============================================
+// Alerts API Methods
+// ============================================
+
+export const alertsApi = {
+  // Get all alerts with filters
+  async getAlerts(params?: {
+    connection_id?: string
+    status?: 'active' | 'acknowledged' | 'resolved'
+    limit?: number
+    offset?: number
+  }): Promise<OrchestratorResponse<AlertsResponse>> {
+    const searchParams = new URLSearchParams()
+
+    if (params?.connection_id) searchParams.set('connection_id', params.connection_id)
+    if (params?.status) searchParams.set('status', params.status)
+    if (params?.limit) searchParams.set('limit', params.limit.toString())
+    if (params?.offset) searchParams.set('offset', params.offset.toString())
+    const query = searchParams.toString()
+
+    
+return orchestratorClient.get<AlertsResponse>(`/alerts${query ? `?${query}` : ''}`)
+  },
+
+  // Get active alerts only
+  async getActiveAlerts(connectionId?: string): Promise<OrchestratorResponse<Alert[]>> {
+    const query = connectionId ? `?${new URLSearchParams({ connection_id: connectionId })}` : ''
+
+
+return orchestratorClient.get<Alert[]>(`/alerts/active${query}`)
+  },
+
+  // Get alert summary
+  async getSummary(connectionId?: string): Promise<OrchestratorResponse<AlertSummary>> {
+    const query = connectionId ? `?${new URLSearchParams({ connection_id: connectionId })}` : ''
+
+
+return orchestratorClient.get<AlertSummary>(`/alerts/summary${query}`)
+  },
+
+  // Get single alert
+  async getAlert(id: string): Promise<OrchestratorResponse<Alert>> {
+    return orchestratorClient.get<Alert>(orchestratorPath`/alerts/${id}`)
+  },
+
+  // Acknowledge an alert
+  async acknowledge(id: string, acknowledgedBy?: string): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.post<{ status: string }>(orchestratorPath`/alerts/${id}/acknowledge`, { acknowledged_by: acknowledgedBy })
+  },
+
+  // Resolve an alert manually
+  async resolve(id: string): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.post<{ status: string }>(orchestratorPath`/alerts/${id}/resolve`)
+  },
+
+  // Delete a single alert by ID
+  async deleteAlert(id: string): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.delete<{ status: string }>(orchestratorPath`/alerts/${id}`)
+  },
+
+  // Clear all active alerts
+  async clearAll(connectionId?: string): Promise<OrchestratorResponse<{ status: string }>> {
+    const query = connectionId ? `?${new URLSearchParams({ connection_id: connectionId })}` : ''
+
+
+return orchestratorClient.delete<{ status: string }>(`/alerts${query}`)
+  },
+
+  // Get thresholds
+  async getThresholds(): Promise<OrchestratorResponse<AlertThresholds>> {
+    return orchestratorClient.get<AlertThresholds>('/alerts/thresholds')
+  },
+
+  // Update thresholds
+  async updateThresholds(thresholds: Partial<AlertThresholds>): Promise<OrchestratorResponse<AlertThresholds>> {
+    return orchestratorClient.put<AlertThresholds>('/alerts/thresholds', thresholds)
+  }
+}
+
+// ============================================
+// Types Event Rules
+// ============================================
+
+export interface EventRule {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+  category: 'task' | 'log' | 'all'
+  level: 'error' | 'warning' | 'info' | 'all'
+  task_types: string  // comma-separated
+  pattern: string
+  connection_id: string
+  node_pattern: string
+  severity: 'info' | 'warning' | 'critical'
+  notify_email: boolean
+  created_at: string
+  updated_at: string
+}
+
+// ============================================
+// Types LDAP (pour délégation vers orchestrator)
+// ============================================
+
+export interface LdapAuthRequest {
+  username: string
+  password: string
+}
+
+export interface LdapAuthResponse {
+  success: boolean
+  user?: {
+    dn: string
+    email: string
+    name: string
+    avatar?: string
+  }
+  error?: string
+}
+
+export interface LdapTestRequest {
+  url: string
+  bind_dn?: string
+  bind_password?: string
+  base_dn: string
+  user_filter?: string
+  tls_insecure?: boolean
+}
+
+export interface LdapTestResponse {
+  success: boolean
+  message: string
+}
+
+// ============================================
+// LDAP API Methods (délégation vers orchestrator)
+// ============================================
+
+export const ldapApi = {
+  /**
+   * Authentifie un utilisateur via LDAP
+   * L'orchestrator gère la connexion LDAP et retourne les infos utilisateur
+   */
+  async authenticate(request: LdapAuthRequest): Promise<OrchestratorResponse<LdapAuthResponse>> {
+    return orchestratorClient.post<LdapAuthResponse>('/auth/ldap/authenticate', request)
+  },
+
+  /**
+   * Teste la connexion LDAP avec les paramètres fournis
+   */
+  async testConnection(request: LdapTestRequest): Promise<OrchestratorResponse<LdapTestResponse>> {
+    return orchestratorClient.post<LdapTestResponse>('/auth/ldap/test', request)
+  },
+}
+
+export interface ProxmoxEvent {
+  id: string
+  ts: string
+  level: string
+  category: string
+  type: string
+  typeLabel: string
+  entity: string
+  node: string
+  user: string
+  status: string
+  message: string
+  connectionId: string
+  connectionName: string
+}
+
+// ============================================
+// Event Rules API Methods
+// ============================================
+
+export const eventRulesApi = {
+  // Get all event rules
+  async getRules(): Promise<OrchestratorResponse<EventRule[]>> {
+    return orchestratorClient.get<EventRule[]>('/alerts/rules')
+  },
+
+  // Get single rule
+  async getRule(id: string): Promise<OrchestratorResponse<EventRule>> {
+    return orchestratorClient.get<EventRule>(orchestratorPath`/alerts/rules/${id}`)
+  },
+
+  // Create a new rule
+  async createRule(rule: Partial<EventRule>): Promise<OrchestratorResponse<EventRule>> {
+    return orchestratorClient.post<EventRule>('/alerts/rules', rule)
+  },
+
+  // Update a rule
+  async updateRule(id: string, rule: Partial<EventRule>): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.put<{ status: string }>(orchestratorPath`/alerts/rules/${id}`, rule)
+  },
+
+  // Delete a rule
+  async deleteRule(id: string): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.delete<{ status: string }>(orchestratorPath`/alerts/rules/${id}`)
+  },
+
+  // Toggle a rule (enable/disable)
+  async toggleRule(id: string): Promise<OrchestratorResponse<{ status: string }>> {
+    return orchestratorClient.post<{ status: string }>(orchestratorPath`/alerts/rules/${id}/toggle`)
+  },
+
+  // Process events (send events to orchestrator for analysis)
+  async processEvents(events: ProxmoxEvent[]): Promise<OrchestratorResponse<{ status: string; processed: number }>> {
+    return orchestratorClient.post<{ status: string; processed: number }>('/alerts/events', events)
+  }
+}

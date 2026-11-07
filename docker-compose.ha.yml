@@ -1,0 +1,254 @@
+# docker-compose.ha.yml
+#
+# Per-node HA compose for the ProxCenter 3-node cluster.
+# Each VM runs this same file with node-specific .env values.
+# Every image is prebuilt and pulled from ghcr.io (see the docker-publish
+# workflow): the conversion never runs `docker build` on a customer node,
+# and nodes only need ghcr.io egress.
+# See docs/ha/prerequisites.md and docs/ha/conversion-runbook.md.
+
+services:
+  # ── Layer 0: distributed consensus ──────────────────────────────
+  etcd:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/etcd:v3.5.17
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - etcd_data:/var/lib/etcd
+    environment:
+      ETCD_NAME: ${NODE_NAME}
+      ETCD_DATA_DIR: /var/lib/etcd
+      ETCD_LISTEN_PEER_URLS: http://${NODE_IP}:2380
+      ETCD_LISTEN_CLIENT_URLS: http://${NODE_IP}:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_IP}:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://${NODE_IP}:2379
+      ETCD_INITIAL_CLUSTER: proxcenter-1=http://${PEER1_IP}:2380,proxcenter-2=http://${PEER2_IP}:2380,proxcenter-3=http://${PEER3_IP}:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_AUTO_COMPACTION_MODE: periodic
+      ETCD_AUTO_COMPACTION_RETENTION: "1h"
+
+  # ── Layer 1: Postgres managed by Patroni ────────────────────────
+  patroni:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-patroni:${VERSION:-latest}
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    # Fresh /tmp on every (re)start so the entrypoint can always re-render
+    # /tmp/patroni.yml. A persisted postgres-owned copy otherwise blocks the
+    # root entrypoint's rewrite on a warm restart and crash-loops the node.
+    tmpfs:
+      - /tmp
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/ha/patroni.yml:/etc/patroni/patroni.yml:ro
+    environment:
+      PATRONI_NAME: ${NODE_NAME}
+      PATRONI_SCOPE: proxcenter
+      # Credentials flow through Patroni's documented environment variables,
+      # never through envsubst into patroni.yml: envsubst cannot quote
+      # arbitrary YAML values, so any printable password must stay an env var.
+      PATRONI_SUPERUSER_USERNAME: ${POSTGRES_USER:-proxcenter}
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_PASSWORD}
+      NODE_IP: ${NODE_IP}
+      PEER1_IP: ${PEER1_IP}
+      PEER2_IP: ${PEER2_IP}
+      PEER3_IP: ${PEER3_IP}
+      PGDATA: /var/lib/postgresql/data
+      # psql client credentials for the entrypoint's replicator-role check.
+      PGUSER: ${POSTGRES_USER:-proxcenter}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      etcd:
+        condition: service_started
+
+  # ── Layer 2: local PG proxy ─────────────────────────────────────
+  haproxy:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/haproxy:2.9-alpine
+    network_mode: host
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c", "sed 's/PEER1_IP/${PEER1_IP}/g; s/PEER2_IP/${PEER2_IP}/g; s/PEER3_IP/${PEER3_IP}/g' /usr/local/etc/haproxy/haproxy.cfg.template > /tmp/haproxy.cfg && exec haproxy -f /tmp/haproxy.cfg"]
+    environment:
+      PEER1_IP: ${PEER1_IP}
+      PEER2_IP: ${PEER2_IP}
+      PEER3_IP: ${PEER3_IP}
+    volumes:
+      - ./config/ha/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+    depends_on:
+      patroni:
+        condition: service_started
+
+  # ── Layer 3: application ────────────────────────────────────────
+  frontend:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-frontend:${VERSION:-latest}
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # Branding / white-label / login-background uploads. Legacy on-disk
+      # assets are imported into Postgres at boot (instrumentation hook);
+      # the volume stays mounted so a converted node 1 keeps serving them.
+      - proxcenter_data:/app/data
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-proxcenter}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB:-proxcenter}?schema=public
+      # Preserved external URL for FQDN / reverse-proxy / OIDC installs;
+      # fresh IP-only installs fall back to the VIP.
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://${VIP}:3000}
+      # The same public URL, under the name the rest of the application reads.
+      # Without it the container simply has no APP_URL, and the HTTPS tab's
+      # coherence check could never be satisfied on an HA install however the
+      # host .env was edited.
+      APP_URL: ${APP_URL:-${NEXTAUTH_URL:-http://${VIP}:3000}}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      APP_SECRET: ${APP_SECRET}
+      # Built-in HTTPS. With network_mode: host there is no ports: mapping to
+      # parametrize (unlike docker-compose.community.yml / .enterprise.yml):
+      # whatever the app listens on inside the container is already the port
+      # used on the host, so only the app-facing variables apply here.
+      # TLS_PORT: port the HTTPS listener binds to. TLS_ENABLED: read once, on
+      # the very first boot, to seed the setting; afterwards /settings is the
+      # source of truth.
+      TLS_PORT: ${TLS_PORT:-8443}
+      TLS_ENABLED: ${TLS_ENABLED:-false}
+      ORCHESTRATOR_URL: http://127.0.0.1:8080
+      # DRS metrics/recommendations go through HAProxy to the leader orchestrator
+      # (ui#803, defect 2); everything else stays on the local orchestrator above.
+      ORCHESTRATOR_LEADER_URL: http://127.0.0.1:8081
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY}
+      PROXCENTER_REPORTING_URL: http://127.0.0.1:5000
+      PG_POOL_MAX: ${PG_POOL_MAX:-}
+      # Session lifetimes, in seconds. Left empty on purpose: the frontend
+      # then applies its defaults, 12 hours of inactivity and 7 days absolute.
+      # A malformed value falls back to those defaults rather than to no limit.
+      # Set the same value on every node, a session must not outlive a failover.
+      SESSION_IDLE_TIMEOUT: ${SESSION_IDLE_TIMEOUT:-}
+      SESSION_ABSOLUTE_TIMEOUT: ${SESSION_ABSOLUTE_TIMEOUT:-}
+      # Cloud image catalog: point TEMPLATE_CATALOG_URL at an internal mirror,
+      # or set TEMPLATE_CATALOG_AUTO_UPDATE=false on an air-gapped install.
+      TEMPLATE_CATALOG_URL: ${TEMPLATE_CATALOG_URL:-}
+      TEMPLATE_CATALOG_AUTO_UPDATE: ${TEMPLATE_CATALOG_AUTO_UPDATE:-}
+      # Air-gapped instance: no version check, no GitHub badge, no catalog
+      # refresh, and the maps say why they cannot show tiles. Written by
+      # install-airgap.sh; leave empty on a connected site.
+      PROXCENTER_OFFLINE: ${PROXCENTER_OFFLINE:-}
+      # Outbound HTTP proxy, written by the installer when it runs behind one.
+      # The frontend only uses it for the calls to the SSO identity provider
+      # (discovery, token, keys, sign-out), and only when no proxy is set in
+      # Settings > OIDC / SSO. Proxmox and the internal services stay direct.
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,frontend,postgres,orchestrator,weasyprint}
+      # Shared secret for the first-run setup endpoint, which is reachable
+      # without authentication for as long as no account exists. Empty keeps
+      # the historical behaviour. A converted cluster already has accounts, so
+      # this only matters on a stack built as HA from the start.
+      PROXCENTER_SETUP_TOKEN: ${PROXCENTER_SETUP_TOKEN:-}
+      # PROXCENTER_INSTANCE_ID is deliberately unset: with host networking the
+      # container inherits the node hostname, which is exactly what the
+      # orphaned-migration sweep needs (unique per node, stable across container
+      # recreation). Never give two nodes the same value: a boot would fail its
+      # live peers' migration jobs (#608).
+      HA_ENABLED: "true"
+      VIP: ${VIP}
+      HA_REDIRECT_DISABLED: ${HA_REDIRECT_DISABLED:-}
+      HA_REDIRECT_EXEMPT_HOSTS: ${HA_REDIRECT_EXEMPT_HOSTS:-}
+      # Proxmox API budgets in milliseconds. Empty keeps the defaults: 8000 for
+      # a regular call, 30000 for the reads that enumerate every storage.
+      PVE_TIMEOUT_MS: ${PVE_TIMEOUT_MS:-}
+      PVE_SLOW_READ_TIMEOUT_MS: ${PVE_SLOW_READ_TIMEOUT_MS:-}
+      # How long a cold migration waits for an operator to pick the root
+      # filesystem before it gives the node temp storage back. Default: 2 hours.
+      V2V_ROOT_CHOICE_TIMEOUT_MS: ${V2V_ROOT_CHOICE_TIMEOUT_MS:-}
+    healthcheck:
+      # Liveness on purpose: /api/health (readiness) returns 503 while the
+      # DB is unreachable, which would flap the container during failover.
+      # Keepalived's track_script owns readiness (config/ha/track_script.sh).
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      haproxy:
+        condition: service_started
+
+  orchestrator:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-orchestrator:${VERSION:-latest}
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - orchestrator_data:/app/data
+      - proxcenter_data:/app/shared_data:ro
+    environment:
+      PROXCENTER_DATABASE_DSN: postgresql://${POSTGRES_USER:-proxcenter}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB:-proxcenter}?sslmode=disable
+      PROXCENTER_API_API_KEY: ${ORCHESTRATOR_API_KEY}
+      PROXCENTER_API_LISTEN: 0.0.0.0:8080
+      PROXCENTER_PROXMOX_APP_SECRET: ${APP_SECRET}
+      PROXCENTER_REPORTING_URL: http://127.0.0.1:5000
+      # CVE scanner sources. Empty keeps the public Debian hosts; an
+      # air-gapped site points both at internal mirrors (see the air-gapped
+      # installation guide).
+      PROXCENTER_CVE_FEED_URL: ${CVE_FEED_URL:-}
+      PROXCENTER_CVE_DEBIAN_MIRROR: ${CVE_DEBIAN_MIRROR:-}
+      # Air-gapped instance: the orchestrator never calls proxcenter.io (no
+      # portal connection, no check-in). Written by install-airgap.sh.
+      PROXCENTER_OFFLINE: ${PROXCENTER_OFFLINE:-}
+      LICENSE_KEY: ${LICENSE_KEY:-}
+      TZ: ${TZ:-Europe/Paris}
+      # sFlow collector: with host networking, UDP 6343 is reachable
+      # directly on the node (no ports: mapping needed).
+      PROXCENTER_SFLOW_ENABLED: "true"
+      PROXCENTER_SFLOW_LISTEN_ADDRESS: 0.0.0.0:6343
+      # Outbound HTTP proxy (CVE feeds, portal), from .env. Empty keeps
+      # direct connections. Proxmox and the HA probes of the cluster nodes
+      # never go through it.
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,frontend,postgres,orchestrator,weasyprint}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      frontend:
+        condition: service_healthy
+
+  weasyprint:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-weasyprint:${VERSION:-latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+
+  # ── Layer 4: VIP management ──────────────────────────────────────
+  keepalived:
+    image: ${REGISTRY:-ghcr.io/adminsyspro}/proxcenter-keepalived:${VERSION:-latest}
+    network_mode: host
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./config/ha/keepalived.conf:/etc/keepalived/keepalived.conf.template:ro
+      - ./config/ha/track_script.sh:/etc/keepalived/track_script.sh:ro
+    environment:
+      NODE_IP: ${NODE_IP}
+      PEER1_IP: ${PEER1_IP}
+      PEER2_IP: ${PEER2_IP}
+      PEER3_IP: ${PEER3_IP}
+      VIP: ${VIP}
+      VIP_INTERFACE: ${VIP_INTERFACE:-eth0}
+      VIP_PREFIX: ${VIP_PREFIX:-24}
+      VRRP_PRIORITY: ${VRRP_PRIORITY:-100}
+    depends_on:
+      frontend:
+        condition: service_healthy
+
+volumes:
+  etcd_data:
+  postgres_data:
+    name: postgres_data
+  orchestrator_data:
+    name: orchestrator_data
+  proxcenter_data:
+    name: proxcenter_data

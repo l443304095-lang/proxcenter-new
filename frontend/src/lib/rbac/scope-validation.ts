@@ -1,0 +1,100 @@
+/**
+ * Shared scope validation for RBAC roles and assignments (issue #383).
+ *
+ * Kept in one place so the assignments routes (POST + PATCH) and the roles
+ * routes (POST + PATCH) validate scope the same way instead of each carrying
+ * its own list (Sonar duplication rule).
+ */
+
+// Scope types an assignment may carry. "inherit" follows the role's default
+// scope; "global" is unscoped. Both carry no target. "storage" names one PVE
+// storage as `connectionId:storageId` (issue #921): it only ever satisfies a
+// check on that storage, so a role scoped to a storage carries no right on
+// the cluster, its nodes or its guests.
+export const ASSIGNMENT_SCOPE_TYPES = [
+  "global",
+  "connection",
+  "node",
+  "vm",
+  "tag",
+  "pool",
+  "storage",
+  "inherit",
+] as const
+
+// Scope types valid as a role's default scope. Excludes "global" (expressed as
+// an empty list) and "inherit" (a role cannot inherit from itself).
+export const ROLE_DEFAULT_SCOPE_TYPES = ["connection", "node", "vm", "tag", "pool", "storage"] as const
+
+const NO_TARGET = new Set<string>(["global", "inherit"])
+
+// How much of the estate a scope type reaches, for "is this change a
+// widening?" comparisons. "inherit" follows the role's default scope, which
+// is at most connection-wide, so it ranks with connection.
+const SCOPE_BREADTH: Record<string, number> = {
+  vm: 0,
+  storage: 0,
+  tag: 1,
+  pool: 1,
+  node: 2,
+  connection: 3,
+  inherit: 3,
+  global: 4,
+}
+
+/** Larger means broader; an unknown type is treated as the broadest. */
+export function scopeBreadth(scopeType: string | null | undefined): number {
+  return SCOPE_BREADTH[String(scopeType)] ?? SCOPE_BREADTH.global
+}
+
+export type ScopeEntry = { scopeType: string; scopeTarget: string }
+
+/**
+ * Validate a single assignment scope. global/inherit carry no target (any
+ * supplied target is dropped); every other type requires a non-empty target.
+ */
+export function validateAssignmentScope(
+  scopeType: string,
+  scopeTarget: string | null | undefined,
+): { ok: boolean; error?: string; scopeType?: string; scopeTarget?: string | null } {
+  if (!ASSIGNMENT_SCOPE_TYPES.includes(scopeType as (typeof ASSIGNMENT_SCOPE_TYPES)[number])) {
+    return { ok: false, error: "Invalid scope_type" }
+  }
+  if (NO_TARGET.has(scopeType)) {
+    return { ok: true, scopeType, scopeTarget: null }
+  }
+  if (!scopeTarget) {
+    return { ok: false, error: "scope_target is required for this scope type" }
+  }
+  return { ok: true, scopeType, scopeTarget }
+}
+
+/**
+ * Validate a role's default_scopes payload. Accepts an array of
+ * { scopeType, scopeTarget } (snake_case keys are also accepted) and returns a
+ * normalized camelCase list. An empty array clears the default scope (global).
+ */
+export function validateRoleDefaultScopes(
+  input: unknown,
+): { ok: boolean; error?: string; scopes?: ScopeEntry[] } {
+  if (!Array.isArray(input)) {
+    return { ok: false, error: "default_scopes must be an array" }
+  }
+  const scopes: ScopeEntry[] = []
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") {
+      return { ok: false, error: "Invalid default_scopes entry" }
+    }
+    const r = raw as Record<string, unknown>
+    const scopeType = (r.scopeType ?? r.scope_type) as string
+    const scopeTarget = (r.scopeTarget ?? r.scope_target) as string
+    if (!ROLE_DEFAULT_SCOPE_TYPES.includes(scopeType as (typeof ROLE_DEFAULT_SCOPE_TYPES)[number])) {
+      return { ok: false, error: `Invalid default_scope scopeType: ${String(scopeType)}` }
+    }
+    if (!scopeTarget || typeof scopeTarget !== "string") {
+      return { ok: false, error: "scopeTarget is required for each default_scope" }
+    }
+    scopes.push({ scopeType, scopeTarget })
+  }
+  return { ok: true, scopes }
+}

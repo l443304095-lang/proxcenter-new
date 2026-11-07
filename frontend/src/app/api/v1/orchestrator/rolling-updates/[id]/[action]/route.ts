@@ -1,0 +1,75 @@
+import { NextResponse } from "next/server"
+
+import { getTenantConnectionIds } from "@/lib/tenant"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { orchestratorHeaders } from "@/lib/orchestrator/headers"
+import { orchestratorSegment, OrchestratorPathError } from "@/lib/orchestrator/client"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || "http://localhost:8080"
+
+// POST /api/v1/orchestrator/rolling-updates/[id]/[action] — tenant-scoped
+// Actions: pause, resume, cancel, approve
+async function handlePost(
+  _req: Request,
+  ctx: { params: Promise<{ id: string; action: string }> }
+) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_EXECUTE)
+    if (denied) return denied
+
+    const { id, action } = await ctx.params
+
+    const validActions = ["pause", "resume", "cancel", "approve"]
+    if (!validActions.includes(action)) {
+      return NextResponse.json(
+        { error: `Invalid action: ${action}. Valid actions: ${validActions.join(", ")}` },
+        { status: 400 }
+      )
+    }
+
+    // Verify rolling update belongs to tenant
+    const ruRes = await fetch(`${ORCHESTRATOR_URL}/api/v1/rolling-updates/${orchestratorSegment(id)}`, {
+      headers: await orchestratorHeaders({ "Content-Type": "application/json" }),
+    })
+    if (ruRes.ok) {
+      const ruData = await ruRes.json()
+      const ru = ruData?.data || ruData
+      if (ru?.connection_id) {
+        const tenantConnectionIds = await getTenantConnectionIds()
+        if (!tenantConnectionIds.has(ru.connection_id)) {
+          return NextResponse.json({ error: 'Rolling update not found' }, { status: 404 })
+        }
+      }
+    }
+
+    const response = await fetch(`${ORCHESTRATOR_URL}/api/v1/rolling-updates/${orchestratorSegment(id)}/${action}`, {
+      method: "POST",
+      headers: await orchestratorHeaders({ "Content-Type": "application/json" }),
+    })
+
+    const data = await response.json()
+
+    if (!response.ok) {
+      return NextResponse.json(
+        { error: data.error || `Failed to ${action} rolling update` },
+        { status: response.status }
+      )
+    }
+
+    return NextResponse.json({ data })
+  } catch (error: any) {
+    if (error instanceof OrchestratorPathError) return NextResponse.json({ error: error.message }, { status: 400 })
+    if ((error as any)?.code !== 'ORCHESTRATOR_UNAVAILABLE') {
+      console.error(`Error in rolling update action:`, error)
+    }
+    return NextResponse.json(
+      { error: error.message || "Internal server error" },
+      { status: 500 }
+    )
+  }
+}
+
+export const POST = withAudit({ category: "automation", resourceType: "rolling_update", resourceParam: "id", action: "execute" }, handlePost)

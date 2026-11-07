@@ -1,0 +1,656 @@
+'use client'
+
+// Standalone restore dialog used wherever a VM backup is listed (currently
+// VmDetailTabs > Backup tab). PbsServerPanel ships its own inlined version
+// for the PBS storage browser flow — this component handles the
+// "I'm looking at a VM and want to restore one of its backups" flow.
+//
+// Backend contract: POST /api/v1/connections/{id}/nodes/{node}/restore
+// (qmrestore for qemu, vzrestore for lxc). The post-restore IPAM sync is
+// scheduled server-side via after(); the dialog just kicks off the task
+// and returns the UPID for the caller to track.
+
+import { useEffect, useMemo, useState } from 'react'
+import { useLocale, useTranslations } from 'next-intl'
+import {
+  Alert,
+  Box,
+  Button,
+  CircularProgress,
+  Dialog, DialogActions, DialogContent,
+  FormControl, FormControlLabel, InputLabel,
+  MenuItem,
+  Select,
+  Stack,
+  Switch,
+  TextField,
+  Typography,
+} from '@mui/material'
+
+import AppDialogTitle from '@/components/ui/AppDialogTitle'
+import { useTenant } from '@/contexts/TenantContext'
+import { useRBAC } from '@/contexts/RBACContext'
+import { formatDateTime } from '@/lib/i18n/date'
+import { readVdcContextCookie } from '@/lib/vdc/contextCookie'
+import { useTaskTracker } from '@/hooks/useTaskTracker'
+import { checkRestoredTagsOmitted, restoredTagsCheckMessage } from '@/lib/backups/restoreTags'
+import RestoreTagsSwitch from '@/components/backup/RestoreTagsSwitch'
+
+interface BackupRef {
+  /** Full PVE volid, e.g. `pbs:backup/vm/100/2025-04-01T10:00:00Z`.
+   *  Optional — when absent, pass the PBS-side coordinates instead and
+   *  the backend will resolve the matching PVE storage to compose the
+   *  volid. The /api/v1/guests/{vmid}/backups endpoint queries PBS
+   *  directly so it never produces a volid; that's the common case. */
+  volid?: string
+  /** PBS-side coordinates for the resolution path. */
+  pbsId?: string
+  datastore?: string
+  namespace?: string
+  backupPath?: string
+  vmid?: number
+  format?: string
+  size?: number | string
+  /** Raw backup epoch (seconds). Preferred over backupTimeFormatted so the
+   *  time renders in the viewer's timezone (real local time), not the server
+   *  container's UTC clock. See discussion #379. */
+  backupTime?: number
+  backupTimeFormatted?: string
+  /** Friendly VM name from the snapshot's `comment` field (PBS) — used
+   *  to label the dialog header instead of leaking the raw backupPath. */
+  vmName?: string
+}
+
+interface Props {
+  open: boolean
+  onClose: () => void
+  /** PVE connection holding the target node (where the restore runs). When
+   *  null/undefined the dialog renders a connection picker — used by the
+   *  cross-PVE /operations/backups view where the listed backups don't
+   *  carry their target cluster context. */
+  connectionId?: string | null
+  /** Node where the restore runs. Same nullable semantics as connectionId. */
+  node?: string | null
+  /** "qemu" or "lxc" — drives endpoint choice + which fields show. */
+  type: 'qemu' | 'lxc'
+  backup: BackupRef
+  /** Original VMID — pre-fills the target field but the user can change it. */
+  sourceVmid: number
+  /** Optional callback fired when the restore POST returns a UPID. */
+  onStarted?: (upid: string) => void
+}
+
+interface StorageOption { storage: string; type?: string }
+
+export default function RestoreVmDialog({
+  open, onClose, connectionId: connectionIdProp, node: nodeProp, type, backup, sourceVmid, onStarted,
+}: Props) {
+  const t = useTranslations()
+  const locale = useLocale()
+  // Tenant mode (vDC) hides every infra picker — VMID, target cluster, node,
+  // storage, MAC/start/live/bandwidth flags. The vDC abstraction owns those
+  // decisions; a tenant just renames the restored VM. Provider / 'default'
+  // tenant keeps the full surface so the operator can pick the target.
+  const { currentTenant, loading: tenantLoading } = useTenant()
+  const isVdcTenant = !tenantLoading && !!currentTenant && currentTenant.id !== 'default' && currentTenant.operatingModel !== 'msp'
+  // Overwriting an existing guest destroys it: the route checks vm.delete on it.
+  const rbac = useRBAC()
+  const canOverwrite = !rbac.loading && rbac.hasPermission('vm.delete')
+
+  // When the caller provides connectionId/node, lock them; otherwise we
+  // render pickers and the user picks. Internal state holds the effective
+  // values used by the load + submit paths.
+  const callerLocksConn = !!connectionIdProp
+  const callerLocksNode = !!nodeProp
+  const [pickedConnectionId, setPickedConnectionId] = useState<string>('')
+  const [pickedNode, setPickedNode] = useState<string>('')
+  const [tenantVdcs, setTenantVdcs] = useState<any[]>([])
+  const [pickedVdcId, setPickedVdcId] = useState<string>('')
+  const connectionId = callerLocksConn ? connectionIdProp! : pickedConnectionId
+  const node = callerLocksNode ? nodeProp! : pickedNode
+
+  const [pveConnections, setPveConnections] = useState<Array<{ id: string; name: string }>>([])
+  const [nodes, setNodes] = useState<Array<{ node: string; status?: string }>>([])
+
+  const [vmid, setVmid] = useState<string>(String(sourceVmid))
+  const [storage, setStorage] = useState('')
+  const [storages, setStorages] = useState<StorageOption[]>([])
+  const [usedVmIds, setUsedVmIds] = useState<Set<number>>(new Set())
+  const [unique, setUnique] = useState(false)
+  const [start, setStart] = useState(false)
+  const [live, setLive] = useState(false)
+  const [bwlimit, setBwlimit] = useState('')
+  const [overrideName, setOverrideName] = useState(false)
+  const [name, setName] = useState('')
+  // #965: keep the backed-up tags (PVE's behaviour) unless told otherwise.
+  const [restoreTags, setRestoreTags] = useState(true)
+  const { trackTask } = useTaskTracker()
+
+  // Tenant-mode-only: pick between overwriting the source VM or spawning
+  // a brand-new VM with a fresh VMID. Defaults to overwrite (the more
+  // common "rollback" flow); `awaitingConfirm` gates the destructive
+  // overwrite behind a second click.
+  const [restoreAsNewChoice, setRestoreAsNewChoice] = useState(false)
+  // A tenant without vm.delete can only restore as a new VM.
+  const restoreAsNew = restoreAsNewChoice || (isVdcTenant && !canOverwrite)
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false)
+
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Reset when (re)opened. In tenant mode, force overrideName=true so the
+  // single tenant-facing field (the new VM name) is always visible.
+  useEffect(() => {
+    if (!open) return
+    setVmid(String(sourceVmid))
+    setStorage('')
+    setUnique(false)
+    setStart(false)
+    setLive(false)
+    setBwlimit('')
+    setOverrideName(isVdcTenant)
+    setName('')
+    setRestoreTags(true)
+    setError(null)
+    setRestoreAsNewChoice(false)
+    setAwaitingConfirm(false)
+    if (!callerLocksConn) setPickedConnectionId('')
+    if (!callerLocksNode) setPickedNode('')
+  }, [open, sourceVmid, callerLocksConn, callerLocksNode, isVdcTenant])
+
+  // Reset the destructive-confirm guard whenever the tenant flips the
+  // mode toggle so a "yes, overwrite" intent can't carry over to a
+  // "create new" submission.
+  useEffect(() => { setAwaitingConfirm(false) }, [restoreAsNew])
+
+  const applyVdc = (v: any) => {
+    setPickedVdcId(v.id)
+    if (!callerLocksConn) setPickedConnectionId(v.connectionId)
+    if (!callerLocksNode && Array.isArray(v.nodes) && v.nodes.length > 0) {
+      setPickedNode(v.nodes[0])
+    }
+  }
+
+  // Tenant mode + cross-PVE caller (no locked connection) → resolve the
+  // target vDC. Single-vDC tenants keep the silent auto-pick; multi-vDC
+  // tenants get a selector (rendered below), defaulted to the vDC whose
+  // PBS binding matches the backup's (pbsId, datastore, namespace) so a
+  // Paris backup doesn't restore to Frankfurt by default.
+  useEffect(() => {
+    if (!open || !isVdcTenant) return
+    if (callerLocksConn && callerLocksNode) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const r = await fetch('/api/v1/vdcs', { cache: 'no-store' })
+        if (cancelled) return
+        if (r.ok) {
+          const j = await r.json()
+          const list: any[] = (Array.isArray(j?.data) ? j.data : []).filter(
+            (v) => v.connectionId && v.enabled !== false
+          )
+          setTenantVdcs(list)
+          const byBinding = list.find((v) =>
+            Array.isArray(v.pbsBindings) && v.pbsBindings.some((b: any) =>
+              (!backup.pbsId || b.pbsConnectionId === backup.pbsId) &&
+              (!backup.datastore || b.datastore === backup.datastore) &&
+              (backup.namespace === undefined || b.namespace === (backup.namespace || ''))
+            )
+          )
+          // Precise vDC context (header switcher): it wins over the PBS
+          // binding heuristic — the visible backups are already narrowed to
+          // that vDC server-side, so target and source always agree.
+          const ctxVdcId = readVdcContextCookie()
+          const byContext = ctxVdcId ? list.find((v) => v.id === ctxVdcId) : undefined
+          const target = byContext || byBinding || list[0]
+          if (target) applyVdc(target)
+        }
+      } catch { /* ignore — falls through to the normal pickers, which we hide anyway */ }
+    })()
+    return () => { cancelled = true }
+  }, [open, isVdcTenant, callerLocksConn, callerLocksNode])
+
+  // Load PVE connections list when the user needs to pick one.
+  useEffect(() => {
+    if (!open || callerLocksConn) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const r = await fetch('/api/v1/connections?type=pve', { cache: 'no-store' })
+        if (cancelled) return
+        if (r.ok) {
+          const j = await r.json()
+          setPveConnections(Array.isArray(j?.data) ? j.data : [])
+        }
+      } catch { /* ignore */ }
+    })()
+    return () => { cancelled = true }
+  }, [open, callerLocksConn])
+
+  // Load nodes when a connection is known and the caller didn't lock the node.
+  useEffect(() => {
+    if (!open || callerLocksNode || !connectionId) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const r = await fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/nodes`, { cache: 'no-store' })
+        if (cancelled) return
+        if (r.ok) {
+          const j = await r.json()
+          const list = Array.isArray(j) ? j : (j?.data || [])
+          setNodes(list.filter((n: any) => n.status === 'online'))
+        }
+      } catch { /* ignore */ }
+    })()
+    return () => { cancelled = true }
+  }, [open, callerLocksNode, connectionId])
+
+  // Load target storages + used VMIDs when (connectionId, node) become known.
+  useEffect(() => {
+    if (!open || !connectionId || !node) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const contentType = type === 'lxc' ? 'rootdir' : 'images'
+        const r = await fetch(
+          `/api/v1/connections/${encodeURIComponent(connectionId)}/nodes/${encodeURIComponent(node)}/storages?content=${contentType}`,
+          { cache: 'no-store' },
+        )
+        if (cancelled) return
+        if (r.ok) {
+          const j = await r.json()
+          setStorages(Array.isArray(j?.data) ? j.data : [])
+        }
+      } catch { /* ignore */ }
+      try {
+        const r = await fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/resources`, { cache: 'no-store' })
+        if (cancelled) return
+        if (r.ok) {
+          const j = await r.json()
+          const ids = new Set<number>(
+            (Array.isArray(j?.data) ? j.data : [])
+              .map((x: any) => Number(x?.vmid))
+              .filter((n: number) => Number.isFinite(n)),
+          )
+          setUsedVmIds(ids)
+        }
+      } catch { /* ignore */ }
+    })()
+    return () => { cancelled = true }
+  }, [open, connectionId, node, type])
+
+  // Same split as PVE: restoring over the source VMID is a full restore and
+  // keeps the backed-up MACs, restoring to another VMID is a clone and
+  // defaults to fresh MACs so it does not collide with the still-running
+  // source on L2 or in the IPAM (subnet, mac) UNIQUE. Either way the user
+  // can flip the switch; the default only moves when the case changes.
+  const targetVmidNumber = Number.parseInt(vmid)
+  const isCloneVmid = (value: string) => {
+    const n = Number.parseInt(value)
+
+    return Number.isFinite(n) && n !== sourceVmid
+  }
+  const handleVmidChange = (value: string) => {
+    const next = value.replace(/[^0-9]/g, '')
+
+    if (isCloneVmid(next) !== isCloneVmid(vmid)) setUnique(isCloneVmid(next))
+    setVmid(next)
+    setAwaitingConfirm(false)
+  }
+
+  // PVE refuses a restore onto a VMID that already exists unless `force=1`
+  // is sent, so both paths that land on an existing VM go through the same
+  // two-click confirmation: the tenant overwrite toggle, and a provider
+  // whose typed VMID is taken (the source VM itself or any other guest).
+  const targetExists = Number.isFinite(targetVmidNumber) && usedVmIds.has(targetVmidNumber)
+  const overwriting = isVdcTenant ? !restoreAsNew : targetExists
+  const overwriteBlocked = !isVdcTenant && targetExists && !canOverwrite
+  const overwriteVmid = isVdcTenant ? sourceVmid : targetVmidNumber
+  const targetExistsKey = canOverwrite ? 'inventory.pbsRestoreTargetExists' : 'inventory.pbsRestoreTargetExistsNoOverwrite'
+
+  const vmidValid = useMemo(() => {
+    if (!Number.isFinite(targetVmidNumber)) return false
+    if (targetVmidNumber < 100 || targetVmidNumber > 999999999) return false
+    // If the target exists and the user hasn't enabled unique, we'll
+    // overwrite the running VM — flag it as a soft warning, not a block.
+    return true
+  }, [targetVmidNumber])
+
+  // Tenant: vmid is derived (sourceVmid for overwrite, /cluster/nextid
+  // for new VM) so we don't gate on `vmid` being typed in. Provider:
+  // unchanged, the field is required.
+  const canSubmit = !submitting && !!connectionId && !!node && !overwriteBlocked && (
+    isVdcTenant ? true : (!!vmid && vmidValid)
+  )
+
+  const handleSubmit = async () => {
+    if (!canSubmit) return
+
+    // Overwrite is destructive — require a second click confirming the
+    // intent. The first click flips `awaitingConfirm` and surfaces a
+    // warning Alert; the second proceeds.
+    if (overwriting && !awaitingConfirm) {
+      setAwaitingConfirm(true)
+      return
+    }
+
+    setSubmitting(true)
+    setError(null)
+    try {
+      // Resolve the target VMID. Tenant + restoreAsNew → /cluster/nextid.
+      // Tenant + overwrite → reuse source. Provider → use the typed value.
+      let effectiveVmid = targetVmidNumber
+      if (isVdcTenant) {
+        if (restoreAsNew) {
+          try {
+            const r = await fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/cluster/nextid`, { cache: 'no-store' })
+            const j = await r.json()
+            if (!r.ok) {
+              setError(j?.error || `nextid HTTP ${r.status}`)
+              setSubmitting(false)
+              return
+            }
+            const candidate = Number(j?.data ?? j?.vmid ?? j)
+            if (!Number.isFinite(candidate)) {
+              setError('Could not allocate a fresh VMID')
+              setSubmitting(false)
+              return
+            }
+            effectiveVmid = candidate
+          } catch (e: any) {
+            setError(e?.message || 'Failed to allocate VMID')
+            setSubmitting(false)
+            return
+          }
+        } else {
+          effectiveVmid = sourceVmid
+        }
+      }
+
+      const body: Record<string, any> = {
+        vmid: effectiveVmid,
+        type,
+      }
+      // Overwrite branch only — `force=1` lets PVE replace the existing
+      // VMID. New-VM branch never sets it (the VMID is fresh).
+      if (overwriting) {
+        body.force = true
+      }
+      // Tenant + new VM → ensure unique MACs to avoid an L2 collision
+      // with the still-running source.
+      if (isVdcTenant && restoreAsNew) {
+        body.unique = true
+      }
+      // Caller provided a fully-qualified PVE volid → use it. Otherwise
+      // hand the PBS-side coordinates to the backend so it resolves the
+      // PVE storage that maps onto this datastore + namespace.
+      if (backup.volid) {
+        body.archive = backup.volid
+      } else if (backup.pbsId && backup.datastore && backup.backupPath) {
+        body.pbsBackup = {
+          pbsId: backup.pbsId,
+          datastore: backup.datastore,
+          namespace: backup.namespace || '',
+          backupPath: backup.backupPath,
+        }
+      } else {
+        setError('Backup reference incomplete — missing volid or PBS coordinates')
+        setSubmitting(false)
+        return
+      }
+      if (storage) body.storage = storage
+      if (bwlimit) body.bwlimit = Number.parseInt(bwlimit)
+      if (unique) body.unique = true
+      if (start) body.start = true
+      if (live && type === 'qemu') body.live = true
+      // Tenant overwrite path keeps the source name — don't forward
+      // the (now hidden) name input. New-VM and provider-override paths
+      // honour whatever the user typed.
+      const wantName =
+        (isVdcTenant && restoreAsNew) || (!isVdcTenant && overrideName)
+      if (wantName && name) body.name = name
+      if (!restoreTags) body.restoreTags = false
+
+      const r = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connectionId)}/nodes/${encodeURIComponent(node)}/restore`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      const j = await r.json().catch(() => ({}))
+      if (!r.ok) {
+        setError(j?.error || `HTTP ${r.status}`)
+        return
+      }
+      if (typeof j?.data === 'string') {
+        onStarted?.(j.data)
+        // Tags omitted: follow the task and read the restored config back
+        // before calling it done, so a guest that kept its tags is reported
+        // instead of being announced as a clean restore.
+        if (!restoreTags) {
+          const restoredType = type
+          void trackTask({
+            upid: j.data,
+            connId: connectionId,
+            node,
+            description: `Restore ${restoredType === 'lxc' ? 'CT' : 'VM'} ${effectiveVmid}`,
+            timeoutMs: 6 * 60 * 60 * 1000,
+            verify: async () => restoredTagsCheckMessage(
+              await checkRestoredTagsOmitted({ connectionId, node, type: restoredType, vmid: effectiveVmid }),
+              t as any,
+            ),
+          })
+        }
+      }
+      onClose()
+    } catch (e: any) {
+      setError(e?.message || 'Restore failed')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const restoreLabel = type === 'lxc' ? t('inventory.pbsRestoreCt') : t('inventory.pbsRestoreVm')
+  const submitLabel = overwriting && awaitingConfirm ? t('inventory.pbsRestoreOverwriteConfirmButton') : restoreLabel
+
+  return (
+    <Dialog open={open} onClose={submitting ? undefined : onClose} maxWidth="sm" fullWidth>
+      <AppDialogTitle onClose={onClose}>
+        {restoreLabel}
+      </AppDialogTitle>
+      <DialogContent>
+        <Stack spacing={2} mt={1}>
+          <Alert severity="info" variant="outlined" sx={{ fontSize: '0.8rem' }} icon={<i className="ri-information-line" style={{ fontSize: 16 }} />}>
+            {(() => {
+              const label = type === 'lxc' ? 'CT' : 'VM'
+              const head = backup.vmName
+                ? `${label} ${backup.vmName} (${sourceVmid})`
+                : `${label} ${sourceVmid}`
+              const when = backup.backupTime
+                ? formatDateTime(backup.backupTime * 1000, locale)
+                : backup.backupTimeFormatted
+              return when
+                ? `${head} · ${when}`
+                : head
+            })()}
+          </Alert>
+
+          {/* Target pickers + every infra-level field are hidden in tenant
+              (vDC) mode. The vDC abstraction owns target cluster/node,
+              VMID assignment, storage selection, and the MAC/start/live
+              flags — exposing them would break the cloud-style abstraction
+              the tenant signed up for. Provider / 'default' tenant keeps
+              the full surface so the operator can drive every option. */}
+          {!isVdcTenant && !callerLocksConn && (
+            <FormControl size="small" fullWidth>
+              <InputLabel>{t('inventory.pbsRestoreTargetCluster')}</InputLabel>
+              <Select
+                value={pickedConnectionId}
+                onChange={(e) => { setPickedConnectionId(String(e.target.value)); setPickedNode('') }}
+                label={t('inventory.pbsRestoreTargetCluster')}
+              >
+                {pveConnections.map((c) => (
+                  <MenuItem key={c.id} value={c.id}>{c.name}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+          {!isVdcTenant && !callerLocksNode && (
+            <FormControl size="small" fullWidth disabled={!connectionId}>
+              <InputLabel>{t('inventory.pbsRestoreTargetNode')}</InputLabel>
+              <Select
+                value={pickedNode}
+                onChange={(e) => setPickedNode(String(e.target.value))}
+                label={t('inventory.pbsRestoreTargetNode')}
+              >
+                {nodes.map((n) => (
+                  <MenuItem key={n.node} value={n.node}>{n.node}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+
+          {!isVdcTenant && (
+            <TextField
+              size="small"
+              label={t('common.vmId')}
+              value={vmid}
+              onChange={(e) => handleVmidChange(e.target.value)}
+              error={(!!vmid && !vmidValid) || overwriteBlocked}
+              helperText={
+                targetExists
+                  ? t(targetExistsKey, { vmid: targetVmidNumber })
+                  : undefined
+              }
+              fullWidth
+            />
+          )}
+
+          {!isVdcTenant && (
+            <FormControl size="small" fullWidth>
+              <InputLabel>{t('inventory.pbsRestoreStorage')}</InputLabel>
+              <Select
+                value={storage}
+                onChange={(e) => setStorage(String(e.target.value))}
+                label={t('inventory.pbsRestoreStorage')}
+              >
+                <MenuItem value="">
+                  <em>{t('common.default')}</em>
+                </MenuItem>
+                {storages.map((s) => (
+                  <MenuItem key={s.storage} value={s.storage}>{s.storage}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+
+          {!isVdcTenant && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+              <FormControlLabel
+                control={<Switch checked={unique} onChange={(_, v) => setUnique(v)} />}
+                label={t('inventory.pbsRestoreUnique')}
+              />
+              <FormControlLabel
+                control={<Switch checked={start} onChange={(_, v) => setStart(v)} />}
+                label={t('inventory.pbsRestoreStart')}
+              />
+              {type === 'qemu' && (
+                <FormControlLabel
+                  control={<Switch checked={live} onChange={(_, v) => setLive(v)} />}
+                  label={t('inventory.pbsRestoreLive')}
+                />
+              )}
+              <FormControlLabel
+                control={<Switch checked={overrideName} onChange={(_, v) => setOverrideName(v)} />}
+                label={t('inventory.pbsRestoreOverrideName')}
+              />
+            </Box>
+          )}
+
+          {!isVdcTenant && <RestoreTagsSwitch checked={restoreTags} onChange={setRestoreTags} />}
+
+          {isVdcTenant && !callerLocksConn && tenantVdcs.length > 1 &&
+            !(readVdcContextCookie() && pickedVdcId === readVdcContextCookie()) && (
+            <FormControl fullWidth size="small">
+              <InputLabel>{t('myVdc.selectVdc')}</InputLabel>
+              <Select
+                value={pickedVdcId}
+                label={t('myVdc.selectVdc')}
+                onChange={(e) => {
+                  const v = tenantVdcs.find((x) => x.id === e.target.value)
+                  if (v) applyVdc(v)
+                }}
+              >
+                {tenantVdcs.map((v) => (
+                  <MenuItem key={v.id} value={v.id}>{v.name}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+
+          {/* Name field is meaningful only when we're spawning a NEW VM
+              (tenant: restoreAsNew, provider: explicit override toggle).
+              Overwrite path keeps the source VM's existing name. */}
+          {((isVdcTenant && restoreAsNew) || (!isVdcTenant && overrideName)) && (
+            <TextField
+              size="small"
+              label={t('common.name')}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={backup.vmName || ''}
+              fullWidth
+            />
+          )}
+
+          {/* Tenant-only mode toggle: overwrite source VM (default) vs
+              spawn a new VM. The new-VM path auto-allocates a fresh VMID
+              via /cluster/nextid and forces unique MACs. */}
+          {isVdcTenant && canOverwrite && (
+            <FormControlLabel
+              control={<Switch checked={restoreAsNew} onChange={(_, v) => setRestoreAsNewChoice(v)} />}
+              label={t('inventory.pbsRestoreAsNew')}
+            />
+          )}
+
+          {/* Confirmation banner for the destructive overwrite path —
+              only shown after the first submit click. */}
+          {overwriting && awaitingConfirm && (
+            <Alert severity="warning" icon={<i className="ri-alert-line" style={{ fontSize: 18 }} />}>
+              {t('inventory.pbsRestoreOverwriteConfirm', { vmid: overwriteVmid })}
+            </Alert>
+          )}
+
+          {!isVdcTenant && (
+            <TextField
+              size="small"
+              label={t('inventory.pbsRestoreBandwidth')}
+              value={bwlimit}
+              onChange={(e) => setBwlimit(e.target.value.replace(/[^0-9]/g, ''))}
+              placeholder={t('common.unlimited')}
+              fullWidth
+            />
+          )}
+
+          <Typography variant="caption" sx={{ opacity: 0.6 }}>
+            {t('inventory.pbsRestoreIpamNote')}
+          </Typography>
+
+          {error && <Alert severity="error">{error}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} disabled={submitting}>{t('common.cancel')}</Button>
+        <Button
+          variant="contained"
+          color={overwriting && awaitingConfirm ? 'warning' : 'primary'}
+          onClick={handleSubmit}
+          disabled={!canSubmit}
+        >
+          {submitting ? <CircularProgress size={16} /> : submitLabel}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}

@@ -1,0 +1,358 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  tenant: vi.fn(), infra: vi.fn(), permission: vi.fn(), pve: vi.fn(), connection: vi.fn(),
+  create: vi.fn(), update: vi.fn(), find: vi.fn(),
+}))
+vi.mock('@/lib/tenant', () => ({
+  DEFAULT_TENANT_ID: 'default', getCurrentTenantId: mocks.tenant,
+  getSessionPrisma: async () => ({ customImage: { create: mocks.create, update: mocks.update, findUnique: mocks.find } }),
+}))
+vi.mock('@/lib/tenant/infraScope', () => ({ getTenantInfrastructureScope: mocks.infra }))
+vi.mock('@/lib/rbac', () => ({ checkPermission: mocks.permission, PERMISSIONS: { VM_CREATE: 'vm.create', VM_CLONE: 'vm.clone' }, buildVmResourceId: (...parts: string[]) => parts.join(':') }))
+vi.mock('next-auth', () => ({ getServerSession: async () => ({ user: { id: 'user-a' } }) }))
+vi.mock('@/lib/auth/config', () => ({ authOptions: {} }))
+vi.mock('@/lib/connections/getConnection', () => ({ getConnectionById: mocks.connection }))
+vi.mock('@/lib/proxmox/client', () => ({ pveFetch: mocks.pve }))
+vi.mock('@/lib/db/prisma', () => ({ prisma: { tenant: { findUnique: async () => ({ slug: 'acme' }), findMany: async () => [{ id: 'tenant-a', slug: 'acme' }, { id: 'tenant-b', slug: 'acme-prod' }] } } }))
+vi.mock('@/lib/audit', () => ({ audit: async () => {} }))
+
+import { POST } from './route'
+import { PUT } from './[id]/route'
+import { authorizeImageVolume, imageSourceForConnection } from '@/lib/templates/sourceVolume'
+import { URL_IMAGE_REFUSED } from '@/lib/vdc/nodeUrlFetch'
+
+const body = { name: 'Disk image', sourceType: 'volume', volumeId: 'shared:vm-201-disk-0', sourceConnectionId: 'conn-a', sourceNode: 'pve1' }
+const request = (data: object) => new Request('http://localhost/api/v1/templates/custom-images', { method: 'POST', body: JSON.stringify(data) })
+const scope = () => ({
+  connectionIds: new Set(['conn-a']), nodesByConnection: new Map([['conn-a', new Set(['pve1'])]]),
+  storagesByConnection: new Map([['conn-a', new Set(['shared', 'library', 'nas.isos'])]]),
+  writableStoragesByConnection: new Map([['conn-a', new Set(['shared'])]]),
+  isoLibrariesByConnection: new Map([['conn-a', new Set(['library', 'nas.isos'])]]),
+  poolsByConnection: new Map([['conn-a', new Set(['pool-a'])]]),
+})
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  mocks.tenant.mockResolvedValue('tenant-a')
+  mocks.infra.mockResolvedValue({ kind: 'iaas', vdcScope: scope() })
+  mocks.permission.mockResolvedValue(null)
+  mocks.connection.mockResolvedValue({ id: 'conn-a' })
+  mocks.find.mockResolvedValue(null)
+  mocks.create.mockImplementation(async ({ data }) => ({ id: 'image-a', ...data }))
+  mocks.update.mockImplementation(async ({ data }) => ({ id: 'image-a', ...data }))
+  mocks.pve.mockImplementation(async (_conn, path) => {
+    if (path.endsWith('/content')) return [{ volid: body.volumeId, content: 'images', vmid: 201 }]
+    if (path === '/cluster/resources?type=vm') return [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-a' }]
+    return { shared: 1, type: 'rbd' }
+  })
+})
+
+describe('custom image source authorization', () => {
+  it('rejects a source on an unauthorized storage before saving an image', async () => {
+    const response = await POST(request({ ...body, volumeId: 'foreign:vm-201-disk-0' }))
+    expect(response.status).toBe(403)
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.pve).not.toHaveBeenCalled()
+  })
+
+  it('rejects another tenant disk on a storage both tenants can use', async () => {
+    mocks.pve.mockImplementation(async (_conn, path) => path.endsWith('/content')
+      ? [{ volid: body.volumeId, content: 'images', vmid: 201 }]
+      : [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-b' }])
+    const response = await POST(request(body))
+    expect(response.status).toBe(403)
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it('cannot bypass source checks by updating an existing URL image', async () => {
+    mocks.find.mockResolvedValue({ id: 'image-a', tenantId: 'tenant-a', sourceType: 'url', downloadUrl: 'https://example.test/image.qcow2' })
+    const response = await PUT(request({ ...body, volumeId: 'foreign:vm-201-disk-0' }), { params: Promise.resolve({ id: 'image-a' }) })
+    expect(response.status).toBe(403)
+    expect(mocks.update).not.toHaveBeenCalled()
+  })
+
+  it('records the selected cluster and node when the tenant owns the source disk', async () => {
+    const response = await POST(request(body))
+    expect(response.status).toBe(201)
+    const result = await response.json()
+    expect(result.data.sourceConnectionId).toBe('conn-a')
+    expect(result.data.sourceNode).toBe('pve1')
+  })
+
+  it.each(['shared:vm-201-disk-0,import-from=foreign:disk', 'shared:../secret', 'shared:/etc/passwd', 'shared:import/%2e%2e/file', 'shared:import//file'])('rejects ambiguous or injected volume %s', async volumeId => {
+    const response = await POST(request({ ...body, volumeId }))
+    expect(response.status).toBe(400)
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it.each([{ sourceConnectionId: 'foreign' }, { sourceNode: 'pve9' }])('rejects an unauthorized source location %o', async location => {
+    const response = await POST(request({ ...body, ...location }))
+    expect(response.status).toBe(403)
+    expect(mocks.pve).not.toHaveBeenCalled()
+  })
+
+  it('requires source coordinates even when a tenant forges sharing flags', async () => {
+    const response = await POST(request({ name: 'Unbound', sourceType: 'volume', volumeId: body.volumeId, isShared: true, tenantId: 'default' }))
+    expect(response.status).toBe(409)
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it('cannot grant itself publication access by setting isShared', async () => {
+    // Provider storage outside the vDC: only a server-resolved published row
+    // may open it, never a flag in the request.
+    mocks.pve.mockResolvedValue([{ volid: 'provider-store:import/provider.qcow2', content: 'import' }])
+    const response = await POST(request({ ...body, volumeId: 'provider-store:import/provider.qcow2', isShared: true, tenantId: 'default' }))
+    expect(response.status).toBe(403)
+    expect(mocks.pve).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['shared:import/custom-acme-disk.qcow2', 'import', 'qcow2', 201],
+    ['shared:import/custom-acme-prod-disk.qcow2', 'import', 'qcow2', 403],
+    ['shared:import/custom-unknown-disk.qcow2', 'import', 'qcow2', 403],
+    ['library:iso/debian.iso', 'iso', 'iso', 201],
+    ['library:iso/custom-acme-private.iso', 'iso', 'iso', 201],
+    ['library:iso/custom-acme-prod-private.iso', 'iso', 'iso', 403],
+    // The vDC's own writable storage: the storage browser uploads raw names
+    // there (tenantUploadFilename only prefixes on libraries), so an unprefixed
+    // file is the tenant's own, but another tenant's prefix still is not.
+    ['shared:iso/debian.iso', 'iso', 'iso', 201],
+    ['shared:import/ubuntu.qcow2', 'import', 'qcow2', 201],
+    ['shared:iso/Win10_22H2 (x64).iso', 'iso', 'iso', 201],
+    ['nas.isos:iso/debian.iso', 'iso', 'iso', 201],
+    ['library:import/custom-acme-disk.qcow2', 'import', 'qcow2', 403],
+    ['library:iso/debian.iso', 'iso', 'qcow2', 400],
+    ['shared:vm-201-disk-0', 'images', 'iso', 400],
+  ])('checks ownership and content for %s', async (volumeId, content, format, status) => {
+    mocks.pve.mockResolvedValue([{ volid: volumeId, content }])
+    const response = await POST(request({ ...body, volumeId, format }))
+    expect(response.status).toBe(status)
+  })
+
+  it('fails closed when the source no longer exists', async () => {
+    mocks.pve.mockResolvedValue([])
+    expect((await POST(request(body))).status).toBe(403)
+  })
+
+  it('fails closed when storage cannot be read', async () => {
+    mocks.pve.mockRejectedValue(new Error('PVE unavailable'))
+    expect((await POST(request(body))).status).toBe(500)
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it('requires clone permission on a source disk even if its pool is owned', async () => {
+    mocks.permission.mockImplementation(async permission => permission === 'vm.clone' ? new Response(null, { status: 403 }) : null)
+    expect((await POST(request(body))).status).toBe(403)
+  })
+
+  it('does not infer disk ownership from its name when PVE omits vmid', async () => {
+    mocks.pve.mockResolvedValue([{ volid: body.volumeId, content: 'images' }])
+    expect((await POST(request(body))).status).toBe(403)
+  })
+
+  it('revalidates a partial volumeId edit using the stored source coordinates', async () => {
+    mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a' })
+    const response = await PUT(request({ volumeId: 'foreign:vm-201-disk-0' }), { params: Promise.resolve({ id: 'image-a' }) })
+    expect(response.status).toBe(403)
+    expect(mocks.update).not.toHaveBeenCalled()
+  })
+
+  it('clears the source locator when switching back to a URL', async () => {
+    // An MSP tenant: a vDC tenant may not set a URL at all (below).
+    mocks.infra.mockResolvedValue({ kind: 'msp', connectionIds: new Set(['conn-a']) })
+    mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a' })
+    const response = await PUT(request({ sourceType: 'url', downloadUrl: 'https://example.test/image.qcow2' }), { params: Promise.resolve({ id: 'image-a' }) })
+    expect(response.status).toBe(200)
+    expect((await response.json()).data).toMatchObject({ volumeId: null, sourceConnectionId: null, sourceNode: null })
+  })
+
+  it('answers 404, not 500, when the source cluster no longer exists', async () => {
+    mocks.infra.mockResolvedValue({ kind: 'provider' })
+    mocks.connection.mockRejectedValue(new Error('Connection not found: conn-a'))
+    expect((await POST(request(body))).status).toBe(404)
+    expect(mocks.create).not.toHaveBeenCalled()
+  })
+
+  it('renames a volume image without reaching its source cluster', async () => {
+    mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a' })
+    mocks.pve.mockResolvedValue([])
+    const response = await PUT(request({ name: 'Renamed', recommendedMemory: 4096 }), { params: Promise.resolve({ id: 'image-a' }) })
+    expect(response.status).toBe(200)
+    expect(mocks.pve).not.toHaveBeenCalled()
+    expect(mocks.update).toHaveBeenCalled()
+  })
+
+  describe('provider-published images (#971)', () => {
+    const golden = { volumeId: 'provider-store:import/golden.qcow2', sourceConnectionId: 'conn-a', sourceNode: 'pve3', format: 'qcow2', tenantId: 'default', isShared: true }
+    beforeEach(() => {
+      mocks.pve.mockImplementation(async (_conn, path) => path.endsWith('/content')
+        ? [{ volid: golden.volumeId, content: 'import' }]
+        : { shared: 1, type: 'nfs' })
+    })
+    it('lets a tenant deploy a published image whose source is outside its vDC', async () => {
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: golden, target: { connectionId: 'conn-a', node: 'pve1' }, publishedImage: golden })).resolves.toBeUndefined()
+    })
+    it('still refuses the same source when it is not published, or published from a tenant', async () => {
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: golden, target: { connectionId: 'conn-a', node: 'pve1' } })).rejects.toMatchObject({ status: 403 })
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: golden, target: { connectionId: 'conn-a', node: 'pve1' }, publishedImage: { ...golden, isShared: false } })).rejects.toMatchObject({ status: 403 })
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: golden, target: { connectionId: 'conn-a', node: 'pve1' }, publishedImage: { ...golden, tenantId: 'tenant-b' } })).rejects.toMatchObject({ status: 403 })
+    })
+    it('lets a tenant deploy a published qcow2 from the library storage its vDC only reads (lab layout)', async () => {
+      const onLibrary = { ...golden, volumeId: 'library:import/golden.qcow2', sourceNode: 'pve1' }
+      mocks.pve.mockResolvedValue([{ volid: onLibrary.volumeId, content: 'import' }])
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: onLibrary, target: { connectionId: 'conn-a', node: 'pve1' }, publishedImage: onLibrary })).resolves.toBeUndefined()
+      // The tenant's own image on that library is still refused as a disk source.
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: { ...onLibrary, tenantId: 'tenant-a', isShared: false } })).rejects.toMatchObject({ status: 403 })
+    })
+    it('keeps the node reachability check for a published image on restricted storage', async () => {
+      mocks.pve.mockImplementation(async (_conn, path) => path.endsWith('/content')
+        ? [{ volid: golden.volumeId, content: 'import' }]
+        : { shared: 1, type: 'nfs', nodes: 'pve3,pve4' })
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: golden, target: { connectionId: 'conn-a', node: 'pve1' }, publishedImage: golden })).rejects.toMatchObject({ status: 400 })
+    })
+  })
+
+  it('rejects using the same volume name on another cluster', async () => {
+    await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: body, target: { connectionId: 'conn-b', node: 'pve1' } })).rejects.toMatchObject({ status: 400 })
+    expect(mocks.pve).not.toHaveBeenCalled()
+  })
+
+  it('does not reuse a local volume name on another node', async () => {
+    mocks.pve.mockResolvedValue({ type: 'dir', shared: 0 })
+    await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: body, target: { connectionId: 'conn-a', node: 'pve2' } })).rejects.toMatchObject({ status: 400 })
+  })
+
+  it('permits the selected shared volume on a different target node', async () => {
+    await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: body, target: { connectionId: 'conn-a', node: 'pve2' } })).resolves.toBeUndefined()
+  })
+  describe('copies on other clusters (#44)', () => {
+    const copy = { connectionId: 'conn-b', node: 'pve7', volumeId: 'nfs-pac:import/golden.qcow2' }
+    const provider = () => {
+      mocks.tenant.mockResolvedValue('default')
+      mocks.infra.mockResolvedValue({ kind: 'provider' })
+      mocks.pve.mockImplementation(async (_conn, path) => path.endsWith('/content')
+        ? [{ volid: body.volumeId, content: 'images', vmid: 201 }, { volid: copy.volumeId, content: 'import' }]
+        : [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-a' }])
+    }
+
+    it('records a copy after checking it exists on that cluster and node', async () => {
+      provider()
+      const response = await POST(request({ ...body, extraLocations: [copy] }))
+      expect(response.status).toBe(201)
+      expect((await response.json()).data.extraLocations).toEqual([copy])
+      expect(mocks.connection).toHaveBeenCalledWith('conn-b')
+      expect(mocks.pve.mock.calls.some(call => call[1] === '/nodes/pve7/storage/nfs-pac/content')).toBe(true)
+    })
+
+    it('refuses a copy whose volume is missing on its cluster', async () => {
+      provider()
+      const response = await POST(request({ ...body, extraLocations: [{ ...copy, volumeId: 'nfs-pac:import/absent.qcow2' }] }))
+      expect(response.status).toBe(403)
+      expect(mocks.create).not.toHaveBeenCalled()
+    })
+
+    it('refuses a copy on the source cluster, or two copies on one cluster', async () => {
+      provider()
+      expect((await POST(request({ ...body, extraLocations: [{ ...copy, connectionId: 'conn-a' }] }))).status).toBe(400)
+      expect((await POST(request({ ...body, extraLocations: [copy, { ...copy, node: 'pve8' }] }))).status).toBe(400)
+      expect(mocks.create).not.toHaveBeenCalled()
+    })
+
+    it('refuses a tenant copy on a cluster outside its vDC', async () => {
+      const response = await POST(request({ ...body, extraLocations: [copy] }))
+      expect(response.status).toBe(403)
+      expect(mocks.create).not.toHaveBeenCalled()
+    })
+
+    it('revalidates copies on edit and drops them when switching back to a URL', async () => {
+      mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a', extraLocations: [] })
+      expect((await PUT(request({ extraLocations: [copy] }), { params: Promise.resolve({ id: 'image-a' }) })).status).toBe(403)
+      expect(mocks.update).not.toHaveBeenCalled()
+      mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a', extraLocations: [copy] })
+      mocks.infra.mockResolvedValue({ kind: 'msp', connectionIds: new Set(['conn-a']) })
+      const response = await PUT(request({ sourceType: 'url', downloadUrl: 'https://example.test/image.qcow2' }), { params: Promise.resolve({ id: 'image-a' }) })
+      expect(response.status).toBe(200)
+      expect((await response.json()).data.extraLocations).toEqual([])
+    })
+
+    it('resolves the copy held by the target cluster, never an unlisted one', () => {
+      const row = { ...body, format: 'qcow2', extraLocations: [copy, { connectionId: 'conn-c' }, 'junk'] }
+      expect(imageSourceForConnection(row, 'conn-a')).toBe(row)
+      expect(imageSourceForConnection(row, 'conn-b')).toMatchObject({ sourceConnectionId: 'conn-b', sourceNode: 'pve7', volumeId: copy.volumeId })
+      expect(imageSourceForConnection(row, 'conn-c')).toBeNull()
+      expect(imageSourceForConnection(row, 'conn-z')).toBeNull()
+    })
+
+    it('lets a tenant deploy a published image from its copy outside the vDC', async () => {
+      const golden = { ...body, format: 'qcow2', tenantId: 'default', isShared: true, extraLocations: [copy] }
+      mocks.infra.mockResolvedValue({ kind: 'iaas', vdcScope: { ...scope(), connectionIds: new Set(['conn-b']), nodesByConnection: new Map([['conn-b', new Set(['pve7'])]]) } })
+      mocks.pve.mockResolvedValue([{ volid: copy.volumeId, content: 'import' }])
+      const resolved = imageSourceForConnection(golden, 'conn-b')!
+      await expect(authorizeImageVolume({ tenantId: 'tenant-a', source: resolved, target: { connectionId: 'conn-b', node: 'pve7' }, publishedImage: resolved })).resolves.toBeUndefined()
+    })
+  })
+
+  it('keeps URL image creation independent of source-volume permissions', async () => {
+    mocks.infra.mockResolvedValue({ kind: 'msp', connectionIds: new Set(['conn-a']) })
+    const response = await POST(request({ name: 'URL', sourceType: 'url', downloadUrl: 'https://example.test/image.qcow2' }))
+    expect(response.status).toBe(201)
+    expect(mocks.pve).not.toHaveBeenCalled()
+  })
+
+  describe('URL images of a vDC tenant (#69)', () => {
+    // The node fetches the URL itself: a vDC (iaas) tenant may not name one.
+    const urlBody = { name: 'URL', sourceType: 'url', downloadUrl: 'http://10.0.0.5/secret.qcow2' }
+    const urlImage = { id: 'image-a', tenantId: 'tenant-a', sourceType: 'url', downloadUrl: 'https://example.test/image.qcow2' }
+    const put = (data: object) => PUT(request(data), { params: Promise.resolve({ id: 'image-a' }) })
+
+    it('refuses a vDC tenant creating a URL image, before saving anything', async () => {
+      const response = await POST(request(urlBody))
+      expect(response.status).toBe(403)
+      expect((await response.json()).error).toBe(URL_IMAGE_REFUSED)
+      expect(mocks.create).not.toHaveBeenCalled()
+      expect(mocks.infra).toHaveBeenCalledWith('tenant-a', { ignoreVdcContext: true })
+    })
+
+    it.each([
+      ['provider', 'default', { kind: 'provider' }],
+      ['MSP', 'tenant-a', { kind: 'msp', connectionIds: new Set(['conn-a']) }],
+    ])('still lets a %s tenant create a URL image', async (_label, tenantId, infra) => {
+      mocks.tenant.mockResolvedValue(tenantId)
+      mocks.infra.mockResolvedValue(infra)
+      const response = await POST(request(urlBody))
+      expect(response.status).toBe(201)
+      expect(mocks.create).toHaveBeenCalled()
+    })
+
+    it('leaves a vDC tenant volume image to the source checks alone', async () => {
+      const response = await POST(request(body))
+      expect(response.status).toBe(201)
+      expect((await response.json()).error).toBeUndefined()
+    })
+
+    it('refuses a vDC tenant switching a volume image to a URL', async () => {
+      mocks.find.mockResolvedValue({ ...body, id: 'image-a', tenantId: 'tenant-a' })
+      const response = await put({ sourceType: 'url', downloadUrl: urlBody.downloadUrl })
+      expect(response.status).toBe(403)
+      expect((await response.json()).error).toBe(URL_IMAGE_REFUSED)
+      expect(mocks.update).not.toHaveBeenCalled()
+    })
+
+    it('refuses a vDC tenant changing the URL of an existing URL image', async () => {
+      mocks.find.mockResolvedValue(urlImage)
+      const response = await put({ downloadUrl: urlBody.downloadUrl })
+      expect(response.status).toBe(403)
+      expect((await response.json()).error).toBe(URL_IMAGE_REFUSED)
+      expect(mocks.update).not.toHaveBeenCalled()
+    })
+
+    it('lets a vDC tenant rename an existing URL image', async () => {
+      mocks.find.mockResolvedValue(urlImage)
+      const response = await put({ name: 'Renamed' })
+      expect(response.status).toBe(200)
+      expect(mocks.update).toHaveBeenCalled()
+      expect(mocks.update.mock.calls[0][0].data).not.toHaveProperty('downloadUrl')
+    })
+  })
+})

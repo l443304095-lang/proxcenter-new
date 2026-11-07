@@ -1,0 +1,85 @@
+// src/app/api/v1/templates/check-image/route.ts
+import { NextResponse } from "next/server"
+
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { pveFetch } from "@/lib/proxmox/client"
+import { resolveBuiltInImage } from "@/lib/templates/catalogStore"
+import { customImageToCloudImage } from "@/lib/templates/cloudImages"
+import { findCustomImageForTenant } from "@/lib/templates/customImageScope"
+import { getCurrentTenantId } from "@/lib/tenant"
+import { getTenantInfrastructureScope } from "@/lib/tenant/infraScope"
+
+export const runtime = "nodejs"
+
+export async function GET(req: Request) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.VM_VIEW)
+    if (denied) return denied
+
+    const { searchParams } = new URL(req.url)
+    const connectionId = searchParams.get("connectionId")
+    const node = searchParams.get("node")
+    const storage = searchParams.get("storage")
+    const imageSlug = searchParams.get("imageSlug")
+
+    if (!connectionId || !node || !storage || !imageSlug) {
+      return NextResponse.json(
+        { error: "Missing required params: connectionId, node, storage, imageSlug" },
+        { status: 400 }
+      )
+    }
+
+    // Storage-tier scope (spec §5.3): an iaas tenant may only probe storages
+    // inside its vDC union scope -- without this an unscoped storage param
+    // would let a tenant enumerate content on any storage on the connection.
+    const tenantId = await getCurrentTenantId()
+    const infra = await getTenantInfrastructureScope(tenantId, { ignoreVdcContext: true })
+    if (infra.kind === 'iaas') {
+      const allowed = infra.vdcScope?.storagesByConnection.get(connectionId) ?? new Set<string>()
+      if (!allowed.has(storage)) {
+        return NextResponse.json(
+          { error: `Storage "${storage}" is not authorised for this tenant.` }, { status: 403 })
+      }
+    }
+
+    // Built-in first, then the caller's custom images and the provider's
+    // shared catalogue entries, the same scope the catalogue and the deploy
+    // route use, so a slug that deploys can always be probed here too.
+    const builtIn = await resolveBuiltInImage(imageSlug)
+    const customRow = builtIn ? null : await findCustomImageForTenant(tenantId, imageSlug)
+    const image = builtIn ?? (customRow ? customImageToCloudImage(customRow) : null)
+
+    if (!image) {
+      return NextResponse.json({ error: "Unknown image slug" }, { status: 400 })
+    }
+
+    const conn = await getConnectionById(connectionId)
+
+    // List content on the target storage to check if image is already downloaded
+    const storageContent = await pveFetch<any[]>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/content`,
+      { method: "GET" }
+    ).catch(() => [])
+
+    // Extract filename from the download URL
+    const urlFilename = image.downloadUrl.split("/").pop() || ""
+
+    // Check if any file matches the image filename
+    const found = storageContent.find((item: any) => {
+      const volName = item.volid?.split("/").pop() || ""
+      return volName === urlFilename || volName.includes(image.slug)
+    })
+
+    return NextResponse.json({
+      data: {
+        exists: !!found,
+        volid: found?.volid || null,
+        filename: urlFilename,
+      },
+    })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

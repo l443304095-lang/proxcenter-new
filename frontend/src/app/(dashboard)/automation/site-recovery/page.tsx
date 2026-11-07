@@ -1,0 +1,997 @@
+'use client'
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import useSWR from 'swr'
+
+import {
+  Alert, Box, Button, Chip, CircularProgress, Tab, Tabs
+} from '@mui/material'
+
+import { Typography } from '@mui/material'
+
+import ReplicationStorageDiscovery, { type StorageDiscoveryState } from '@/components/automation/site-recovery/ReplicationStorageDiscovery'
+import EnterpriseGuard from '@/components/guards/EnterpriseGuard'
+import ProviderTenantGuard from '@/components/guards/ProviderTenantGuard'
+import { Features, useLicense } from '@/contexts/LicenseContext'
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import { useSelectionGuard } from '@/hooks/useSelectionGuard'
+
+import {
+  useReplicationHealth,
+  useReplicationJobs,
+  useRecoveryPlans,
+  useReplicationJobLogs,
+  useRecoveryHistory
+} from '@/hooks/useSiteRecovery'
+
+import {
+  DashboardTab,
+  ProtectionTab,
+  SnapshotsTab,
+  RecoveryPlansTab,
+  EmergencyDRTab,
+  SimulationTab,
+  CreateJobDialog,
+  CreatePlanDialog,
+  EditJobDialog,
+  FailoverDialog,
+  GuestFailoverDialog
+} from '@/components/automation/site-recovery'
+import type { DRReadyVM } from '@/components/automation/site-recovery/EmergencyDRTab'
+import type { GuestDialogTarget, GuestPlacements, GuestRestorePointsState } from '@/components/automation/site-recovery/GuestFailoverDialog'
+
+import type {
+  RecoveryPlan, RecoveryExecution, StorageEngine, UpdateReplicationJobRequest, TestFailoverOptions
+} from '@/lib/orchestrator/site-recovery.types'
+
+import {
+  buildVmStatesByConn,
+  cancelGuestFailback,
+  cutoverGuestFailback,
+  failoverGuest,
+  guestStateOf,
+  loadVMRestorePoints as loadVMRestorePointsRequest,
+  saveRecoveryPlan,
+  scheduleRefreshes,
+  startDRVM,
+  startGuestFailback,
+  stopDRVM,
+} from '@/lib/site-recovery/emergencyActions'
+import { jsonInit, requireOk } from '@/lib/api/fetchJsonSafe'
+
+const fetcher = (url: string) => fetch(url).then(res => {
+  if (!res.ok) throw new Error('Failed to fetch')
+  return res.json()
+})
+
+export default function SiteRecoveryPage() {
+  const t = useTranslations()
+  const { isEnterprise } = useLicense()
+  const { setPageInfo } = usePageTitle()
+
+  // The default tab is chosen after discovery and the existing inventory settle.
+  const [tab, setTab] = useState(0)
+  const [tabInitialized, setTabInitialized] = useState(false)
+
+  // Dialog states
+  const [createJobOpen, setCreateJobOpen] = useState(false)
+  const [createPlanOpen, setCreatePlanOpen] = useState(false)
+  const [editPlanId, setEditPlanId] = useState<string | null>(null)
+  const [editJobId, setEditJobId] = useState<string | null>(null)
+  const [failoverDialog, setFailoverDialog] = useState<{
+    open: boolean
+    planId: string | null
+    type: 'test' | 'failover' | 'failback'
+  }>({ open: false, planId: null, type: 'test' })
+
+  // Per-guest failover and failback (ui#943): the row being acted on, the
+  // execution the dialog follows, and the orchestrator's last refusal.
+  const [guestDialog, setGuestDialog] = useState<{ open: boolean; mode: 'failover' | 'failback'; target: GuestDialogTarget | null }>({ open: false, mode: 'failover', target: null })
+  const [guestExecution, setGuestExecution] = useState<RecoveryExecution | null>(null)
+  const [guestError, setGuestError] = useState<string | null>(null)
+  const [guestRestorePoints, setGuestRestorePoints] = useState<GuestRestorePointsState>({ loading: false, data: null, failed: false })
+
+  // Selection states
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null)
+
+  // Execution tracking
+  const [activeExecution, setActiveExecution] = useState<RecoveryExecution | null>(null)
+  const [failoverError, setFailoverError] = useState<string | null>(null)
+  const [failoverErrorStatus, setFailoverErrorStatus] = useState<number | null>(null)
+  const [operationError, setOperationError] = useState<string | null>(null)
+
+  // Cleanup state. The cleanup itself runs on the orchestrator, not inside
+  // the request that starts it, so cleanupExecutionId is the execution the
+  // dialog polls for progress and for the verdict.
+  const [cleanupLoading, setCleanupLoading] = useState(false)
+  const [cleanupResult, setCleanupResult] = useState<any>(null)
+  const [cleanupExecutionId, setCleanupExecutionId] = useState<string | null>(null)
+
+  // SWR hooks
+  const { data: health, isLoading: healthLoading } = useReplicationHealth(isEnterprise)
+  const { data: jobs, isLoading: jobsLoading, mutate: mutateJobs } = useReplicationJobs(isEnterprise)
+  const { data: plans, isLoading: plansLoading, mutate: mutatePlans } = useRecoveryPlans(isEnterprise)
+  const { data: jobLogs, isLoading: logsLoading } = useReplicationJobLogs(selectedJobId, !!selectedJobId)
+  const { data: planHistory, isLoading: historyLoading, mutate: mutateHistory } = useRecoveryHistory(selectedPlanId)
+
+  // Real data: PVE connections and all VMs
+  const { data: connectionsData, error: connectionsError, isLoading: connectionsLoading } = useSWR<{ data: Array<{ id: string; name: string; hasCeph: boolean }> }>('/api/v1/connections?type=pve', fetcher)
+  const { data: allVMsData, mutate: mutateAllVMs } = useSWR<{ data: { vms: any[] } }>('/api/v1/vms', fetcher)
+
+  // Restore points for the plan currently open in the failover dialog (test/failover only — failback has no selector)
+  const { data: restorePoints, error: restorePointsError, isLoading: restorePointsLoading, mutate: mutateRestorePoints } = useSWR(
+    failoverDialog.open && failoverDialog.planId && failoverDialog.type !== 'failback'
+      ? `/api/v1/orchestrator/replication/plans/${failoverDialog.planId}/restore-points`
+      : null,
+    (url: string) => fetch(url).then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json() })
+  )
+
+  // Drop the cached list on every dialog open: RBD snapshots move with each
+  // sync, and a reopened dialog must never offer points from a previous look.
+  useEffect(() => {
+    if (failoverDialog.open && failoverDialog.planId && failoverDialog.type !== 'failback') {
+      void mutateRestorePoints(undefined, { revalidate: true })
+    }
+  }, [failoverDialog.open, failoverDialog.planId, failoverDialog.type, mutateRestorePoints])
+
+  // Page title
+  useEffect(() => {
+    setPageInfo(t('siteRecovery.title'), t('siteRecovery.subtitle'), 'ri-shield-star-line')
+
+    return () => setPageInfo('', '', '')
+  }, [setPageInfo, t])
+
+  // Error count for badge
+  const errorCount = useMemo(() =>
+    (jobs || []).filter((j: any) => j.status === 'error').length
+  , [jobs])
+
+  const [discovery, setDiscovery] = useState<Record<string, StorageDiscoveryState>>({})
+  const updateDiscovery = useCallback((id: string, state: StorageDiscoveryState) => {
+    setDiscovery(previous => ({ ...previous, [id]: state }))
+  }, [])
+  const connections = useMemo(() => (connectionsData?.data || []).map(connection => ({
+    ...connection,
+    engines: discovery[connection.id]?.error ? [] : discovery[connection.id]?.data?.engines || [],
+  })), [connectionsData, discovery])
+  const engines: StorageEngine[] = health?.engines ?? (health ? ['rbd'] : [])
+  const discoveryLoading = connectionsLoading || connections.some(connection => !discovery[connection.id] || discovery[connection.id].loading)
+  const discoveryError = !!connectionsError || connections.some(connection => discovery[connection.id]?.error)
+  const canCreateProtection = engines.some(engine => connections.filter(connection => connection.engines.includes(engine)).length >= 2)
+  const canOperate = !!jobs?.length || !!plans?.length
+  const canAccessRecovery = canCreateProtection || canOperate
+
+  useEffect(() => {
+    if (!discoveryLoading && !jobsLoading && !plansLoading && !healthLoading && !tabInitialized) {
+      if (!canAccessRecovery) setTab(5)
+      setTabInitialized(true)
+    }
+  }, [discoveryLoading, jobsLoading, plansLoading, healthLoading, canAccessRecovery, tabInitialized])
+
+  // All VMs for create job dialog
+  const allVMs = useMemo(() =>
+    (allVMsData?.data?.vms || []).map((vm: any) => ({
+      vmid: Number.parseInt(vm.vmid, 10) || 0,
+      name: vm.name,
+      node: vm.node || vm.host,
+      connId: vm.connId,
+      type: vm.type,
+      status: vm.status,
+      diskGb: vm.diskGb || 0,
+      tags: (Array.isArray(vm.tags) ? vm.tags : vm.tags ? String(vm.tags).split(';') : [])
+        .map((t: string) => t.trim()).filter(Boolean)
+    }))
+  , [allVMsData])
+
+  // VM names scoped per connection (connId → vmid → name): the same VMID can
+  // exist on both sites, so a flat map resolves nondeterministically.
+  const vmNamesByConn = useMemo(() => {
+    const m: Record<string, Record<number, string>> = {}
+    for (const vm of allVMs) {
+      if (!vm.vmid || !vm.name || !vm.connId) continue
+      ;(m[vm.connId] ??= {})[vm.vmid] = vm.name
+    }
+    return m
+  }, [allVMs])
+
+  // Replica power state scoped per connection, for the Emergency DR rows.
+  const vmStatesByConn = useMemo(() => buildVmStatesByConn(allVMs), [allVMs])
+
+  // Selected plan for failover dialog
+  const failoverPlan = useMemo(() =>
+    (plans || []).find((p: RecoveryPlan) => p.id === failoverDialog.planId) || null
+  , [plans, failoverDialog.planId])
+
+  // Selected job for edit dialog
+  const editJob = editJobId ? (jobs || []).find((j: any) => j.id === editJobId) ?? null : null
+
+  // ── Handlers ──────────────────────────────────────────────────────
+
+  // Rejects with the server's reason so the dialog stays open and shows it.
+  const handleCreateJob = useCallback(async (data: any) => {
+    await requireOk('/api/v1/orchestrator/replication/jobs', jsonInit('POST', data))
+    void mutateJobs()
+  }, [mutateJobs])
+
+  const handleUpdateJob = async (id: string, req: UpdateReplicationJobRequest) => {
+    const res = await fetch(`/api/v1/orchestrator/replication/jobs/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    })
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({ error: res.statusText }))
+      const err = new Error(errBody.error || res.statusText) as Error & { status?: number }
+      err.status = res.status
+      throw err
+    }
+    void mutateJobs()
+  }
+
+  // One form for both: creating posts, editing puts onto the plan being
+  // edited. The orchestrator refuses an edit during a failback (a guest added
+  // mid-failback would have no vm_result and the plan would never converge),
+  // so its message is surfaced rather than swallowed.
+  const handleSubmitPlan = useCallback(async (data: any) => {
+    try {
+      const { error } = await saveRecoveryPlan(data, editPlanId)
+
+      setOperationError(error)
+      if (!error) void mutatePlans()
+    } catch (e) {
+      console.error('Failed to save plan:', e)
+    } finally {
+      setEditPlanId(null)
+    }
+  }, [editPlanId, mutatePlans])
+
+  // An orchestrator that dropped the connection after 30 s has usually
+  // finished the work anyway (roadmap#8). Before such an error is shown, the
+  // plans and jobs are refetched so what is on screen is the real state, and
+  // the message says so, or the operator retries an action that completed.
+  const describeActionError = useCallback(async (data: any, fallback: string): Promise<string> => {
+    const message: string = data?.error || fallback
+    if (data?.code !== 'ORCHESTRATOR_UNAVAILABLE') return message
+    await Promise.all([mutatePlans(), mutateJobs()])
+    return `${message}. ${t('siteRecovery.failover.unavailableRefreshed')}`
+  }, [mutatePlans, mutateJobs, t])
+
+  const handleJobAction = useCallback(async (id: string, action: 'sync' | 'resume' | 'pause') => {
+    try {
+      const response = await fetch(`/api/v1/orchestrator/replication/jobs/${id}/${action}`, { method: 'POST' })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        setOperationError(response.status === 409 ? t('siteRecovery.failover.testActiveConflict') : await describeActionError(data, response.statusText))
+        return
+      }
+      setOperationError(null)
+      void mutateJobs()
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error))
+    }
+  }, [describeActionError, mutateJobs, t])
+
+  const handleSyncJob = useCallback((id: string) => handleJobAction(id, 'sync'), [handleJobAction])
+
+  const handlePauseJob = useCallback((id: string) => handleJobAction(id, 'pause'), [handleJobAction])
+
+  const handleResumeJob = useCallback((id: string) => handleJobAction(id, 'resume'), [handleJobAction])
+
+  const handleDeleteJob = useCallback(async (id: string) => {
+    try {
+      const response = await fetch(`/api/v1/orchestrator/replication/jobs/${id}`, { method: 'DELETE' })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        if (response.status === 409 && data.code === 'job_in_use_by_plan') {
+          setOperationError(t('siteRecovery.protection.deleteJobInUse', { plans: (data.plans || []).join(', ') }))
+        } else if (response.status === 409 && data.code === 'job_running') {
+          setOperationError(t('siteRecovery.protection.deleteJobRunning'))
+        } else {
+          setOperationError(response.status === 409 ? t('siteRecovery.failover.testActiveConflict') : await describeActionError(data, response.statusText))
+        }
+        return
+      }
+      setOperationError(null)
+      void mutateJobs()
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error))
+    }
+  }, [describeActionError, mutateJobs, t])
+
+  const handleDeletePlan = useCallback(async (id: string) => {
+    try {
+      const response = await fetch(`/api/v1/orchestrator/replication/plans/${id}`, { method: 'DELETE' })
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        setOperationError(response.status === 409 ? t('siteRecovery.failover.testActiveConflict') : await describeActionError(data, response.statusText))
+        return
+      }
+      setOperationError(null)
+      void mutatePlans()
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error))
+    }
+  }, [describeActionError, mutatePlans, t])
+
+  const openFailoverDialog = useCallback((planId: string, type: 'test' | 'failover' | 'failback') => {
+    setFailoverDialog({ open: true, planId, type })
+    setActiveExecution(null)
+    setCleanupResult(null)
+    setCleanupLoading(false)
+    setCleanupExecutionId(null)
+    setFailoverError(null)
+    setFailoverErrorStatus(null)
+
+    // Rehydration: a test failover started before a reload has no in-memory
+    // `activeExecution` — refetch it from its id on the plan so the dialog
+    // can land directly on the Cleanup block instead of showing "confirm".
+    if (type === 'test') {
+      const plan = (plans || []).find((p: RecoveryPlan) => p.id === planId)
+      if (plan?.active_test_execution_id) {
+        fetch(`/api/v1/orchestrator/replication/executions/${plan.active_test_execution_id}`)
+          .then(res => (res.ok ? res.json() : null))
+          .then(data => {
+            if (!data) return
+            setActiveExecution(data)
+            // A cleanup started before this reload is still running on the
+            // orchestrator: pick its progress back up instead of showing the
+            // operator an idle dialog over a live rollback.
+            if (data.phase === 'cleaning') {
+              setCleanupLoading(true)
+              setCleanupExecutionId(data.id)
+            } else if (data.cleanup_result) {
+              setCleanupResult(data.cleanup_result)
+            }
+          })
+          .catch(() => { /* ignore — dialog shows the warning banner instead */ })
+      }
+    }
+
+    // Same rehydration for a failback in progress: a failing_back plan
+    // carries the running execution's id so reopening the dialog (or
+    // reloading the page) lands back on the reverse-sync/cutover view
+    // instead of the initial confirm screen.
+    if (type === 'failback') {
+      const plan = (plans || []).find((p: RecoveryPlan) => p.id === planId)
+      if (plan?.active_failback_execution_id) {
+        fetch(`/api/v1/orchestrator/replication/executions/${plan.active_failback_execution_id}`)
+          .then(res => (res.ok ? res.json() : null))
+          .then(data => { if (data) setActiveExecution(data) })
+          .catch(() => { /* ignore — dialog shows the initial confirm screen instead */ })
+      }
+    }
+  }, [plans])
+
+  const handleFailoverConfirm = useCallback(async (options?: TestFailoverOptions) => {
+    if (!failoverDialog.planId) return
+    const endpoint = failoverDialog.type === 'test' ? 'test-failover' : failoverDialog.type
+
+    const body = failoverDialog.type === 'test'
+      ? JSON.stringify({
+        network_isolated: options?.networkIsolated ?? true,
+        ...(options?.screenshotDelaySeconds != null ? { screenshot_delay_seconds: options.screenshotDelaySeconds } : {}),
+        ...(options?.restorePoints ? { restore_points: options.restorePoints } : {})
+      })
+      : failoverDialog.type === 'failover'
+        ? (options?.restorePoints ? JSON.stringify({ restore_points: options.restorePoints }) : undefined)
+        : undefined
+
+    try {
+      const res = await fetch(`/api/v1/orchestrator/replication/plans/${failoverDialog.planId}/${endpoint}`, {
+        method: 'POST',
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setFailoverErrorStatus(res.status)
+        setFailoverError(await describeActionError(data, t('siteRecovery.failover.testConflict')))
+        void mutatePlans()
+        return
+      }
+      setFailoverError(null)
+      setFailoverErrorStatus(null)
+      setActiveExecution(data)
+      void mutatePlans()
+    } catch (e) {
+      console.error('Failed to execute:', e)
+    }
+  }, [describeActionError, failoverDialog, mutatePlans, t])
+
+  const handleCleanupTest = useCallback(async () => {
+    if (!failoverDialog.planId) return
+    setCleanupLoading(true)
+    setCleanupResult(null)
+    try {
+      const res = await fetch(`/api/v1/orchestrator/replication/plans/${failoverDialog.planId}/cleanup-test`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+
+      // A cleanup that never reached the orchestrator must never read as a
+      // finished one: the DR guests may still be running on the replica
+      // images. Feed the error through the same shape the dialog already
+      // renders, so the retry button stays. What travels here is the
+      // technical cause only; the dialog states the operator-facing
+      // consequence itself, in the operator's own language.
+      // 409 is the exception: a cleanup is already running, and watching that
+      // one is exactly the right thing to do.
+      if (!res.ok && res.status !== 409) {
+        setCleanupLoading(false)
+        setCleanupResult({ vms_stopped: 0, disks_rolled: 0, jobs_resumed: 0, errors: data?.error ? [await describeActionError(data, data.error)] : [] })
+        return
+      }
+
+      const executionId: string | null = data?.execution_id || activeExecution?.id || null
+      if (!executionId) {
+        setCleanupLoading(false)
+        setCleanupResult({ vms_stopped: 0, disks_rolled: 0, jobs_resumed: 0, errors: ['The execution that tracks this cleanup no longer exists'] })
+        return
+      }
+      setCleanupExecutionId(executionId)
+      void mutateJobs()
+      void mutatePlans()
+    } catch (e) {
+      // A request that never came back leaves the DR guests up just the same,
+      // so it owes the operator a banner rather than a console line and a
+      // spinner that stops on its own.
+      console.error('Failed to cleanup test:', e)
+      setCleanupLoading(false)
+      setCleanupResult({ vms_stopped: 0, disks_rolled: 0, jobs_resumed: 0, errors: [e instanceof Error ? e.message : String(e)] })
+    }
+  }, [failoverDialog.planId, activeExecution, describeActionError, mutateJobs, mutatePlans])
+
+  // Follow a cleanup while it runs. Stopping each DR guest and rolling its
+  // replica images back takes minutes per guest on large images, far past any
+  // request timeout, so the orchestrator writes its progress onto the
+  // execution and the dialog reads it from there (ui#958). Polling stops as
+  // soon as the phase clears, whatever the verdict.
+  useEffect(() => {
+    if (!cleanupExecutionId) return
+    let cancelled = false
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/v1/orchestrator/replication/executions/${cleanupExecutionId}`)
+        if (!res.ok) {
+          // The execution is gone (history cleared, plan deleted): stop
+          // following it rather than poll a 404 for ever.
+          if (!cancelled) {
+            setCleanupExecutionId(null)
+            setCleanupLoading(false)
+          }
+          return
+        }
+        const data = await res.json()
+        if (cancelled) return
+        setActiveExecution(data)
+        if (data.cleanup_result) setCleanupResult(data.cleanup_result)
+        if (data.phase !== 'cleaning') {
+          setCleanupExecutionId(null)
+          setCleanupLoading(false)
+          void mutateJobs()
+          void mutatePlans()
+        }
+      } catch (e) {
+        // A dropped poll is not a failed cleanup: the orchestrator keeps
+        // working, so keep polling rather than declare anything.
+        console.error('Failed to poll cleanup:', e)
+      }
+    }
+
+    void poll()
+    const interval = setInterval(poll, 3000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [cleanupExecutionId, mutateJobs, mutatePlans])
+
+  const handleFailbackCutover = useCallback(async (planId: string) => {
+    try {
+      const res = await fetch(`/api/v1/orchestrator/replication/plans/${planId}/failback-cutover`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setFailoverError(await describeActionError(data, 'Failed to execute failback cutover'))
+        void mutatePlans()
+        return
+      }
+      setFailoverError(null)
+      // Refetch the execution so the dialog picks up the 'cutover' phase
+      // right away instead of waiting for the next poll tick.
+      if (activeExecution) {
+        const execRes = await fetch(`/api/v1/orchestrator/replication/executions/${activeExecution.id}`)
+        const execData = await execRes.json().catch(() => null)
+        if (execData) setActiveExecution(execData)
+      }
+      void mutatePlans()
+    } catch (e) {
+      console.error('Failed to execute failback cutover:', e)
+    }
+  }, [activeExecution, describeActionError, mutatePlans])
+
+  const handleFailbackCancel = useCallback(async (planId: string) => {
+    try {
+      const res = await fetch(`/api/v1/orchestrator/replication/plans/${planId}/failback-cancel`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setFailoverError(await describeActionError(data, 'Failed to cancel failback'))
+        void mutatePlans()
+        return
+      }
+      setFailoverError(null)
+      setActiveExecution(null)
+      setFailoverDialog({ open: false, planId: null, type: 'test' })
+      void mutatePlans()
+    } catch (e) {
+      console.error('Failed to cancel failback:', e)
+    }
+  }, [describeActionError, mutatePlans])
+
+  // What an emergency action changes keeps moving for about a minute: the
+  // replica's power state first, then its job walking pending -> syncing ->
+  // synced. A single mutate when the call returns catches none of it, the VM
+  // inventory has no refresh interval of its own, and the jobs list refreshes
+  // on a 15s cadence the user can switch off entirely in Appearance. So the
+  // action schedules its own short burst of refreshes.
+  const actionRefreshTimers = useRef<ReturnType<typeof setTimeout>[]>([])
+
+  const refreshAfterEmergencyAction = useCallback(() => {
+    actionRefreshTimers.current.forEach(clearTimeout)
+    actionRefreshTimers.current = scheduleRefreshes(() => {
+      void mutateJobs()
+      void mutateAllVMs()
+    })
+  }, [mutateJobs, mutateAllVMs])
+
+  useEffect(() => () => actionRefreshTimers.current.forEach(clearTimeout), [])
+
+  const handleStartDRVM = useCallback(async (vmId: number, targetCluster: string, jobId: string, restorePoint?: string) => {
+    await startDRVM({
+      vmId, targetCluster, jobId, restorePoint,
+      conflictMessage: t('siteRecovery.failover.testActiveConflict'),
+    })
+    refreshAfterEmergencyAction()
+  }, [refreshAfterEmergencyAction, t])
+
+  const handleStopDRVM = useCallback(async (vmId: number, targetCluster: string, jobId: string, resumeReplication: boolean) => {
+    await stopDRVM({
+      vmId, targetCluster, jobId, resumeReplication,
+      conflictMessage: t('siteRecovery.failover.testActiveConflict'),
+    })
+    refreshAfterEmergencyAction()
+  }, [refreshAfterEmergencyAction, t])
+
+  // Restore points of one replicated guest, loaded when its start dialog opens
+  // (not with the tab: one probe per guest, only for the row being started).
+  const loadVMRestorePoints = useCallback((jobId: string, vmId: number) => loadVMRestorePointsRequest(jobId, vmId), [])
+
+  // ── Per-guest failover and failback (ui#943) ───────────────────────
+
+  // Where the guest of the open dialog runs on each site right now (node and
+  // power state), from the inventory the page refreshes after every action.
+  const guestPlacements = useMemo((): GuestPlacements | null => {
+    const target = guestDialog.target
+
+    if (!target) return null
+    const placementOf = (connId: string | undefined, vmid: number) => {
+      const vm = allVMs.find((v: any) => v.connId === connId && Number(v.vmid) === vmid)
+
+      return vm ? { node: vm.node || undefined, status: vm.status || undefined } : null
+    }
+
+    return { source: placementOf(target.sourceCluster, target.vmId), dr: placementOf(target.targetCluster, target.targetVmId) }
+  }, [guestDialog.target, allVMs])
+
+  const guestTargetOf = (vm: DRReadyVM): GuestDialogTarget => ({
+    planId: vm.planId || '',
+    planName: vm.planName || '',
+    vmId: vm.vmId,
+    vmName: vm.vmName,
+    targetVmId: vm.targetVmId,
+    jobId: vm.jobId,
+    siblingCount: vm.siblingCount ?? 0,
+    sourceCluster: vm.sourceCluster,
+    targetCluster: vm.targetCluster,
+    sourceSite: connections.find(connection => connection.id === vm.sourceCluster)?.name || vm.sourceCluster,
+    targetSite: connections.find(connection => connection.id === vm.targetCluster)?.name || vm.targetCluster,
+  })
+
+  // Loads and action outcomes of the per-guest dialog belong to the guest
+  // (and mode) it was opened for: closing it or opening another one drops
+  // whatever is still in flight for the previous one.
+  const guestDialogKey = (open: boolean, mode: string, target: GuestDialogTarget | null) =>
+    (open && target ? `${mode}:${target.planId}:${target.vmId}` : null)
+  const guestGuard = useSelectionGuard(guestDialogKey(guestDialog.open, guestDialog.mode, guestDialog.target))
+
+  const fetchExecution = useCallback(async (executionId: string) => {
+    const res = await fetch(`/api/v1/orchestrator/replication/executions/${executionId}`)
+
+    return res.ok ? res.json() : null
+  }, [])
+
+  // Opens the dialog on one row. A guest already in flight (its failover or
+  // failback started before this page load) is rehydrated from the execution
+  // its plan state points at, so the dialog lands on the live view.
+  const openGuestDialog = useCallback((vm: DRReadyVM, mode: 'failover' | 'failback') => {
+    const target = guestTargetOf(vm)
+    const req = guestGuard.switchTo(guestDialogKey(true, mode, target))
+
+    setGuestError(null)
+    setGuestExecution(null)
+    setGuestDialog({ open: true, mode, target })
+
+    const plan = (plans || []).find((p: RecoveryPlan) => p.id === vm.planId)
+    const guest = guestStateOf(plan, vm.vmId)
+
+    if (guest?.executionId && (guest.state === 'failing_over' || guest.state === 'failing_back')) {
+      fetchExecution(guest.executionId).then(data => { if (data && req.isCurrent()) setGuestExecution(data) }).catch(() => { /* the dialog shows the start screen instead */ })
+    }
+
+    if (mode === 'failover') {
+      setGuestRestorePoints({ loading: true, data: null, failed: false })
+      loadVMRestorePointsRequest(vm.jobId, vm.vmId)
+        .then(data => { if (req.isCurrent()) setGuestRestorePoints({ loading: false, data, failed: false }) })
+        .catch(() => { if (req.isCurrent()) setGuestRestorePoints({ loading: false, data: null, failed: true }) })
+    }
+  }, [plans, fetchExecution, guestGuard])
+
+  const closeGuestDialog = useCallback(() => {
+    setGuestDialog(prev => ({ ...prev, open: false }))
+    void mutatePlans()
+  }, [mutatePlans])
+
+  const runGuestAction = useCallback(async (action: () => Promise<any>, onDone: (data: any) => void) => {
+    // The action itself always completes; its outcome only reaches the dialog
+    // if that dialog is still the one it was started from.
+    const req = guestGuard.beginCurrent()
+
+    try {
+      const data = await action()
+
+      if (!req.isCurrent()) return
+      setGuestError(null)
+      onDone(data)
+    } catch (e: any) {
+      if (req.isCurrent()) setGuestError(e?.message || String(e))
+    } finally {
+      void mutatePlans()
+      refreshAfterEmergencyAction()
+    }
+  }, [mutatePlans, refreshAfterEmergencyAction, guestGuard])
+
+  const handleGuestFailover = useCallback((restorePoint?: string) => {
+    const target = guestDialog.target
+
+    if (!target) return
+    void runGuestAction(() => failoverGuest(target.planId, target.vmId, restorePoint), data => setGuestExecution(data))
+  }, [guestDialog.target, runGuestAction])
+
+  const handleGuestStartFailback = useCallback(() => {
+    const target = guestDialog.target
+
+    if (!target) return
+    void runGuestAction(() => startGuestFailback(target.planId, target.vmId), data => setGuestExecution(data))
+  }, [guestDialog.target, runGuestAction])
+
+  const handleGuestCutover = useCallback(() => {
+    const target = guestDialog.target
+    const executionId = guestExecution?.id
+
+    if (!target) return
+    void runGuestAction(() => cutoverGuestFailback(target.planId, target.vmId), () => {
+      // Pick the 'cutover' phase up right away rather than at the next poll.
+      if (executionId) fetchExecution(executionId).then(data => { if (data) setGuestExecution(data) }).catch(() => { /* next poll */ })
+    })
+  }, [guestDialog.target, guestExecution?.id, runGuestAction, fetchExecution])
+
+  const handleGuestCancelFailback = useCallback(() => {
+    const target = guestDialog.target
+
+    if (!target) return
+    void runGuestAction(() => cancelGuestFailback(target.planId, target.vmId), () => {
+      setGuestExecution(null)
+      setGuestDialog(prev => ({ ...prev, open: false }))
+    })
+  }, [guestDialog.target, runGuestAction])
+
+  // Follow the guest's execution while it runs, like the plan dialog does.
+  const guestExecutionId = guestExecution?.id
+  const guestExecutionRunning = guestExecution?.status === 'running'
+
+  useEffect(() => {
+    if (!guestDialog.open || !guestExecutionId || !guestExecutionRunning) return
+    let alive = true
+    const interval = setInterval(async () => {
+      try {
+        const data = await fetchExecution(guestExecutionId)
+
+        // A poll answered after the dialog closed or moved on is dropped.
+        if (!data || !alive) return
+        setGuestExecution(data)
+        if (data.status !== 'running') {
+          clearInterval(interval)
+          void mutatePlans()
+          refreshAfterEmergencyAction()
+        }
+      } catch (e) {
+        console.error('Failed to poll guest execution:', e)
+      }
+    }, 3000)
+
+    return () => {
+      alive = false
+      clearInterval(interval)
+    }
+  }, [guestDialog.open, guestExecutionId, guestExecutionRunning, fetchExecution, mutatePlans, refreshAfterEmergencyAction])
+
+  const guestDialogPlan = useMemo(() =>
+    (plans || []).find((p: RecoveryPlan) => p.id === guestDialog.target?.planId) || null
+  , [plans, guestDialog.target?.planId])
+  const guestDialogState = guestDialog.target ? guestStateOf(guestDialogPlan, guestDialog.target.vmId)?.state || null : null
+
+  // Poll execution status every 3s while running
+  useEffect(() => {
+    if (!activeExecution || activeExecution.status !== 'running') return
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/v1/orchestrator/replication/executions/${activeExecution.id}`)
+        const data = await res.json()
+        setActiveExecution(data)
+        if (data.status !== 'running') {
+          clearInterval(interval)
+          void mutatePlans()
+        }
+      } catch (e) {
+        console.error('Failed to poll execution:', e)
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [activeExecution?.id, activeExecution?.status, mutatePlans])
+
+  return (
+    <ProviderTenantGuard>
+    <EnterpriseGuard requiredFeature={Features.CEPH_REPLICATION} featureName="Site Recovery">
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+        {(connectionsData?.data || []).map(connection => (
+          <ReplicationStorageDiscovery key={connection.id} connectionId={connection.id} onChange={updateDiscovery} />
+        ))}
+        {discoveryLoading && <Alert severity='info' icon={<CircularProgress size={18} />}>{t('siteRecovery.discoveryLoading')}</Alert>}
+        {operationError && <Alert severity='error' onClose={() => setOperationError(null)}>{operationError}</Alert>}
+        {discoveryError && <Alert severity='warning'>{t('siteRecovery.discoveryError')}</Alert>}
+        {!discoveryLoading && !discoveryError && !canCreateProtection && (
+          <Alert severity='info'>
+            <Typography variant='subtitle2'>{t(connections.some(connection => connection.engines.length) ? 'siteRecovery.oneCeph' : 'siteRecovery.noCeph')}</Typography>
+            {t(connections.some(connection => connection.engines.length) ? 'siteRecovery.oneCephDesc' : 'siteRecovery.noCephDesc')}
+          </Alert>
+        )}
+        {/* Tabs + Actions */}
+        <Box sx={{ display: 'flex', alignItems: 'center', borderBottom: 1, borderColor: 'divider' }}>
+          <Tabs
+            value={tab}
+            onChange={(_, v) => {
+              // Recovery remains usable during a site outage.
+              if (!canAccessRecovery && v !== 5) return
+              setTab(v)
+            }}
+            sx={{ flex: 1 }}
+          >
+          <Tab
+            icon={<i className='ri-dashboard-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            label={t('siteRecovery.tabs.dashboard')}
+            disabled={!canAccessRecovery}
+          />
+          <Tab
+            icon={<i className='ri-refresh-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            disabled={!canAccessRecovery}
+            label={
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                {t('siteRecovery.tabs.replication')}
+                {errorCount > 0 && (
+                  <Chip size='small' label={errorCount} color='error' sx={{ height: 18, fontSize: '0.65rem' }} />
+                )}
+              </Box>
+            }
+          />
+          <Tab
+            icon={<i className='ri-camera-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            label={t('siteRecovery.tabs.snapshots')}
+            disabled={!canAccessRecovery}
+          />
+          <Tab
+            icon={<i className='ri-file-shield-2-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            label={t('siteRecovery.tabs.recoveryPlans')}
+            disabled={!canAccessRecovery}
+          />
+          <Tab
+            icon={<i className='ri-alarm-warning-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            label={t('siteRecovery.tabs.emergencyDR')}
+            disabled={!canAccessRecovery}
+          />
+          <Tab
+            icon={<i className='ri-test-tube-line' style={{ fontSize: 18 }} />}
+            iconPosition='start'
+            label={t('siteRecovery.tabs.simulation')}
+          />
+        </Tabs>
+          {canAccessRecovery && (
+          <Box sx={{ display: 'flex', gap: 1, ml: 'auto', pl: 2 }}>
+            <Button
+              variant='outlined'
+              size='small'
+              startIcon={<i className='ri-add-line' />}
+              onClick={() => setCreatePlanOpen(true)}
+              disabled={!jobs?.length}
+            >
+              {t('siteRecovery.createPlan.title')}
+            </Button>
+            <Button
+              variant='contained'
+              size='small'
+              startIcon={<i className='ri-add-line' />}
+              onClick={() => setCreateJobOpen(true)}
+              disabled={!canCreateProtection}
+            >
+              {t('siteRecovery.createJob.title')}
+            </Button>
+          </Box>
+          )}
+        </Box>
+
+        {/* Tab Content */}
+        {tab === 0 && canAccessRecovery && (
+          <DashboardTab health={health} loading={healthLoading} jobs={jobs || []} connections={connections} vmNamesByConn={vmNamesByConn} onSyncJob={handleSyncJob} />
+        )}
+
+        {tab === 1 && canAccessRecovery && (
+          <ProtectionTab
+            jobs={jobs || []}
+            loading={jobsLoading}
+            logs={jobLogs || []}
+            logsLoading={logsLoading}
+            connections={connections}
+            vmNamesByConn={vmNamesByConn}
+            onSyncJob={handleSyncJob}
+            onPauseJob={handlePauseJob}
+            onResumeJob={handleResumeJob}
+            onDeleteJob={handleDeleteJob}
+            onEditJob={setEditJobId}
+            selectedJobId={selectedJobId}
+            onSelectJob={setSelectedJobId}
+          />
+        )}
+
+        {tab === 2 && canAccessRecovery && (
+          <SnapshotsTab connections={connections} vmNamesByConn={vmNamesByConn} />
+        )}
+
+        {tab === 3 && canAccessRecovery && (
+          <RecoveryPlansTab
+            plans={plans || []}
+            loading={plansLoading}
+            history={planHistory || []}
+            historyLoading={historyLoading}
+            selectedPlanId={selectedPlanId}
+            onSelectPlan={setSelectedPlanId}
+            onTestFailover={(id) => openFailoverDialog(id, 'test')}
+            onFailover={(id) => openFailoverDialog(id, 'failover')}
+            onFailback={(id) => openFailoverDialog(id, 'failback')}
+            onEditPlan={setEditPlanId}
+            onDeletePlan={handleDeletePlan}
+            onCleanupTest={(id) => openFailoverDialog(id, 'test')}
+            onHistoryCleared={() => mutateHistory()}
+            connections={connections}
+            jobs={jobs || []}
+          />
+        )}
+
+        {tab === 4 && canAccessRecovery && (
+          <EmergencyDRTab
+            jobs={jobs || []}
+            plans={plans || []}
+            loading={jobsLoading || plansLoading}
+            connections={connections}
+            vmNamesByConn={vmNamesByConn}
+            vmStatesByConn={vmStatesByConn}
+            onStartVM={handleStartDRVM}
+            onStopVM={handleStopDRVM}
+            loadRestorePoints={loadVMRestorePoints}
+            onExecuteFailover={(planId) => openFailoverDialog(planId, 'failover')}
+            onExecuteFailback={(planId) => openFailoverDialog(planId, 'failback')}
+            onDeletePlan={handleDeletePlan}
+            onGuestFailover={(vm) => openGuestDialog(vm, 'failover')}
+            onGuestFailback={(vm) => openGuestDialog(vm, 'failback')}
+          />
+        )}
+
+        {tab === 5 && (
+          <SimulationTab connections={connections} isEnterprise={isEnterprise} />
+        )}
+
+        {/* Dialogs */}
+        <GuestFailoverDialog
+          open={guestDialog.open}
+          mode={guestDialog.mode}
+          target={guestDialog.target}
+          guestState={guestDialogState}
+          execution={guestExecution}
+          errorMessage={guestError}
+          placements={guestPlacements}
+          restorePoints={guestRestorePoints}
+          onClose={closeGuestDialog}
+          onFailover={handleGuestFailover}
+          onStartFailback={handleGuestStartFailback}
+          onCutover={handleGuestCutover}
+          onCancelFailback={handleGuestCancelFailback}
+        />
+
+        <CreateJobDialog
+          open={createJobOpen}
+          onClose={() => setCreateJobOpen(false)}
+          onSubmit={handleCreateJob}
+          connections={connections}
+          allVMs={allVMs}
+          engines={engines}
+          jobs={jobs}
+        />
+
+        <EditJobDialog
+          open={editJobId !== null}
+          job={editJob}
+          onClose={() => setEditJobId(null)}
+          onSubmit={handleUpdateJob}
+          connections={connections}
+          allVMs={allVMs}
+          jobs={jobs || []}
+        />
+
+        <CreatePlanDialog
+          open={createPlanOpen || !!editPlanId}
+          onClose={() => {
+            setCreatePlanOpen(false)
+            setEditPlanId(null)
+          }}
+          onSubmit={handleSubmitPlan}
+          connections={connections}
+          jobs={jobs || []}
+          plan={editPlanId ? (plans || []).find((p: RecoveryPlan) => p.id === editPlanId) || null : null}
+          plans={plans || []}
+        />
+
+        <FailoverDialog
+          open={failoverDialog.open}
+          onClose={() => {
+            setFailoverDialog({ open: false, planId: null, type: 'test' })
+            // The next open rehydrates from the plan; keeping the old execution
+            // would leave its pollers alive for a test that may be gone.
+            setActiveExecution(null)
+          }}
+          plan={failoverPlan}
+          type={failoverDialog.type}
+          onConfirm={handleFailoverConfirm}
+          onCleanup={handleCleanupTest}
+          cleanupLoading={cleanupLoading}
+          cleanupResult={cleanupResult}
+          execution={activeExecution}
+          errorMessage={failoverError}
+          errorStatus={failoverErrorStatus}
+          targetConnId={failoverPlan?.target_cluster}
+          connections={connections}
+          vmNameMap={failoverPlan ? vmNamesByConn[failoverPlan.source_cluster] : undefined}
+          restorePoints={restorePoints}
+          restorePointsLoading={restorePointsLoading}
+          restorePointsError={!!restorePointsError}
+          onFailbackCutover={handleFailbackCutover}
+          onFailbackCancel={handleFailbackCancel}
+        />
+      </Box>
+    </EnterpriseGuard>
+    </ProviderTenantGuard>
+  )
+}

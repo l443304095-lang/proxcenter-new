@@ -1,0 +1,343 @@
+/**
+ * Map ESXi VM configuration to Proxmox VE VM creation parameters
+ */
+
+import type { EsxiVmConfig, EsxiDiskInfo } from "@/lib/vmware/soap"
+import { vmwareToolsState } from "@/lib/vmware/soap"
+import { MIGRATION_CPU_TYPE_DEFAULT } from "./cpu-type"
+import { applyHardwareOverrides, buildNetValue, resolveNicTarget, type MigrationDiskBus, type MigrationTargetOverrides } from "./target-overrides"
+import { tpmstate0Param } from "./vtpm"
+
+export interface PveVmCreateParams {
+  vmid: number
+  name: string
+  ostype: string
+  cores: number
+  sockets: number
+  memory: number
+  cpu: string
+  scsihw: string
+  bios: string
+  machine: "q35" | "pc"
+  boot: string
+  /** Slot of the boot disk: the IDE disk sitting first on its bus, else the first source disk, else the #653 default. */
+  bootDiskSlot: string
+  /** Target slot of every source disk, in source listing order (`ide2`, `sata0`, `scsi1`…), see planDiskSlots. */
+  diskSlots: string[]
+  agent: string
+  /**
+   * One entry per target NIC, `net0` to `netN`, in source NIC order (#317).
+   * Every source NIC is emitted: a guest with two adapters gets two.
+   */
+  nets: Record<string, string>
+  // EFI disk (only if firmware=efi)
+  efidisk0?: string
+  /** Empty TPM 2.0 state, only when the source has a vTPM (roadmap#1). */
+  tpmstate0?: string
+}
+
+/** What the warm engine decides at cutover rather than at creation (#1000). */
+export interface MapperOptions {
+  /** The guest went through virt-v2v-in-place: it boots from VirtIO SCSI and drives VirtIO NICs. */
+  guestConverted?: boolean
+  /** Forced bus per disk, in the order of `esxiConfig.disks` (the review step's Bus column). */
+  buses?: (MigrationDiskBus | undefined)[]
+}
+
+/** `efidisk0` value: the Proxmox default enrols the Microsoft Secure Boot keys, false leaves the store empty. */
+export function efiDiskValue(storage: string, preEnrolledKeys?: boolean): string {
+  return `${storage}:1,efitype=4m,pre-enrolled-keys=${preEnrolledKeys === false ? 0 : 1}`
+}
+
+/** Map ESXi guest ID / guest full name to Proxmox ostype */
+function mapOsType(guestId: string, guestOS: string): string {
+  const id = (guestId || "").toLowerCase()
+  const name = (guestOS || "").toLowerCase()
+
+  if (id.includes("win11") || name.includes("windows 11")) return "win11"
+  if (id.includes("win10") || name.includes("windows 10")) return "win10"
+  if (id.includes("windows9") || name.includes("windows 8")) return "win8"
+  if (id.includes("windows7") || name.includes("windows 7")) return "win7"
+  if (id.includes("windows") || name.includes("windows")) return "win10"
+  if (id.includes("ubuntu") || id.includes("debian") || id.includes("centos") || id.includes("rhel") ||
+      id.includes("linux") || id.includes("sles") || id.includes("fedora") || id.includes("oracle") ||
+      name.includes("linux") || name.includes("ubuntu") || name.includes("debian")) return "l26"
+  if (id.includes("freebsd") || name.includes("freebsd")) return "other"
+  return "l26"
+}
+
+/** Map ESXi NIC type to Proxmox network model */
+function mapNicModel(nicType: string): string {
+  switch (nicType) {
+    case "Vmxnet3": return "virtio"
+    case "E1000": return "e1000"
+    case "E1000e": return "e1000"
+    default: return "virtio"
+  }
+}
+
+/** Detect if the VM is Windows-based */
+export function isWindowsVm(config: EsxiVmConfig): boolean {
+  const id = (config.guestId || "").toLowerCase()
+  const name = (config.guestOS || "").toLowerCase()
+  return id.includes("windows") || id.includes("win") || name.includes("windows")
+}
+
+/** Proxmox slot capacity per bus (`qemu-server`: ide0-3, sata0-5, scsi0-30). */
+const MAX_SLOTS: Record<"ide" | "sata" | "scsi", number> = { ide: 4, sata: 6, scsi: 31 }
+
+/** vSphere IDE controllers carry fixed keys 200 and 201 (two units each), which is exactly Proxmox's `ideN` = controller N/2, unit N%2. */
+function idePosition(d: Pick<EsxiDiskInfo, "controllerKey" | "unitNumber">): number | undefined {
+  if (d.controllerKey === undefined || d.unitNumber === undefined) return undefined
+  const controller = d.controllerKey - 200
+  if (controller < 0 || controller > 1 || d.unitNumber < 0 || d.unitNumber > 1) return undefined
+  return controller * 2 + d.unitNumber
+}
+
+function busOf(d: Pick<EsxiDiskInfo, "controllerType">, sataAsScsi = false): "ide" | "sata" | "scsi" {
+  const t = (d.controllerType || "").toLowerCase()
+  if (t === "sata" && sataAsScsi) return "scsi"
+  return t === "ide" || t === "sata" ? t : "scsi"
+}
+
+/**
+ * One target slot per source disk, on the bus the guest already knows.
+ *
+ * A raw block copy carries the guest's drivers exactly as they are, so a disk
+ * must come back on a controller the guest can boot from without a new driver:
+ * - a disk on an IDE controller stays on IDE, at its source position. A closed
+ *   appliance built for legacy IDE (a PBX image, a firewall) finds its disks
+ *   where its bootloader expects them (field case: a four-disk IPvA appliance,
+ *   `ide0:0` to `ide1:1`, which the old SCSI-only mapping left unbootable);
+ * - a disk on a SATA controller stays on SATA (six slots on Proxmox, the
+ *   overflow goes to SCSI);
+ * - a disk on a SCSI controller follows the #653 rule: the boot disk of a
+ *   Windows or UEFI guest goes to `sata0`, everything else to `scsiN`;
+ *   `dataOnSata` (a Windows without the VirtIO drivers, #1173) sends the data
+ *   disks to SATA as well, AHCI being inbox: on VirtIO SCSI Windows sees none
+ *   of them until the drivers are installed. Past the sixth SATA slot they go
+ *   to SCSI.
+ * A slot is never handed out twice, and the boot disk claims first: a Windows
+ * SCSI boot disk on `sata0` pushes a SATA data disk to `sata1`. A disk whose
+ * exact position is unknown, or already taken, gets the next free slot of its
+ * bus, in listing order.
+ *
+ * `buses` carries the operator's choice per disk (#1000, review step): a disk
+ * forced to SCSI or SATA goes there whatever its source bus, the boot disk
+ * claiming slot 0 of that bus; "auto" or absent keeps the rule above.
+ * `sataAsScsi` (a guest converted at cutover, #1000) moves the SATA source
+ * disks to SCSI too: the guest now carries the VirtIO SCSI driver. IDE disks
+ * keep their bus, the closed appliances they belong to are not converted.
+ */
+export function planDiskSlots(
+  disks: Pick<EsxiDiskInfo, "controllerType" | "controllerKey" | "unitNumber">[],
+  opts: { bootOnSata: boolean; buses?: (MigrationDiskBus | undefined)[]; sataAsScsi?: boolean; dataOnSata?: boolean },
+): string[] {
+  const taken = new Set<string>()
+  const claim = (bus: "ide" | "sata" | "scsi", preferred?: number): string | undefined => {
+    const candidates = preferred !== undefined && preferred < MAX_SLOTS[bus]
+      ? [preferred, ...Array.from({ length: MAX_SLOTS[bus] }, (_, n) => n)]
+      : Array.from({ length: MAX_SLOTS[bus] }, (_, n) => n)
+    for (const n of candidates) {
+      const slot = `${bus}${n}`
+      if (!taken.has(slot)) { taken.add(slot); return slot }
+    }
+    return undefined
+  }
+  const exact = (bus: "ide" | "sata" | "scsi", n: number): string | undefined => {
+    const slot = `${bus}${n}`
+    if (n >= MAX_SLOTS[bus] || taken.has(slot)) return undefined
+    taken.add(slot)
+    return slot
+  }
+
+  const slots: (string | undefined)[] = disks.map(() => undefined)
+  const forced = (i: number): "scsi" | "sata" | undefined => {
+    const b = opts.buses?.[i]
+    return b === "scsi" || b === "sata" ? b : undefined
+  }
+  // Pass 0, the operator's forced buses: the boot disk takes slot 0 of its
+  // bus, so it claims before anything else does.
+  disks.forEach((_, i) => {
+    const bus = forced(i)
+    if (bus && i === 0) slots[i] = exact(bus, 0)
+  })
+  // Pass 1, exact positions: the boot disk of a Windows/UEFI SCSI guest takes
+  // sata0, IDE and SATA disks take their source position when it is free.
+  disks.forEach((d, i) => {
+    if (slots[i] || forced(i)) return
+    const bus = busOf(d, opts.sataAsScsi)
+    if (bus === "ide") {
+      const pos = idePosition(d)
+      if (pos !== undefined) slots[i] = exact("ide", pos)
+    } else if (bus === "sata") {
+      if (d.unitNumber !== undefined) slots[i] = exact("sata", d.unitNumber)
+    } else if (i === 0 && opts.bootOnSata) {
+      slots[i] = exact("sata", 0)
+    }
+  })
+  // Pass 2, everything still unplaced: next free slot of its bus, SCSI once a
+  // small bus is full, at the listing index when that one is free (the SCSI
+  // data disks therefore keep their historical `scsiN`).
+  disks.forEach((d, i) => {
+    if (slots[i]) return
+    const bus = forced(i) ?? (opts.dataOnSata && busOf(d) === "scsi" ? "sata" : busOf(d, opts.sataAsScsi))
+    slots[i] = (bus === "scsi" ? undefined : claim(bus)) ?? claim("scsi", i) ?? `scsi${i}`
+  })
+  return slots as string[]
+}
+
+/**
+ * Which slot the target boots from. Several IDE disks boot from the lowest IDE
+ * position, as the appliance's BIOS did on vSphere; otherwise the first source
+ * disk, as before. Without any disk, the #653 default the callers relied on.
+ */
+function bootSlotOf(slots: string[], fallback: string): string {
+  const ide = slots.filter(s => s.startsWith("ide")).sort((a, b) => Number(a.slice(3)) - Number(b.slice(3)))
+  return ide[0] ?? slots[0] ?? fallback
+}
+
+/**
+ * Generate Proxmox VM creation parameters from ESXi VM config.
+ *
+ * `overrides` (#317) carries what the operator changed in the review step:
+ * hardware (cores, sockets, memory) applied on top of the source values, and
+ * a target bridge, VLAN tag and model per source NIC. A NIC without a mapping
+ * lands on `networkBridge` with `vlanTag`, as every NIC did before.
+ */
+export function mapEsxiToPveConfig(
+  esxiConfig: EsxiVmConfig,
+  targetVmid: number,
+  targetStorage: string,
+  networkBridge: string = "vmbr0",
+  vlanTag?: number,
+  cpuType: string = MIGRATION_CPU_TYPE_DEFAULT,
+  overrides?: MigrationTargetOverrides,
+  opts: MapperOptions = {},
+): PveVmCreateParams {
+  const isEfi = esxiConfig.firmware === "efi"
+  const isWin = isWindowsVm(esxiConfig)
+  // A guest converted at cutover (#1000) carries the VirtIO drivers in its
+  // initramfs or its driver store: nothing forces its boot disk onto SATA or
+  // its Windows NICs onto e1000 any more.
+  const needsInboxDrivers = !opts.guestConverted
+
+  // virtio-scsi for every guest: data disks appear as soon as VirtIO drivers are
+  // installed. The boot disk cannot rely on that (a raw byte copy never has a
+  // boot-start VirtIO driver), so Windows boots from SATA — AHCI is inbox and
+  // boot-start in every supported Windows. The old `lsi` fallback bluescreened
+  // every modern Windows with INACCESSIBLE_BOOT_DEVICE: no inbox LSI driver
+  // since the XP era (#653).
+  const scsihw = "virtio-scsi-single"
+  // Boot disk bus: SATA when the firmware is OVMF (existing rule — OVMF cannot
+  // enumerate an LSI controller) or the guest is Windows (#653). A Windows
+  // keeps its data disks on SATA too (#1173), other guests on SCSI. IDE and
+  // SATA source disks keep their bus, see planDiskSlots.
+  const bootOnSata = needsInboxDrivers && (isEfi || isWin)
+  const diskSlots = planDiskSlots(esxiConfig.disks, { bootOnSata, buses: opts.buses, sataAsScsi: opts.guestConverted, dataOnSata: needsInboxDrivers && isWin })
+  const bootDiskSlot = bootSlotOf(diskSlots, bootOnSata ? "sata0" : "scsi0")
+  // q35 has no legacy IDE controller: Proxmox hangs its `ideN` off the ICH9 AHCI,
+  // where only one unit per port exists (ide1 and ide3 cannot even be created)
+  // and a guest built for PIIX IDE finds no disk. Any IDE slot means i440fx.
+  const machine: "q35" | "pc" = diskSlots.some(s => s.startsWith("ide")) ? "pc" : "q35"
+  // A guest that never had VMware Tools will not get a QEMU agent either (a
+  // closed appliance); leaving the agent enabled only makes every Proxmox
+  // shutdown wait for an agent that will never answer.
+  const agent = vmwareToolsState(esxiConfig) === "not-installed" ? "0" : "1"
+
+  // One target NIC per source NIC, in source order (#317): `configMapper` used
+  // to emit `net0` from `nics[0]` only and silently dropped every other
+  // adapter. The source MAC is preserved so the guest keeps its network
+  // identity: without it Proxmox assigns a fresh MAC, the guest (notably
+  // Windows) sees a brand new adapter and its IP is stranded on the old
+  // "ghost" NIC. Only a well-formed unicast MAC is set; the target boots after
+  // the source is powered off (warm cutover / direct-ESXi power-off), so there
+  // is no MAC collision. A Windows guest gets e1000 (inbox driver) unless the
+  // operator picked a model; a source without any adapter still gets one
+  // default NIC on the default bridge, as before.
+  const defaultNicModel = (sourceType: string | undefined): string => {
+    if (opts.guestConverted) return "virtio"
+    return isWin ? "e1000" : mapNicModel(sourceType || "Vmxnet3")
+  }
+  const nets: Record<string, string> = {}
+  esxiConfig.nics.forEach((nic, i) => {
+    const target = resolveNicTarget(i, overrides?.nics, { bridge: networkBridge, vlanTag })
+    // A converted guest has the VirtIO network driver (netkvm on Windows), so
+    // every NIC the operator left on "auto" becomes VirtIO, an E1000 source
+    // adapter included.
+    const model = target.model ?? defaultNicModel(nic.type)
+    nets[`net${i}`] = buildNetValue(model, target.bridge, nic.macAddress, target.vlanTag)
+  })
+  if (esxiConfig.nics.length === 0) {
+    const target = resolveNicTarget(0, overrides?.nics, { bridge: networkBridge, vlanTag })
+    nets.net0 = buildNetValue(target.model ?? (isWin && needsInboxDrivers ? "e1000" : "virtio"), target.bridge, undefined, target.vlanTag)
+  }
+
+  const params: PveVmCreateParams = applyHardwareOverrides({
+    vmid: targetVmid,
+    name: esxiConfig.name.replace(/[^a-zA-Z0-9-]/g, "-").replace(/^-+|(?<!-)-+$/g, '').substring(0, 63) || 'vm',
+    ostype: mapOsType(esxiConfig.guestId, esxiConfig.guestOS),
+    cores: esxiConfig.numCoresPerSocket || esxiConfig.numCPU,
+    sockets: esxiConfig.sockets,
+    memory: esxiConfig.memoryMB,
+    cpu: cpuType,
+    scsihw,
+    bios: isEfi ? "ovmf" : "seabios",
+    machine,
+    boot: `order=${bootDiskSlot}`,
+    bootDiskSlot,
+    diskSlots,
+    agent,
+    nets,
+  }, overrides?.hardware)
+
+  if (isEfi) {
+    // pre-enrolled-keys=1 mirrors the Proxmox GUI default for UEFI VMs:
+    // OVMF ships with the standard Microsoft Secure Boot keys (PK, KEK,
+    // db, dbx) so Windows (and signed Linux shim bootloaders) pass
+    // Secure Boot verification after migration. Using =0 caused silent
+    // boot failures when the source VM had Secure Boot enabled. The operator
+    // can still turn the keys off (#1000): a guest whose shim the current
+    // revocation list rejects (CentOS 8) only boots with Secure Boot off.
+    params.efidisk0 = efiDiskValue(targetStorage, overrides?.hardware?.efiPreEnrolledKeys)
+  }
+  // A source with a virtual TPM keeps a TPM device on the target: an empty
+  // TPM 2.0 state (the vSphere one is encrypted and never copied, roadmap#1).
+  // Windows 11 / Server 2022 refuse to boot without one once installed with it.
+  if (esxiConfig.hasVtpm) {
+    params.tpmstate0 = tpmstate0Param(targetStorage)
+  }
+
+  return params
+}
+
+/** The devices a guest without the VirtIO drivers cannot use (#1173): its VirtIO SCSI disk slots and VirtIO NICs. */
+export function virtioDevices(p: Pick<PveVmCreateParams, "diskSlots" | "nets">): string[] {
+  const nics = Object.entries(p.nets).filter(([, v]) => v.startsWith("virtio,")).map(([k]) => k)
+  return [...p.diskSlots.filter(s => s.startsWith("scsi")), ...nics]
+}
+
+/**
+ * The review step's choices without those that need the VirtIO drivers
+ * (#1173): a disk forced to SCSI and a NIC forced to VirtIO fall back to the
+ * mapper's rule. They were picked for a guest the cutover converts; a Windows
+ * the conversion left without the drivers sees neither.
+ */
+export function withoutVirtioChoices(
+  overrides: MigrationTargetOverrides,
+  buses: (MigrationDiskBus | undefined)[],
+): { overrides: MigrationTargetOverrides; buses: (MigrationDiskBus | undefined)[] } {
+  return {
+    overrides: { ...overrides, ...(overrides.nics && { nics: overrides.nics.map(n => n.model === "virtio" ? { ...n, model: undefined } : n) }) },
+    buses: buses.map(b => b === "scsi" ? undefined : b),
+  }
+}
+
+/** "Disk 2 scsi1 → sata1, net0 virtio → e1000": the disks that changed bus and the NICs that changed model between two plans of the same guest. */
+export function describeHardwareChanges(from: Pick<PveVmCreateParams, "diskSlots" | "nets">, to: Pick<PveVmCreateParams, "diskSlots" | "nets">): string[] {
+  const bus = (slot: string | undefined) => (slot || "").replace(/\d+$/, "")
+  const disks = from.diskSlots.flatMap((s, i) => to.diskSlots[i] && bus(to.diskSlots[i]) !== bus(s) ? [`Disk ${i + 1} ${s} → ${to.diskSlots[i]}`] : [])
+  const model = (v: string | undefined) => (v || "").split(",")[0]
+  const nics = Object.keys(from.nets).flatMap(k => model(to.nets[k]) && model(to.nets[k]) !== model(from.nets[k]) ? [`${k} ${model(from.nets[k])} → ${model(to.nets[k])}`] : [])
+  return [...disks, ...nics]
+}

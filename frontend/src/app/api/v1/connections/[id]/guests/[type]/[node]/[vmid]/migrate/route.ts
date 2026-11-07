@@ -1,0 +1,155 @@
+import { NextResponse } from "next/server"
+import { licenseExcludedResponse } from "@/lib/api/response"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { describeSnapshotBlockers, snapshotMigrationGuard } from "@/lib/migration/snapshotMigrationCheck"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { migrateVmSchema } from "@/lib/schemas"
+import { refreshCachedGuests } from "@/lib/cache/guestSetRefresh"
+import { migrationTenantDenied } from "@/lib/tenant/migrationGuard"
+import { guardSessionGuest } from "@/lib/vdc/guestGuard"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+// POST /api/v1/connections/{id}/guests/{type}/{node}/{vmid}/migrate
+// Lance la migration d'une VM vers un autre node
+async function handler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; type: string; node: string; vmid: string }> }
+) {
+  try {
+    const { id, type, node, vmid } = await ctx.params
+
+    // RBAC: Check vm.migrate permission
+    const resourceId = buildVmResourceId(id, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_MIGRATE, "vm", resourceId)
+
+    if (denied) return denied
+
+    const tenantDenied = await migrationTenantDenied(id)
+    if (tenantDenied) return tenantDenied
+
+    const rawBody = await req.json()
+    const parseResult = migrateVmSchema.safeParse(rawBody)
+
+    if (!parseResult.success) {
+      return NextResponse.json(
+        { error: "Invalid input", details: parseResult.error.flatten() },
+        { status: 400 }
+      )
+    }
+
+    const { target, online, targetstorage, withLocalDisks } = parseResult.data
+
+    const conn = await getConnectionById(id)
+
+    // migrationTenantDenied already refuses every vDC tenant; this keeps the
+    // path segments strict and the guest confined should that ever loosen.
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    // Déterminer le type de ressource pour l'API Proxmox
+    const resourceType = type === 'lxc' ? 'lxc' : 'qemu'
+
+    // #1027: PVE aborts a migration held by local snapshots with only "check
+    // log". Refuse it here with the reason, so every caller (dialog, bulk
+    // migration, rolling node update) shows it. A failed check leaves the
+    // verdict to PVE, as before, rather than blocking on a guess.
+    let blockers: Awaited<ReturnType<typeof snapshotMigrationGuard>> = []
+    try {
+      blockers = await snapshotMigrationGuard(
+        conn,
+        { node, type: resourceType, vmid },
+        { target, targetStorage: targetstorage || undefined },
+      )
+    } catch (e: any) {
+      console.warn('[migrate] snapshot check skipped:', String(e?.message || e).replace(/[\r\n]/g, ''))
+    }
+    if (blockers.length > 0) {
+      return NextResponse.json(
+        { error: describeSnapshotBlockers(blockers), code: 'SNAPSHOTS_BLOCK_MIGRATION', blockers },
+        { status: 409 },
+      )
+    }
+    
+    // Construire les paramètres de migration
+    const migrateParams: Record<string, any> = {
+      target,
+    }
+    
+    // Pour les VMs QEMU
+    if (resourceType === 'qemu') {
+      migrateParams.online = online ? 1 : 0
+
+      if (targetstorage) {
+        migrateParams['with-local-disks'] = 1
+        migrateParams.targetstorage = targetstorage
+      } else {
+        // Always send with-local-disks for online QEMU migrations.
+        // Proxmox ignores it if the VM has no local disks, but without it
+        // migrations fail when local disks are present. The frontend detection
+        // of local disks is fragile (async storages fetch may not complete),
+        // so we always set this flag to match Proxmox native UI behavior.
+        migrateParams['with-local-disks'] = 1
+      }
+    }
+    
+    // Pour les LXC
+    if (resourceType === 'lxc') {
+      if (online) {
+        migrateParams.restart = 1
+      }
+      if (targetstorage) {
+        migrateParams['target-storage'] = targetstorage
+      }
+    }
+    
+    // Appeler l'API Proxmox pour la migration
+    const result = await pveFetch<string>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/${resourceType}/${encodeURIComponent(vmid)}/migrate`,
+      {
+        method: 'POST',
+        body: new URLSearchParams(
+          Object.entries(migrateParams).map(([k, v]) => [k, String(v)])
+        ).toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    )
+    
+    // roadmap#192: one read of this connection patches the cached inventories
+    // (migration lock now; the new node once the poller sees the task end),
+    // instead of a full fan-out per tenant on the next read.
+    await refreshCachedGuests(id, conn)
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "migrate",
+      category: type === 'lxc' ? 'containers' : 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { sourceNode: node, targetNode: target, connectionId: id, online },
+    })
+
+    return NextResponse.json({
+      success: true,
+      data: result,
+      message: `Migration of VM ${vmid} to ${target} started`
+    })
+  } catch (e: any) {
+    const excluded = licenseExcludedResponse(e)
+    if (excluded) return excluded
+    console.error('Error migrating VM:', e)
+
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const POST = withAudit({ category: "vms", resourceType: "guest", resourceTypeParam: "type", resourceParam: "vmid", action: "migrate" }, withPublicApiGuard("vm-migrate", handler))

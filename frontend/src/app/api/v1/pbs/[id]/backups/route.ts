@@ -1,0 +1,243 @@
+import { NextResponse } from "next/server"
+import { cookies } from "next/headers"
+
+import { demoResponse } from "@/lib/demo/demo-api"
+import { getPbsConnectionById, getPbsConnectionByIdUnscoped } from "@/lib/connections/getConnection"
+import { prisma as globalPrisma } from "@/lib/db/prisma"
+import { formatBytes } from "@/utils/format"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { assertVdcPbsAccess, getVdcScope } from "@/lib/vdc/scope"
+import { getDateLocale } from "@/lib/i18n/date"
+import { getCurrentTenantId } from "@/lib/tenant"
+import { setCachedPbsBackups } from "@/lib/cache/pbsBackupCache"
+import { fetchAllPbsBackups, getAllBackups, type CachedBackup } from "@/lib/backups/pbsSnapshots"
+import { withPublicApiGuard, type GuardedRouteContext } from "@/lib/api-tokens/routeGuard"
+
+import { groupBackupMachines } from "@/lib/backups/machineGroups"
+
+export const runtime = "nodejs"
+
+// Connection perimeter for THIS route is layered elsewhere on purpose (spec
+// section 6): layer 1 is the guard itself, which validates the {id} segment
+// (declared as the entry's connectionSegment) against
+// resolveVisibleConnectionIds(principal) BEFORE this handler ever runs;
+// layer 2 is the existing checkPermission(BACKUP_VIEW, "pbs", id) call
+// below, already principal-aware since Task 9. Nothing else changes here.
+async function handler(req: Request, ctx: GuardedRouteContext) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const id = (params as any)?.id
+
+    if (!id) return NextResponse.json({ error: "Missing params.id" }, { status: 400 })
+
+    const denied = await checkPermission(PERMISSIONS.BACKUP_VIEW, "pbs", id)
+    if (denied) return denied
+
+    const access = await assertVdcPbsAccess(id)
+    if (access instanceof Response) return access
+
+    // P1<->P1.5 seam: the union access VERDICT above stays untouched, but the
+    // DISPLAYED namespaces must follow the active vDC view context — otherwise
+    // the list here still shows vDC-B namespaces while the restore dialog
+    // hides its selector and locks the target to vDC A, and a restore can
+    // silently target the wrong vDC. Token callers never depend on the
+    // cookie (global ruling n°4); the 5s memo makes this second resolution
+    // of the scope cheap.
+    const tenantId = await getCurrentTenantId()
+    const narrowed = await getVdcScope(tenantId, { ignoreVdcContext: ctx?.principal?.kind === 'token' })
+
+    const cookieStore = await cookies()
+    const dateLocale = getDateLocale(cookieStore.get('NEXT_LOCALE')?.value || 'en')
+
+    const url = new URL(req.url)
+    const datastoreFilter = url.searchParams.get('datastore')
+    const namespaceFilter = url.searchParams.get('namespace') // exact namespace string, '' for root
+    const typeFilter = url.searchParams.get('type') // 'vm' | 'ct' | 'host'
+    const page = Number.parseInt(url.searchParams.get('page') || '1', 10)
+    const pageSize = Number.parseInt(url.searchParams.get('pageSize') || '50', 10)
+    const search = url.searchParams.get('search')?.toLowerCase() || ''
+    const noCache = url.searchParams.get('noCache') === '1'
+
+    const conn = access.kind === 'admin'
+      ? await getPbsConnectionById(id)
+      : await getPbsConnectionByIdUnscoped(id)
+
+    // Get all backups (from cache or fresh fetch)
+    let allBackups: CachedBackup[]
+    let warnings: string[]
+    let fromCache: boolean
+
+    if (noCache) {
+      // Force refresh requested
+      const result = await fetchAllPbsBackups(conn, dateLocale)
+      setCachedPbsBackups(id, result.data, result.warnings, 'default', dateLocale)
+      allBackups = result.data
+      warnings = result.warnings
+      fromCache = false
+    } else {
+      const result = await getAllBackups(id, conn, 'default', dateLocale)
+      allBackups = result.data
+      warnings = result.warnings
+      fromCache = result.fromCache
+    }
+
+    // Tenant scoping: restrict to the caller's authorised (datastore, namespace) pairs.
+    // The union access list is the outer authorization bound; intersecting
+    // with the context-narrowed scope can only REMOVE entries from it, never
+    // add ones the union verdict didn't already authorise. A no-op when no
+    // view context is set (narrowed == union).
+    if (access.kind === 'tenant') {
+      const allowedSet = new Set(access.allowed.map(p => `${p.datastore}|${p.namespace}`))
+      const narrowedNs = narrowed?.pbsNamespacesByConnection.get(id) ?? []
+      const narrowedSet = new Set(narrowedNs.map(p => `${p.datastore}|${p.namespace}`))
+      allBackups = allBackups.filter(b =>
+        allowedSet.has(`${b.datastore}|${b.namespace}`) && narrowedSet.has(`${b.datastore}|${b.namespace}`)
+      )
+    }
+
+    // Keep names from PBS metadata only: the snapshot notes, else the notes
+    // of its own group (lib/backups/pbsGroupNotes.ts). A live VMID match, even
+    // if unique, cannot establish which cluster produced this backup (the
+    // source may be offline, removed, or the VMID reused). Unknown names stay
+    // empty rather than labelling a snapshot with another guest's name.
+
+    // Extract available namespaces from all backups (before filtering)
+    const namespaceSet = new Set(allBackups.map(b => b.namespace))
+    const namespaces = Array.from(namespaceSet).sort((a, b) => {
+      // Root namespace first, then alphabetical
+      if (a === '') return -1
+      if (b === '') return 1
+      return a.localeCompare(b)
+    })
+
+    // Resolve the (datastore, namespace) → vDC mapping so the UI can group
+    // namespaces by vDC. For tenant callers we restrict to their own vDCs;
+    // super-admins see bindings across every tenant on this PBS connection.
+    let bindings: Array<{ datastore: string; namespace: string; vdcId: string; vdcName: string; tenantName?: string }> = []
+    if (access.kind === 'tenant') {
+      const tenantId = await getCurrentTenantId()
+      const rows = await globalPrisma.vdcPbsNamespace.findMany({
+        where: { pbsConnectionId: id, vdc: { tenantId } },
+        select: {
+          datastore: true,
+          namespace: true,
+          vdc: { select: { id: true, name: true } },
+        },
+      })
+      bindings = rows.map(r => ({
+        datastore: r.datastore,
+        namespace: r.namespace,
+        vdcId: r.vdc.id,
+        vdcName: r.vdc.name,
+      }))
+    } else {
+      const rows = await globalPrisma.vdcPbsNamespace.findMany({
+        where: { pbsConnectionId: id },
+        select: {
+          datastore: true,
+          namespace: true,
+          vdc: { select: { id: true, name: true, tenant: { select: { name: true } } } },
+        },
+      })
+      bindings = rows.map(r => ({
+        datastore: r.datastore,
+        namespace: r.namespace,
+        vdcId: r.vdc.id,
+        vdcName: r.vdc.name,
+        tenantName: r.vdc.tenant?.name ?? undefined,
+      }))
+    }
+
+    // Apply filters on cached data (fast, in-memory)
+
+    // Filter by datastore
+    let filteredBackups = datastoreFilter
+      ? allBackups.filter(b => b.datastore === datastoreFilter)
+      : allBackups
+
+    // Filter by namespace
+    if (namespaceFilter !== null) {
+      filteredBackups = filteredBackups.filter(b => b.namespace === namespaceFilter)
+    }
+
+    // Filter by type
+    if (typeFilter) {
+      filteredBackups = filteredBackups.filter(b => b.backupType === typeFilter)
+    }
+
+    // Filter by search (ID, VM name, datastore, comment)
+    if (search) {
+      filteredBackups = filteredBackups.filter(b =>
+        b.backupId?.toLowerCase().includes(search) ||
+        b.vmName?.toLowerCase().includes(search) ||
+        b.datastore?.toLowerCase().includes(search) ||
+        b.namespace?.toLowerCase().includes(search) ||
+        b.comment?.toLowerCase().includes(search)
+      )
+    }
+
+    // Stats (before pagination)
+    const totalSize = filteredBackups.reduce((sum, b) => sum + (b.size || 0), 0)
+
+    const stats = {
+      total: filteredBackups.length,
+      vmCount: filteredBackups.filter(b => b.backupType === 'vm').length,
+      ctCount: filteredBackups.filter(b => b.backupType === 'ct').length,
+      hostCount: filteredBackups.filter(b => b.backupType === 'host').length,
+      totalSize,
+      totalSizeFormatted: formatBytes(totalSize),
+      verifiedCount: filteredBackups.filter(b => b.verified).length,
+      protectedCount: filteredBackups.filter(b => b.protected).length,
+    }
+
+    // Pagination
+    const groups = url.searchParams.get('groupBy') === 'machine'
+      ? groupBackupMachines(filteredBackups)
+      : null
+    const totalItems = groups ? groups.length : filteredBackups.length
+    const totalPages = Math.ceil(totalItems / pageSize)
+    const startIndex = (page - 1) * pageSize
+    const paginatedBackups = groups
+      ? groups.slice(startIndex, startIndex + pageSize).flatMap(group => group.points)
+      : filteredBackups.slice(startIndex, startIndex + pageSize)
+
+    // `slim=1` drops the two fat per-snapshot fields (the file list and the
+    // full verification record). The bulk restore wizard pulls EVERY snapshot
+    // of the server in one page to fold them into guests, and those two
+    // fields alone are most of the payload; it only needs the identity, the
+    // date, the size and the verified flag. Filtering, stats and pagination
+    // are untouched, so the contract stays the same for every other caller.
+    const slim = url.searchParams.get('slim') === '1'
+    const responseBackups = slim
+      ? paginatedBackups.map(({ files, verification, ...rest }) => rest)
+      : paginatedBackups
+
+    return NextResponse.json({
+      data: {
+        backups: responseBackups,
+        namespaces,
+        bindings,
+        stats,
+        warnings,
+        fromCache,
+        pagination: {
+          page,
+          pageSize,
+          totalPages,
+          totalItems,
+          hasNext: page < totalPages,
+          hasPrev: page > 1,
+        }
+      }
+    })
+  } catch (e: any) {
+    console.error("PBS backups error:", e)
+
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const GET = withPublicApiGuard("pbs-backups", handler)

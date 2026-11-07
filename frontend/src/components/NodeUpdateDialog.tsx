@@ -1,0 +1,1694 @@
+'use client'
+
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  FormControlLabel,
+  IconButton,
+  LinearProgress,
+  Stack,
+  Step,
+  StepLabel,
+  Stepper,
+  Switch,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tooltip,
+  Typography,
+} from '@mui/material'
+
+import ConfirmCloseDialog from '@/components/ConfirmCloseDialog'
+import { useRBAC } from '@/contexts/RBACContext'
+import { NodeInfo, formatMemory } from '@/components/hardware/utils'
+import { loadNodeRepoIssues, type RepoIssue } from '@/lib/proxmox/aptRepositories'
+import { migrateGuestAndWait, migrationFailureText } from '@/lib/migration/guestMigrateClient'
+import { errorMessage, fetchJsonResult, jsonInit, requireOk } from '@/lib/api/fetchJsonSafe'
+import TaskLogButton from '@/components/tasks/TaskLogButton'
+import { waitForPveTask } from '@/lib/proxmox/waitForTaskClient'
+import PendingChangesWarning from '@/components/migration/PendingChangesWarning'
+
+interface RunningVmInfo {
+  vmid: number
+  name: string
+  type: 'qemu' | 'lxc'
+  isLocal: boolean
+  localDisks?: string[]
+  maxmem?: number
+}
+
+interface VmActionResult {
+  vmid: number
+  name: string
+  type: 'qemu' | 'lxc'
+  action: 'migrate' | 'shutdown'
+  status: 'pending' | 'running' | 'success' | 'failed'
+  error?: string
+  target?: string
+  /** The migration task, to open its log when it failed (#926). */
+  upid?: string | null
+  taskNode?: string
+}
+
+interface NodeUpdateDialogProps {
+  open: boolean
+  onClose: () => void
+  connectionId: string
+  nodeName: string
+  vmCount: number
+  nodeUpdates: Record<string, { count: number; updates: any[]; version: string | null }>
+  isCluster?: boolean
+  /**
+   * Whether the cluster runs Ceph. When the caller does not know, the dialog
+   * reads it from the connection record (stored by the connection probe, no
+   * Proxmox call).
+   */
+  hasCeph?: boolean
+}
+
+type UpgradeStatus = 'UNKNOWN' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'REBOOTING'
+
+const CEPH_MAINTENANCE_FLAGS = ['noout', 'norebalance', 'norecover']
+
+/**
+ * Greedy first-fit-decreasing bin-packing: distribute VMs across nodes by available RAM.
+ * Returns a Map of vmid → target node name.
+ */
+function distributeVms(vms: RunningVmInfo[], nodes: NodeInfo[]): Map<number, string> {
+  const result = new Map<number, string>()
+  if (nodes.length === 0) return result
+
+  // Track remaining free memory per node
+  const freeMem = new Map<string, number>()
+  for (const n of nodes) {
+    freeMem.set(n.node, (n.maxmem || 0) - (n.mem || 0))
+  }
+
+  // Sort VMs by maxmem descending (biggest first)
+  const sorted = [...vms].sort((a, b) => (b.maxmem || 0) - (a.maxmem || 0))
+
+  for (const vm of sorted) {
+    // Pick node with the most free memory
+    let bestNode = nodes[0].node
+    let bestFree = freeMem.get(bestNode) || 0
+    for (const n of nodes) {
+      const free = freeMem.get(n.node) || 0
+      if (free > bestFree) {
+        bestNode = n.node
+        bestFree = free
+      }
+    }
+
+    result.set(vm.vmid, bestNode)
+    freeMem.set(bestNode, bestFree - (vm.maxmem || 0))
+  }
+
+  return result
+}
+
+/**
+ * Shut a guest down and wait for its PVE task to end. Resolves with the
+ * reason instead of throwing, so one guest never stops the others.
+ */
+async function shutdownGuestAndWait(
+  connBaseUrl: string,
+  connectionId: string,
+  nodeName: string,
+  vm: Pick<RunningVmInfo, 'vmid' | 'type'>,
+  t: (key: string) => string,
+): Promise<{ ok: boolean; error?: string; upid?: string }> {
+  const result = await fetchJsonResult<unknown>(
+    `${connBaseUrl}/guests/${vm.type}/${encodeURIComponent(nodeName)}/${vm.vmid}/shutdown`,
+    jsonInit('POST'),
+  )
+  if (!result.ok) return { ok: false, error: result.error || t('updates.vmShutdownFailed') }
+
+  const upid = typeof result.data === 'string' ? result.data : ''
+  if (!upid) return { ok: false, error: t('updates.vmShutdownNotFollowed') }
+
+  const task = await waitForPveTask(connectionId, nodeName, upid)
+  if (task.outcome === 'ok') return { ok: true }
+  if (task.outcome === 'failed') return { ok: false, error: task.reason || task.error || t('updates.vmShutdownFailed'), upid }
+
+  return { ok: false, error: t('updates.vmShutdownNotFollowed'), upid }
+}
+
+/** One guest of the pre-flight migrate/shutdown run, with why it failed (#926). */
+function VmActionResultRow({ r, connectionId }: Readonly<{ r: VmActionResult; connectionId: string }>) {
+  const t = useTranslations()
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25, minWidth: 0 }}>
+      {r.status === 'success' && <i className="ri-checkbox-circle-fill" style={{ fontSize: 14, color: 'var(--mui-palette-success-main)' }} />}
+      {r.status === 'failed' && <i className="ri-error-warning-fill" style={{ fontSize: 14, color: 'var(--mui-palette-error-main)' }} />}
+      {r.status === 'running' && <CircularProgress size={12} />}
+      {r.status === 'pending' && <i className="ri-time-line" style={{ fontSize: 14, opacity: 0.4 }} />}
+      <Typography variant="caption" sx={{ fontFamily: 'monospace', fontSize: 11, flexShrink: 0 }}>
+        {r.type === 'qemu' ? 'VM' : 'CT'} {r.vmid} ({r.name})
+      </Typography>
+      <Typography variant="caption" noWrap title={r.error} sx={{ ml: 'auto', fontSize: 11, minWidth: 0, ...(r.status === 'failed' && { color: 'error.main' }) }}>
+        {r.status === 'success' && r.action === 'migrate' && t('updates.vmMigrateSuccess', { target: r.target || '?' })}
+        {r.status === 'success' && r.action === 'shutdown' && t('updates.vmShutdownSuccess')}
+        {r.status === 'failed' && (r.error || (r.action === 'migrate' ? t('updates.vmMigrateFailed') : t('updates.vmShutdownFailed')))}
+        {r.status === 'running' && '...'}
+      </Typography>
+      {r.status === 'failed' && r.upid && <TaskLogButton connectionId={connectionId} upid={r.upid} node={r.taskNode} size={14} />}
+    </Box>
+  )
+}
+
+export default function NodeUpdateDialog({
+  open,
+  onClose,
+  connectionId,
+  nodeName,
+  vmCount,
+  nodeUpdates,
+  isCluster = false,
+  hasCeph: hasCephProp,
+}: NodeUpdateDialogProps) {
+  const t = useTranslations()
+  // Ceph OSD flags are cluster-wide storage settings: setting them needs
+  // storage.admin on top of the node right that runs the update (#920).
+  const { hasPermission } = useRBAC()
+  const canSetCephFlags = hasPermission('storage.admin')
+
+  // Steps depend on cluster mode
+  const clusterMode = isCluster
+  const steps = clusterMode
+    ? [t('updates.stepPreflight'), t('updates.stepConfiguration'), t('updates.stepUpdate'), t('updates.stepPostActions'), t('updates.stepCompleted')]
+    : [t('updates.stepConfiguration'), t('updates.stepUpdate'), t('updates.stepCompleted')]
+
+  // Step mapping: logical step indices
+  const STEP = clusterMode
+    ? { PREFLIGHT: 0, CONFIG: 1, UPDATE: 2, POST: 3, COMPLETED: 4 }
+    : { PREFLIGHT: -1, CONFIG: 0, UPDATE: 1, POST: -1, COMPLETED: 2 }
+
+  const [activeStep, setActiveStep] = useState(0)
+
+  // Config
+  const [autoReboot, setAutoReboot] = useState(true)
+  const [packagesExpanded, setPackagesExpanded] = useState(false)
+
+  // Execution
+  const [loading, setLoading] = useState(false)
+  const [upgradeStatus, setUpgradeStatus] = useState<UpgradeStatus>('UNKNOWN')
+  const [upgradeLogs, setUpgradeLogs] = useState<string>('')
+  const [rebootRequired, setRebootRequired] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [startedAt, setStartedAt] = useState<Date | null>(null)
+  const [completedAt, setCompletedAt] = useState<Date | null>(null)
+  const pollingRef = useRef<NodeJS.Timeout | null>(null)
+  const logsEndRef = useRef<HTMLDivElement | null>(null)
+
+  // SSH check
+  const [sshNotConfigured, setSshNotConfigured] = useState(false)
+
+  // Repository check
+  const [repoIssues, setRepoIssues] = useState<RepoIssue[]>([])
+  const [repoChecking, setRepoChecking] = useState(false)
+
+  // Cluster pre-flight state
+  const [maintenanceStatus, setMaintenanceStatus] = useState<string | null>(null)
+  const [maintenanceLoading, setMaintenanceLoading] = useState(false)
+  const [enableMaintenance, setEnableMaintenance] = useState(true)
+  const [hasCeph, setHasCeph] = useState(hasCephProp ?? false)
+  const [cephFlags, setCephFlags] = useState<string[]>([])
+  const [cephFlagsLoading, setCephFlagsLoading] = useState(false)
+  // Unknown flags: the dialog cannot tell which ones it adds, so it leaves them alone.
+  const [cephFlagsError, setCephFlagsError] = useState<string | null>(null)
+  // The flags this run added; the post-action removes only these, never one
+  // that was already set before the update.
+  const [addedCephFlags, setAddedCephFlags] = useState<string[]>([])
+  const [setCephMaintenanceFlags, setSetCephMaintenanceFlags] = useState(true)
+  const [preflightLoading, setPreflightLoading] = useState(false)
+
+  // Cluster post-actions state
+  const [postCephRemoving, setPostCephRemoving] = useState(false)
+  const [postCephRemoved, setPostCephRemoved] = useState(false)
+  const [postMaintenanceExiting, setPostMaintenanceExiting] = useState(false)
+  const [postMaintenanceExited, setPostMaintenanceExited] = useState(false)
+  const [didSetCephFlags, setDidSetCephFlags] = useState(false)
+  const [didEnableMaintenance, setDidEnableMaintenance] = useState(false)
+
+  // VM migration state
+  const [runningVms, setRunningVms] = useState<RunningVmInfo[]>([])
+  const [vmsLoading, setVmsLoading] = useState(false)
+  // Guest discovery that failed is not "no guest": the evacuation plan is unknown.
+  const [vmsDiscoveryError, setVmsDiscoveryError] = useState<string | null>(null)
+  // A post-action PVE refused: shown instead of marking the action done.
+  const [postError, setPostError] = useState<string | null>(null)
+  const [clusterNodes, setClusterNodes] = useState<NodeInfo[]>([])
+  const [migrateSharedVms, setMigrateSharedVms] = useState(true)
+  const [shutdownLocalVms, setShutdownLocalVms] = useState(false)
+  const [vmDistribution, setVmDistribution] = useState<Map<number, string>>(new Map())
+  const [vmActionResults, setVmActionResults] = useState<VmActionResult[]>([])
+  const [vmActionsInProgress, setVmActionsInProgress] = useState(false)
+  const [migratedVms, setMigratedVms] = useState<VmActionResult[]>([])
+  const [shutdownVms, setShutdownVmsList] = useState<RunningVmInfo[]>([])
+  const [didMigrateVms, setDidMigrateVms] = useState(false)
+  const [didShutdownVms, setDidShutdownVms] = useState(false)
+  const [migrateBackInProgress, setMigrateBackInProgress] = useState(false)
+  const [migrateBackDone, setMigrateBackDone] = useState(false)
+  const [migrateBackFailures, setMigrateBackFailures] = useState<string[]>([])
+  const [restartVmsInProgress, setRestartVmsInProgress] = useState(false)
+  const [restartVmsDone, setRestartVmsDone] = useState(false)
+
+  const nodeUpdate = nodeUpdates?.[nodeName]
+  const pkgCount = nodeUpdate?.count || 0
+
+  const baseUrl = `/api/v1/connections/${connectionId}/nodes/${encodeURIComponent(nodeName)}/upgrade`
+  const maintenanceUrl = `/api/v1/connections/${connectionId}/nodes/${encodeURIComponent(nodeName)}/maintenance`
+  const cephFlagsUrl = `/api/v1/connections/${connectionId}/ceph/flags`
+
+  const connBaseUrl = `/api/v1/connections/${connectionId}`
+
+  const cephMaintenanceFlagsSet = CEPH_MAINTENANCE_FLAGS.every(f => cephFlags.includes(f))
+
+  const sharedVms = runningVms.filter(vm => !vm.isLocal)
+  const localVms = runningVms.filter(vm => vm.isLocal)
+
+  // Fetch pre-flight data when dialog opens in cluster mode
+  useEffect(() => {
+    if (!open || !connectionId || !nodeName || !clusterMode) return
+
+    let cancelled = false
+    setMaintenanceLoading(true)
+    setCephFlagsLoading(true)
+    setCephFlagsError(null)
+
+    // Fetch maintenance status
+    fetch(maintenanceUrl)
+      .then(res => res.json())
+      .then(json => {
+        if (cancelled) return
+        setMaintenanceStatus(json.data?.maintenance || null)
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setMaintenanceLoading(false) })
+
+    // Does the cluster run Ceph? Then read its flags.
+    const readHasCeph = async (): Promise<boolean> => {
+      if (hasCephProp !== undefined) return hasCephProp
+      const conn = await fetchJsonResult<{ hasCeph?: boolean }>(connBaseUrl, { cache: 'no-store' })
+
+      return conn.ok && !!conn.data?.hasCeph
+    }
+    readHasCeph()
+      .then(async (withCeph) => {
+        if (cancelled) return
+        setHasCeph(withCeph)
+        if (!withCeph) return
+        const flags = await fetchJsonResult<{ flags?: string[] }>(cephFlagsUrl, { cache: 'no-store' })
+        if (cancelled) return
+        if (flags.ok) setCephFlags(flags.data?.flags || [])
+        else setCephFlagsError(flags.error || 'HTTP error')
+      })
+      .catch((e: unknown) => { if (!cancelled) setCephFlagsError(errorMessage(e)) })
+      .finally(() => { if (!cancelled) setCephFlagsLoading(false) })
+
+    // Fetch running VMs and cluster nodes for migration. Any of the three
+    // failing leaves the plan unknown: it is reported, never read as empty.
+    setVmsLoading(true)
+    setVmsDiscoveryError(null)
+    const readJson = async (url: string): Promise<any> => {
+      const result = await fetchJsonResult(url)
+      if (!result.ok) throw new Error(result.error)
+
+      return result.body ?? {}
+    }
+    Promise.all([
+      readJson(`${connBaseUrl}/nodes`),
+      readJson(`${connBaseUrl}/resources`),
+      readJson(`${connBaseUrl}/nodes/${encodeURIComponent(nodeName)}/local-vms`),
+    ])
+      .then(([nodesJson, resourcesJson, localVmsJson]) => {
+        if (cancelled) return
+
+        // Cluster nodes: online nodes other than current (keep full NodeInfo)
+        const onlineNodes: NodeInfo[] = (nodesJson.data || [])
+          .filter((n: any) => n.node !== nodeName && n.status === 'online')
+          .map((n: any) => ({
+            node: n.node,
+            status: n.status,
+            cpu: n.cpu,
+            maxcpu: n.maxcpu,
+            mem: n.mem,
+            maxmem: n.maxmem,
+          }))
+        setClusterNodes(onlineNodes)
+
+        // Running VMs on this node (not templates)
+        const resources = (resourcesJson.data || []).filter(
+          (r: any) => r.node === nodeName && r.status === 'running' && !r.template && (r.type === 'qemu' || r.type === 'lxc')
+        )
+
+        // local-vms API returns { data: { localVms: [...], summary: {...} } }
+        const localVmsList = localVmsJson.data?.localVms || []
+
+        // Local VM IDs set
+        const localVmIds = new Set(
+          localVmsList.map((v: any) => v.vmid)
+        )
+
+        // Build local disks map
+        const localDisksMap = new Map<number, string[]>()
+        for (const v of localVmsList) {
+          if (v.localDisks?.length) localDisksMap.set(v.vmid, v.localDisks)
+        }
+
+        const vms: RunningVmInfo[] = resources.map((r: any) => ({
+          vmid: r.vmid,
+          name: r.name || `${r.type === 'qemu' ? 'VM' : 'CT'} ${r.vmid}`,
+          type: r.type as 'qemu' | 'lxc',
+          isLocal: localVmIds.has(r.vmid),
+          localDisks: localDisksMap.get(r.vmid),
+          maxmem: r.maxmem,
+        }))
+
+        setRunningVms(vms)
+
+        // Compute VM distribution across cluster nodes
+        const shared = vms.filter(vm => !vm.isLocal)
+        if (onlineNodes.length > 0 && shared.length > 0) {
+          setVmDistribution(distributeVms(shared, onlineNodes))
+        }
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setVmsDiscoveryError(errorMessage(e))
+      })
+      .finally(() => { if (!cancelled) setVmsLoading(false) })
+
+    return () => { cancelled = true }
+  }, [open, connectionId, nodeName, clusterMode, hasCephProp, maintenanceUrl, cephFlagsUrl, connBaseUrl])
+
+  // Check SSH + repository configuration when dialog opens
+  useEffect(() => {
+    if (!open || !connectionId || !nodeName) return
+
+    let cancelled = false
+    setSshNotConfigured(false)
+    setRepoChecking(true)
+    setRepoIssues([])
+
+    fetch(`/api/v1/connections/${connectionId}`)
+      .then(res => res.json())
+      .then(json => {
+        if (cancelled) return
+        if (!json.data?.sshEnabled) setSshNotConfigured(true)
+      })
+      .catch(() => {})
+
+    // Repositories and subscription status read together: enterprise-only
+    // repositories are only a problem without an active subscription. A null
+    // answer means the repositories could not be read, keep the previous verdict.
+    void loadNodeRepoIssues(connectionId, nodeName)
+      .then(issues => {
+        if (cancelled || !issues) return
+
+        setRepoIssues(issues)
+      })
+      .finally(() => {
+        if (!cancelled) setRepoChecking(false)
+      })
+
+    return () => { cancelled = true }
+  }, [open, connectionId, nodeName])
+
+  // Cleanup polling
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current)
+        pollingRef.current = null
+      }
+    }
+  }, [])
+
+  // Auto-scroll logs
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [upgradeLogs])
+
+  // Auto-reboot after a successful upgrade that needs it. On a refusal the
+  // reboot stays required, with the Reboot now button and the reason.
+  const autoRebootNode = useCallback(async () => {
+    try {
+      await requireOk(`${baseUrl}/reboot`, jsonInit('POST'))
+      setRebootRequired(false)
+    } catch (e) {
+      setPostError(t('updates.postActionFailed', { error: errorMessage(e) }))
+    }
+  }, [baseUrl, t])
+
+  const pollStatus = useCallback(async () => {
+    try {
+      const res = await fetch(baseUrl)
+      const json = await res.json()
+
+      if (!res.ok) return
+
+      const status = json.status as UpgradeStatus
+      setUpgradeStatus(status)
+      setUpgradeLogs(json.logs || '')
+      setRebootRequired(json.reboot_required || false)
+
+      if (status !== 'COMPLETED' && status !== 'FAILED') return
+
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current)
+        pollingRef.current = null
+      }
+      setCompletedAt(new Date())
+      // Go to post-actions for cluster, completed for standalone
+      setActiveStep(clusterMode ? STEP.POST : STEP.COMPLETED)
+
+      if (status === 'COMPLETED' && json.reboot_required && autoReboot) await autoRebootNode()
+    } catch {
+      // ignore polling errors (node may be rebooting)
+    }
+  }, [baseUrl, autoReboot, autoRebootNode, clusterMode, STEP.POST, STEP.COMPLETED])
+
+  // Pre-flight: execute maintenance + ceph flags actions then go to config
+  const executePreFlight = useCallback(async () => {
+    setPreflightLoading(true)
+    setError(null)
+
+    try {
+      // Enable maintenance mode if selected and not already active
+      // A refused step throws: the pre-flight stops here, no guest is moved
+      // and the update step is never reached.
+      if (enableMaintenance && maintenanceStatus !== 'maintenance') {
+        await requireOk(maintenanceUrl, jsonInit('POST'))
+        setMaintenanceStatus('maintenance')
+        setDidEnableMaintenance(true)
+      }
+
+      // Set the missing Ceph maintenance flags, remembering each one added
+      // (also when a later one is refused) so the post-action can clear them.
+      if (hasCeph && !cephFlagsError && canSetCephFlags && setCephMaintenanceFlags && !cephMaintenanceFlagsSet) {
+        const added: string[] = []
+        try {
+          for (const flag of CEPH_MAINTENANCE_FLAGS) {
+            if (!cephFlags.includes(flag)) {
+              await requireOk(cephFlagsUrl, jsonInit('PUT', { flag }))
+              added.push(flag)
+            }
+          }
+        } finally {
+          if (added.length > 0) {
+            setCephFlags(prev => [...new Set([...prev, ...added])])
+            setAddedCephFlags(added)
+            setDidSetCephFlags(true)
+          }
+        }
+      }
+
+      // Migrate shared-storage VMs (distributed across nodes)
+      const vmsToMigrate = migrateSharedVms && vmDistribution.size > 0 ? sharedVms : []
+      const vmsToShutdown = shutdownLocalVms ? localVms : []
+      const allActions: VmActionResult[] = [
+        ...vmsToMigrate.map(vm => ({ vmid: vm.vmid, name: vm.name, type: vm.type, action: 'migrate' as const, status: 'pending' as const, target: vmDistribution.get(vm.vmid) })),
+        ...vmsToShutdown.map(vm => ({ vmid: vm.vmid, name: vm.name, type: vm.type, action: 'shutdown' as const, status: 'pending' as const })),
+      ]
+
+      if (allActions.length > 0) {
+        setVmActionResults(allActions)
+        setVmActionsInProgress(true)
+
+        // Migrate shared VMs (each to its distributed target)
+        const successfulMigrations: VmActionResult[] = []
+        for (const vm of vmsToMigrate) {
+          const target = vmDistribution.get(vm.vmid)
+          if (!target) continue
+
+          setVmActionResults(prev => prev.map(r =>
+            r.vmid === vm.vmid && r.action === 'migrate' ? { ...r, status: 'running' } : r
+          ))
+          // #926: a guest counts as migrated once its PVE task ended OK, not
+          // when the POST was accepted.
+          const outcome = await migrateGuestAndWait(
+            { connId: connectionId, node: nodeName, type: vm.type, vmid: vm.vmid },
+            { target, online: true },
+          )
+          const result: Partial<VmActionResult> = outcome.ok
+            ? { status: 'success' }
+            : { status: 'failed', error: migrationFailureText(outcome, t), upid: outcome.upid, taskNode: outcome.node }
+          setVmActionResults(prev => prev.map(r =>
+            r.vmid === vm.vmid && r.action === 'migrate' ? { ...r, ...result } : r
+          ))
+          if (outcome.ok) {
+            successfulMigrations.push({ vmid: vm.vmid, name: vm.name, type: vm.type, action: 'migrate', status: 'success', target })
+          }
+        }
+        if (vmsToMigrate.length > 0) {
+          setMigratedVms(successfulMigrations)
+          setDidMigrateVms(true)
+        }
+
+        // Shutdown local VMs. A guest counts as shut down once its PVE task
+        // ended OK (the guest is stopped), not when the request was accepted:
+        // otherwise the update could start while it is still running.
+        const shutDown: RunningVmInfo[] = []
+        for (const vm of vmsToShutdown) {
+          setVmActionResults(prev => prev.map(r =>
+            r.vmid === vm.vmid && r.action === 'shutdown' ? { ...r, status: 'running' } : r
+          ))
+          const outcome = await shutdownGuestAndWait(connBaseUrl, connectionId, nodeName, vm, t)
+          const patch: Partial<VmActionResult> = outcome.ok
+            ? { status: 'success' }
+            : { status: 'failed', error: outcome.error, upid: outcome.upid, taskNode: nodeName }
+          setVmActionResults(prev => prev.map(r =>
+            r.vmid === vm.vmid && r.action === 'shutdown' ? { ...r, ...patch } : r
+          ))
+          if (outcome.ok) shutDown.push(vm)
+        }
+        // Only the guests that did stop are started again afterwards.
+        if (vmsToShutdown.length > 0) {
+          setShutdownVmsList(shutDown)
+          setDidShutdownVms(true)
+        }
+
+        setVmActionsInProgress(false)
+      }
+
+      setActiveStep(STEP.CONFIG)
+    } catch (e: any) {
+      setError(t('updates.preflightStopped', { error: errorMessage(e) }))
+      setVmActionsInProgress(false)
+    } finally {
+      setPreflightLoading(false)
+    }
+  }, [enableMaintenance, maintenanceStatus, hasCeph, cephFlagsError, canSetCephFlags, setCephMaintenanceFlags, cephMaintenanceFlagsSet, cephFlags, maintenanceUrl, cephFlagsUrl, STEP.CONFIG, migrateSharedVms, vmDistribution, sharedVms, shutdownLocalVms, localVms, connBaseUrl, connectionId, nodeName, t])
+
+  const startUpdate = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const res = await fetch(baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_reboot: autoReboot }),
+      })
+
+      const json = await res.json()
+
+      if (!res.ok) {
+        throw new Error(json.error || 'Failed to start update')
+      }
+
+      setStartedAt(new Date())
+      setUpgradeStatus('RUNNING')
+      setUpgradeLogs('')
+      setActiveStep(STEP.UPDATE)
+
+      const interval = setInterval(pollStatus, 3000)
+      pollingRef.current = interval
+
+      setTimeout(pollStatus, 1500)
+    } catch (e: any) {
+      setError(e.message || 'Unknown error')
+    } finally {
+      setLoading(false)
+    }
+  }, [baseUrl, autoReboot, pollStatus, STEP.UPDATE])
+
+  // Post-actions: remove ceph flags
+  const removeCephMaintenanceFlags = useCallback(async () => {
+    setPostCephRemoving(true)
+    setPostError(null)
+    try {
+      const removed: string[] = []
+      try {
+        for (const flag of addedCephFlags) {
+          await requireOk(cephFlagsUrl, jsonInit('DELETE', { flag }))
+          removed.push(flag)
+        }
+      } finally {
+        setCephFlags(prev => prev.filter(f => !removed.includes(f)))
+        setAddedCephFlags(prev => prev.filter(f => !removed.includes(f)))
+      }
+      setPostCephRemoved(true)
+    } catch (e) {
+      setPostError(t('updates.postActionFailed', { error: errorMessage(e) }))
+    }
+    setPostCephRemoving(false)
+  }, [addedCephFlags, cephFlagsUrl, t])
+
+  // Post-actions: exit maintenance
+  const exitMaintenance = useCallback(async () => {
+    setPostMaintenanceExiting(true)
+    setPostError(null)
+    try {
+      await requireOk(maintenanceUrl, jsonInit('DELETE'))
+      setMaintenanceStatus(null)
+      setPostMaintenanceExited(true)
+    } catch (e) {
+      setPostError(t('updates.postActionFailed', { error: errorMessage(e) }))
+    }
+    setPostMaintenanceExiting(false)
+  }, [maintenanceUrl, t])
+
+  // Post-actions: migrate VMs back (each from its specific target node)
+  const migrateVmsBack = useCallback(async () => {
+    setMigrateBackInProgress(true)
+    try {
+      const failures: string[] = []
+      for (const vm of migratedVms) {
+        if (!vm.target) continue
+        const outcome = await migrateGuestAndWait(
+          { connId: connectionId, node: vm.target, type: vm.type, vmid: vm.vmid },
+          { target: nodeName, online: true },
+        )
+        if (!outcome.ok) failures.push(`${vm.name}: ${migrationFailureText(outcome, t)}`)
+      }
+      setMigrateBackFailures(failures)
+      setMigrateBackDone(true)
+    } catch {}
+    setMigrateBackInProgress(false)
+  }, [migratedVms, connectionId, nodeName, t])
+
+  // Post-actions: restart shut down VMs
+  const restartLocalVmsAction = useCallback(async () => {
+    setRestartVmsInProgress(true)
+    setPostError(null)
+    const failures: string[] = []
+    for (const vm of shutdownVms) {
+      try {
+        await requireOk(`${connBaseUrl}/guests/${vm.type}/${encodeURIComponent(nodeName)}/${vm.vmid}/start`, jsonInit('POST'))
+      } catch (e) {
+        failures.push(`${vm.name}: ${errorMessage(e)}`)
+      }
+    }
+    // Done only when every guest was started; otherwise say which were not.
+    if (failures.length === 0) setRestartVmsDone(true)
+    else setPostError(t('updates.postActionFailed', { error: failures.join(', ') }))
+    setRestartVmsInProgress(false)
+  }, [shutdownVms, connBaseUrl, nodeName, t])
+
+  // Closing while the upgrade runs asks first (themed dialog, not the
+  // browser's confirm box); finishClose does the actual reset.
+  const [confirmCloseOpen, setConfirmCloseOpen] = useState(false)
+
+  const handleClose = () => {
+    if (upgradeStatus === 'RUNNING') {
+      setConfirmCloseOpen(true)
+      return
+    }
+    finishClose()
+  }
+
+  const finishClose = () => {
+    setConfirmCloseOpen(false)
+
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+
+    setActiveStep(0)
+    setUpgradeStatus('UNKNOWN')
+    setUpgradeLogs('')
+    setRebootRequired(false)
+    setError(null)
+    setAutoReboot(true)
+    setPackagesExpanded(false)
+    setStartedAt(null)
+    setCompletedAt(null)
+    setMaintenanceStatus(null)
+    setCephFlags([])
+    setCephFlagsError(null)
+    setAddedCephFlags([])
+    setEnableMaintenance(true)
+    setSetCephMaintenanceFlags(true)
+    setPreflightLoading(false)
+    setPostCephRemoving(false)
+    setPostCephRemoved(false)
+    setPostMaintenanceExiting(false)
+    setPostMaintenanceExited(false)
+    setDidSetCephFlags(false)
+    setDidEnableMaintenance(false)
+    setRunningVms([])
+    setVmsLoading(false)
+    setVmsDiscoveryError(null)
+    setPostError(null)
+    setClusterNodes([])
+    setMigrateSharedVms(true)
+    setShutdownLocalVms(false)
+    setVmDistribution(new Map())
+    setVmActionResults([])
+    setVmActionsInProgress(false)
+    setMigratedVms([])
+    setShutdownVmsList([])
+    setDidMigrateVms(false)
+    setDidShutdownVms(false)
+    setMigrateBackInProgress(false)
+    setMigrateBackDone(false)
+    setMigrateBackFailures([])
+    setRestartVmsInProgress(false)
+    setRestartVmsDone(false)
+    onClose()
+  }
+
+  const rebootNode = useCallback(async () => {
+    setPostError(null)
+    try {
+      await requireOk(`${baseUrl}/reboot`, jsonInit('POST'))
+      setRebootRequired(false)
+    } catch (e) {
+      setPostError(t('updates.postActionFailed', { error: errorMessage(e) }))
+    }
+  }, [baseUrl, t])
+
+  const getDuration = () => {
+    if (!startedAt || !completedAt) return null
+    const ms = completedAt.getTime() - startedAt.getTime()
+    const sec = Math.floor(ms / 1000)
+    if (sec < 60) return `${sec}s`
+    const min = Math.floor(sec / 60)
+    const remSec = sec % 60
+    return remSec > 0 ? `${min}min ${remSec}s` : `${min}min`
+  }
+
+  const logLines = upgradeLogs
+    ? upgradeLogs.split('\n').filter(l => l.trim()).slice(-80)
+    : []
+
+  // Body of the Ceph flags card: loading, unreadable, already set, or the toggle.
+  const renderCephFlagsBody = () => {
+    if (cephFlagsLoading) return (
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1 }}>
+        <CircularProgress size={16} />
+        <Typography variant="caption" color="text.secondary">Loading...</Typography>
+      </Box>
+    )
+    if (cephFlagsError) return (
+      <Alert severity="warning" sx={{ mb: 1 }}>
+        <Typography variant="body2">{t('updates.cephFlagsUnreadable', { error: cephFlagsError })}</Typography>
+      </Alert>
+    )
+    if (cephMaintenanceFlagsSet) return (
+      <Alert severity="success" sx={{ mb: 1 }}>
+        <Typography variant="body2">{t('updates.cephFlagsAlreadySet')}</Typography>
+      </Alert>
+    )
+
+    return (
+      <>
+        <Alert severity="info" sx={{ mb: 1 }}>
+          <Typography variant="body2">{t('updates.cephFlagsNotSet')}</Typography>
+        </Alert>
+        {cephFlags.length > 0 && (
+          <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', mb: 1 }}>
+            {cephFlags.map(f => (
+              <Chip key={f} label={f} size="small" sx={{ fontFamily: 'monospace', fontSize: 11, height: 22 }} />
+            ))}
+          </Box>
+        )}
+        {canSetCephFlags && (
+          <FormControlLabel
+            control={
+              <Switch
+                checked={setCephMaintenanceFlags}
+                onChange={(e) => setSetCephMaintenanceFlags(e.target.checked)}
+                size="small"
+              />
+            }
+            label={<Typography variant="body2">{t('updates.setCephFlagsBefore')}</Typography>}
+          />
+        )}
+      </>
+    )
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onClose={handleClose}
+      maxWidth="sm"
+      fullWidth
+      PaperProps={{ sx: { minHeight: '50vh' } }}
+    >
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className="ri-download-cloud-line" style={{ fontSize: 22 }} />
+        {t('updates.nodeUpdateTitle')}
+        <Chip
+          size="small"
+          label={nodeName}
+          sx={{ ml: 1, fontWeight: 600 }}
+        />
+      </DialogTitle>
+
+      <DialogContent dividers>
+        <Stepper activeStep={activeStep} sx={{ mb: 3 }}>
+          {steps.map((label, index) => (
+            <Step key={label} completed={index < activeStep}>
+              <StepLabel>{label}</StepLabel>
+            </Step>
+          ))}
+        </Stepper>
+
+        {/* Step: Pre-flight (cluster only) */}
+        {clusterMode && activeStep === STEP.PREFLIGHT && (
+          <Stack spacing={2.5}>
+            {/* Maintenance mode card */}
+            <Card variant="outlined">
+              <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                  <i className="ri-shield-check-line" style={{ marginRight: 8, fontSize: 16 }} />
+                  {t('updates.maintenanceModeCard')}
+                </Typography>
+
+                {maintenanceLoading ? (
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1 }}>
+                    <CircularProgress size={16} />
+                    <Typography variant="caption" color="text.secondary">Loading...</Typography>
+                  </Box>
+                ) : maintenanceStatus === 'maintenance' ? (
+                  <Alert severity="success" sx={{ mb: 1 }}>
+                    <Typography variant="body2">{t('updates.maintenanceAlreadyEnabled')}</Typography>
+                  </Alert>
+                ) : (
+                  <>
+                    <Alert severity="warning" sx={{ mb: 1 }}>
+                      <Typography variant="body2">{t('updates.maintenanceNotEnabled')}</Typography>
+                    </Alert>
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={enableMaintenance}
+                          onChange={(e) => setEnableMaintenance(e.target.checked)}
+                          size="small"
+                        />
+                      }
+                      label={<Typography variant="body2">{t('updates.enableMaintenanceBefore')}</Typography>}
+                    />
+                  </>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Ceph flags card (if hasCeph) */}
+            {hasCeph && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-database-2-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.cephFlagsCard')}
+                  </Typography>
+
+                  {renderCephFlagsBody()}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* VM Migration card */}
+            {runningVms.length > 0 && !vmsLoading && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-swap-box-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.vmMigrationCard')}
+                  </Typography>
+
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                    {t('updates.vmMigrationSummary', {
+                      total: runningVms.length,
+                      shared: sharedVms.length,
+                      local: localVms.length,
+                    })}
+                  </Typography>
+
+                  {/* Shared storage section */}
+                  {sharedVms.length > 0 && (
+                    <Box sx={{ mb: localVms.length > 0 ? 2 : 0 }}>
+                      <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ display: 'block', mb: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                        {t('updates.sharedStorageSection')}
+                      </Typography>
+                      <FormControlLabel
+                        control={
+                          <Switch
+                            checked={migrateSharedVms}
+                            onChange={(e) => setMigrateSharedVms(e.target.checked)}
+                            size="small"
+                            disabled={clusterNodes.length === 0 || vmActionsInProgress}
+                          />
+                        }
+                        label={<Typography variant="body2">{t('updates.migrateSharedVms')}</Typography>}
+                      />
+                      {migrateSharedVms && (
+                        <Box sx={{ ml: 4, mt: 1 }}>
+                          {clusterNodes.length > 0 ? (
+                            <Box>
+                              <Typography variant="caption" fontWeight={600} sx={{ display: 'block', mb: 1 }}>
+                                {t('updates.distributionSummary')}
+                              </Typography>
+                              {clusterNodes.map(node => {
+                                const nodeVms = sharedVms.filter(vm => vmDistribution.get(vm.vmid) === node.node)
+                                if (nodeVms.length === 0) return null
+                                const totalRam = nodeVms.reduce((sum, vm) => sum + (vm.maxmem || 0), 0)
+                                const currentMem = node.mem || 0
+                                const projectedMem = currentMem + totalRam
+                                const projectedPercent = node.maxmem ? Math.round((projectedMem / node.maxmem) * 100) : 0
+
+                                return (
+                                  <Tooltip
+                                    key={node.node}
+                                    title={nodeVms.map(vm => `${vm.type === 'qemu' ? 'VM' : 'CT'} ${vm.vmid} (${vm.name})`).join(', ')}
+                                    arrow
+                                  >
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, py: 0.5 }}>
+                                      <Typography variant="caption" sx={{ fontFamily: 'monospace', fontWeight: 700, minWidth: 60 }}>
+                                        {node.node}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" sx={{ minWidth: 100 }}>
+                                        {nodeVms.length} VM{nodeVms.length > 1 ? 's' : ''} · {formatMemory(totalRam)}
+                                      </Typography>
+                                      <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+                                        <LinearProgress
+                                          variant="determinate"
+                                          value={Math.min(projectedPercent, 100)}
+                                          sx={{
+                                            flex: 1,
+                                            height: 6,
+                                            borderRadius: 1,
+                                            '& .MuiLinearProgress-bar': {
+                                              bgcolor: projectedPercent > 85 ? 'error.main' : projectedPercent > 70 ? 'warning.main' : 'primary.main',
+                                            },
+                                          }}
+                                        />
+                                        <Typography variant="caption" sx={{ fontSize: 10, minWidth: 28, textAlign: 'right' }}>
+                                          {projectedPercent}%
+                                        </Typography>
+                                      </Box>
+                                    </Box>
+                                  </Tooltip>
+                                )
+                              })}
+                            </Box>
+                          ) : (
+                            <Alert severity="warning" sx={{ py: 0.5 }}>
+                              <Typography variant="caption">{t('updates.noTargetNodes')}</Typography>
+                            </Alert>
+                          )}
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                            {t('updates.migrateSharedVmsHint')}
+                          </Typography>
+                          {/* #926: preflight for changes waiting for a restart */}
+                          {!vmActionsInProgress && (
+                            <PendingChangesWarning
+                              sx={{ mt: 1 }}
+                              guests={sharedVms.map(vm => ({ connId: connectionId, node: nodeName, type: vm.type, vmid: vm.vmid, name: vm.name }))}
+                            />
+                          )}
+                        </Box>
+                      )}
+                    </Box>
+                  )}
+
+                  {/* Local storage section */}
+                  {localVms.length > 0 && (
+                    <Box>
+                      <Typography variant="caption" fontWeight={700} color="text.secondary" sx={{ display: 'block', mb: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                        {t('updates.localStorageSection')}
+                      </Typography>
+                      <Alert severity="warning" sx={{ mb: 1, py: 0.5 }}>
+                        <Typography variant="caption" fontWeight={600}>{t('updates.localStorageVmsWarning')}</Typography>
+                        {localVms.map(vm => (
+                          <Typography key={vm.vmid} variant="caption" sx={{ display: 'block', ml: 1 }}>
+                            &bull; {vm.type === 'qemu' ? 'VM' : 'CT'} {vm.vmid} ({vm.name})
+                            {vm.localDisks?.length ? ` — ${vm.localDisks.join(', ')}` : ''}
+                          </Typography>
+                        ))}
+                      </Alert>
+                      <FormControlLabel
+                        control={
+                          <Switch
+                            checked={shutdownLocalVms}
+                            onChange={(e) => setShutdownLocalVms(e.target.checked)}
+                            size="small"
+                            disabled={vmActionsInProgress}
+                          />
+                        }
+                        label={<Typography variant="body2">{t('updates.shutdownLocalVmsSwitch')}</Typography>}
+                      />
+                      {shutdownLocalVms && (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', ml: 4 }}>
+                          {t('updates.shutdownLocalVmsHint')}
+                        </Typography>
+                      )}
+                    </Box>
+                  )}
+
+                  {/* Progress during execution */}
+                  {vmActionsInProgress && vmActionResults.length > 0 && (
+                    <Box sx={{ mt: 2 }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                        <CircularProgress size={14} />
+                        <Typography variant="caption" fontWeight={600}>
+                          {t('updates.migratingVms', {
+                            done: vmActionResults.filter(r => r.status === 'success' || r.status === 'failed').length,
+                            total: vmActionResults.length,
+                          })}
+                        </Typography>
+                      </Box>
+                      <LinearProgress
+                        variant="determinate"
+                        value={(vmActionResults.filter(r => r.status === 'success' || r.status === 'failed').length / vmActionResults.length) * 100}
+                        sx={{ height: 4, borderRadius: 1, mb: 1 }}
+                      />
+                      {vmActionResults.map(r => <VmActionResultRow key={`${r.type}-${r.vmid}`} r={r} connectionId={connectionId} />)}
+                    </Box>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {vmsDiscoveryError && !vmsLoading && (
+              <Alert severity="error">
+                {t('updates.guestDiscoveryFailed', { error: vmsDiscoveryError })}
+              </Alert>
+            )}
+
+            {vmsLoading && (
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1 }}>
+                <CircularProgress size={16} />
+                <Typography variant="caption" color="text.secondary">Loading VMs...</Typography>
+              </Box>
+            )}
+
+            {error && <Alert severity="error">{error}</Alert>}
+          </Stack>
+        )}
+
+        {/* Step: Configuration */}
+        {activeStep === STEP.CONFIG && (
+          <Stack spacing={2.5}>
+            {/* #926: guests the pre-flight could not move are still on the node */}
+            {vmActionResults.some(r => r.status === 'failed') && (
+              <Alert severity="error" icon={<i className="ri-error-warning-line" style={{ fontSize: 20 }} />}>
+                <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                  {t('updates.vmActionsFailedTitle', { count: vmActionResults.filter(r => r.status === 'failed').length })}
+                </Typography>
+                {vmActionResults.filter(r => r.status === 'failed').map(r => (
+                  <VmActionResultRow key={`${r.type}-${r.vmid}`} r={r} connectionId={connectionId} />
+                ))}
+              </Alert>
+            )}
+
+            {sshNotConfigured && (
+              <Alert
+                severity="error"
+                icon={<i className="ri-terminal-box-line" style={{ fontSize: 20 }} />}
+              >
+                <Typography variant="body2" fontWeight={600}>
+                  {t('updates.sshNotConfiguredTitle')}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {t('updates.sshNotConfiguredDescription')}
+                </Typography>
+              </Alert>
+            )}
+
+            {repoIssues.length > 0 && (
+              <Alert
+                severity="error"
+                icon={<i className="ri-archive-line" style={{ fontSize: 20 }} />}
+              >
+                <Typography variant="body2" fontWeight={600}>
+                  {t('updates.repoIssuesTitle', { count: repoIssues.length })}
+                </Typography>
+                {repoIssues.some(i => i.kind === 'enterprise') && (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                    {t('updates.repoIssuesDescription')}
+                  </Typography>
+                )}
+                {repoIssues.some(i => i.kind === 'parse') && (
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                    {t('updates.repoParseErrorsDescription')}
+                  </Typography>
+                )}
+                {repoIssues.map((issue, i) => (
+                  <Typography key={i} variant="caption" sx={{ display: 'block' }}>
+                    &bull;{' '}
+                    {issue.kind === 'parse'
+                      ? issue.detail
+                      : issue.component
+                        ? t('updates.repoEnterpriseComponent', { component: issue.component })
+                        : t('updates.repoEnterprisePve')}
+                  </Typography>
+                ))}
+              </Alert>
+            )}
+
+            <Card variant="outlined">
+              <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <i className="ri-download-cloud-line" style={{ fontSize: 18 }} />
+                    <Typography variant="subtitle2" fontWeight={700}>
+                      {pkgCount} {t('updates.packages').toLowerCase()}
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                    {nodeUpdate?.version && (
+                      <Typography variant="caption" sx={{ opacity: 0.6 }}>
+                        {nodeUpdate.version}
+                      </Typography>
+                    )}
+                    {pkgCount > 0 && (
+                      <IconButton size="small" onClick={() => setPackagesExpanded(p => !p)} sx={{ ml: 0.5 }}>
+                        <i className={packagesExpanded ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'} style={{ fontSize: 18 }} />
+                      </IconButton>
+                    )}
+                  </Box>
+                </Box>
+                <Collapse in={packagesExpanded}>
+                  {nodeUpdate?.updates && nodeUpdate.updates.length > 0 && (
+                    <TableContainer sx={{ mt: 1.5, maxHeight: 250 }}>
+                      <Table size="small" stickyHeader>
+                        <TableHead>
+                          <TableRow>
+                            <TableCell sx={{ fontWeight: 700, fontSize: 11 }}>{t('updates.package')}</TableCell>
+                            <TableCell sx={{ fontWeight: 700, fontSize: 11 }}>{t('updates.currentVersion')}</TableCell>
+                            <TableCell sx={{ fontWeight: 700, fontSize: 11 }}>{t('updates.newVersion')}</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {nodeUpdate.updates.map((pkg: any, i: number) => (
+                            <TableRow key={i}>
+                              <TableCell sx={{ fontFamily: 'monospace', fontSize: 11 }}>{pkg.Package}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace', fontSize: 11, opacity: 0.6 }}>{pkg.OldVersion}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace', fontSize: 11 }}>{pkg.Version}</TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  )}
+                </Collapse>
+              </CardContent>
+            </Card>
+
+            {/* VM warning (standalone only — for cluster it's in pre-flight) */}
+            {!clusterMode && vmCount > 0 && (
+              <Alert
+                severity="warning"
+                icon={<i className="ri-computer-line" style={{ fontSize: 20 }} />}
+              >
+                <Typography variant="body2" fontWeight={600}>
+                  {t('updates.vmsRunningOnNode', { count: vmCount })}
+                </Typography>
+                <Typography variant="caption" sx={{ opacity: 0.8 }}>
+                  {t('updates.vmsShutdownHint')}
+                </Typography>
+              </Alert>
+            )}
+
+            <Card variant="outlined">
+              <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                  <i className="ri-settings-3-line" style={{ marginRight: 8, fontSize: 16 }} />
+                  {t('updates.options')}
+                </Typography>
+
+                <Stack spacing={1} sx={{ mt: 1 }}>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={autoReboot}
+                        onChange={(e) => setAutoReboot(e.target.checked)}
+                        size="small"
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2">{t('updates.autoReboot')}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {t('updates.autoRebootDescription')}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                </Stack>
+              </CardContent>
+            </Card>
+
+            {error && <Alert severity="error">{error}</Alert>}
+          </Stack>
+        )}
+
+        {/* Step: Execution */}
+        {activeStep === STEP.UPDATE && (
+          <Stack spacing={2.5}>
+            <Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" fontWeight={600}>
+                    {upgradeStatus === 'REBOOTING' ? t('updates.rebooting') : t('updates.installingPackages')}
+                  </Typography>
+                </Box>
+                <Chip
+                  size="small"
+                  label={upgradeStatus}
+                  color="primary"
+                  sx={{ height: 22, fontSize: 11 }}
+                />
+              </Box>
+              <LinearProgress
+                variant="indeterminate"
+                sx={{ height: 6, borderRadius: 1 }}
+              />
+            </Box>
+
+            {logLines.length > 0 && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
+                  <Typography variant="caption" fontWeight={700} sx={{ display: 'block', mb: 1 }}>
+                    Logs
+                  </Typography>
+                  <Box
+                    sx={{
+                      maxHeight: 250,
+                      overflow: 'auto',
+                      bgcolor: 'background.default',
+                      borderRadius: 1,
+                      p: 1,
+                      fontFamily: '"JetBrains Mono", monospace',
+                      fontSize: 11,
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    {logLines.map((line, i) => (
+                      <Box key={i} sx={{ color: 'text.primary' }}>
+                        {line}
+                      </Box>
+                    ))}
+                    <div ref={logsEndRef} />
+                  </Box>
+                </CardContent>
+              </Card>
+            )}
+
+            {error && <Alert severity="error">{error}</Alert>}
+          </Stack>
+        )}
+
+        {/* Step: Post-actions (cluster only) */}
+        {clusterMode && activeStep === STEP.POST && (
+          <Stack spacing={2.5}>
+            {/* Update result */}
+            <Alert
+              severity={upgradeStatus === 'COMPLETED' ? 'success' : 'error'}
+              icon={
+                <i
+                  className={upgradeStatus === 'COMPLETED' ? 'ri-checkbox-circle-fill' : 'ri-error-warning-fill'}
+                  style={{ fontSize: 22 }}
+                />
+              }
+            >
+              <Typography variant="body2" fontWeight={600}>
+                {upgradeStatus === 'COMPLETED'
+                  ? t('updates.updateCompletedSuccess')
+                  : t('updates.updateFailed', { error: 'See logs for details' })
+                }
+              </Typography>
+              {getDuration() && (
+                <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                  {t('updates.duration', { duration: getDuration() })}
+                </Typography>
+              )}
+            </Alert>
+
+            {postError && <Alert severity="error">{postError}</Alert>}
+
+            {/* Ceph flags cleanup */}
+            {didSetCephFlags && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-database-2-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.cephFlagsCard')}
+                  </Typography>
+                  {postCephRemoved ? (
+                    <Alert severity="success">
+                      <Typography variant="body2">{t('updates.cephFlagsRemoved')}</Typography>
+                    </Alert>
+                  ) : (
+                    <Button
+                      variant="outlined"
+                      color="warning"
+                      size="small"
+                      onClick={removeCephMaintenanceFlags}
+                      disabled={postCephRemoving}
+                      startIcon={postCephRemoving ? <CircularProgress size={14} /> : <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />}
+                    >
+                      {postCephRemoving ? t('updates.removingCephFlags') : t('updates.removeCephFlags')}
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Maintenance exit */}
+            {didEnableMaintenance && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-shield-check-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.maintenanceModeCard')}
+                  </Typography>
+                  {postMaintenanceExited ? (
+                    <Alert severity="success">
+                      <Typography variant="body2">{t('updates.maintenanceExited')}</Typography>
+                    </Alert>
+                  ) : (
+                    <Button
+                      variant="outlined"
+                      color="warning"
+                      size="small"
+                      onClick={exitMaintenance}
+                      disabled={postMaintenanceExiting}
+                      startIcon={postMaintenanceExiting ? <CircularProgress size={14} /> : <i className="ri-logout-box-line" style={{ fontSize: 16 }} />}
+                    >
+                      {postMaintenanceExiting ? t('updates.exitingMaintenance') : t('updates.exitMaintenanceMode')}
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Migrate VMs back */}
+            {didMigrateVms && migratedVms.length > 0 && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-swap-box-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.migrateVmsBack')}
+                  </Typography>
+                  {migrateBackDone && migrateBackFailures.length > 0 && (
+                    <Alert severity="error">
+                      {migrateBackFailures.map(line => (
+                        <Typography key={line} variant="body2">{line}</Typography>
+                      ))}
+                    </Alert>
+                  )}
+                  {migrateBackDone && migrateBackFailures.length === 0 && (
+                    <Alert severity="success">
+                      <Typography variant="body2">{t('updates.vmsMigratedBack')}</Typography>
+                    </Alert>
+                  )}
+                  {!migrateBackDone && (
+                    <>
+                      <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        {t('updates.migrateVmsBackDescription', {
+                          node: nodeName,
+                          targets: [...new Set(migratedVms.map(vm => vm.target).filter(Boolean))].join(', '),
+                        })}
+                      </Typography>
+                      <Button
+                        variant="outlined"
+                        color="primary"
+                        size="small"
+                        onClick={migrateVmsBack}
+                        disabled={migrateBackInProgress}
+                        startIcon={migrateBackInProgress ? <CircularProgress size={14} /> : <i className="ri-arrow-go-back-line" style={{ fontSize: 16 }} />}
+                      >
+                        {migrateBackInProgress ? t('updates.migratingVmsBack') : t('updates.migrateVmsBackBtn')}
+                      </Button>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Restart local VMs */}
+            {didShutdownVms && shutdownVms.length > 0 && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                  <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                    <i className="ri-play-circle-line" style={{ marginRight: 8, fontSize: 16 }} />
+                    {t('updates.restartLocalVms')}
+                  </Typography>
+                  {restartVmsDone ? (
+                    <Alert severity="success">
+                      <Typography variant="body2">{t('updates.localVmsRestarted')}</Typography>
+                    </Alert>
+                  ) : (
+                    <>
+                      <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                        {t('updates.restartLocalVmsDescription')}
+                      </Typography>
+                      <Button
+                        variant="outlined"
+                        color="primary"
+                        size="small"
+                        onClick={restartLocalVmsAction}
+                        disabled={restartVmsInProgress}
+                        startIcon={restartVmsInProgress ? <CircularProgress size={14} /> : <i className="ri-restart-line" style={{ fontSize: 16 }} />}
+                      >
+                        {restartVmsInProgress ? t('updates.restartingLocalVms') : t('updates.restartLocalVmsBtn')}
+                      </Button>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Reboot status */}
+            <Card variant="outlined">
+              <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                  <i className="ri-server-line" style={{ marginRight: 8, fontSize: 16 }} />
+                  {t('updates.resultTitle')}
+                </Typography>
+                <Stack spacing={1}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('updates.rebootLabel')}</Typography>
+                    {rebootRequired ? (
+                      <Chip size="small" label={t('updates.rebootRequiredNotDone')} color="warning" sx={{ height: 22, fontSize: 11 }} />
+                    ) : (
+                      <Chip size="small" label={t('updates.rebootNotRequired')} color="default" sx={{ height: 22, fontSize: 11 }} />
+                    )}
+                  </Box>
+
+                  {rebootRequired && (
+                    <Button
+                      variant="outlined"
+                      color="warning"
+                      size="small"
+                      startIcon={<i className="ri-restart-line" style={{ fontSize: 16 }} />}
+                      onClick={rebootNode}
+                      sx={{ alignSelf: 'flex-start' }}
+                    >
+                      {t('updates.rebootNow')}
+                    </Button>
+                  )}
+                </Stack>
+              </CardContent>
+            </Card>
+          </Stack>
+        )}
+
+        {/* Step: Completed (standalone) or final step (cluster) */}
+        {activeStep === STEP.COMPLETED && (
+          <Stack spacing={2.5}>
+            {postError && <Alert severity="error">{postError}</Alert>}
+            {/* For standalone: show result alert + reboot + logs */}
+            {!clusterMode && (
+              <>
+                <Alert
+                  severity={upgradeStatus === 'COMPLETED' ? 'success' : 'error'}
+                  icon={
+                    <i
+                      className={upgradeStatus === 'COMPLETED' ? 'ri-checkbox-circle-fill' : 'ri-error-warning-fill'}
+                      style={{ fontSize: 22 }}
+                    />
+                  }
+                >
+                  <Typography variant="body2" fontWeight={600}>
+                    {upgradeStatus === 'COMPLETED'
+                      ? t('updates.updateCompletedSuccess')
+                      : t('updates.updateFailed', { error: 'See logs for details' })
+                    }
+                  </Typography>
+                  {getDuration() && (
+                    <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                      {t('updates.duration', { duration: getDuration() })}
+                    </Typography>
+                  )}
+                </Alert>
+
+                <Card variant="outlined">
+                  <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
+                    <Typography variant="subtitle2" fontWeight={700} gutterBottom>
+                      <i className="ri-server-line" style={{ marginRight: 8, fontSize: 16 }} />
+                      {t('updates.resultTitle')}
+                    </Typography>
+                    <Stack spacing={1}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('updates.rebootLabel')}</Typography>
+                        {rebootRequired ? (
+                          <Chip size="small" label={t('updates.rebootRequiredNotDone')} color="warning" sx={{ height: 22, fontSize: 11 }} />
+                        ) : (
+                          <Chip size="small" label={t('updates.rebootNotRequired')} color="default" sx={{ height: 22, fontSize: 11 }} />
+                        )}
+                      </Box>
+
+                      {rebootRequired && (
+                        <Button
+                          variant="outlined"
+                          color="warning"
+                          size="small"
+                          startIcon={<i className="ri-restart-line" style={{ fontSize: 16 }} />}
+                          onClick={rebootNode}
+                          sx={{ alignSelf: 'flex-start' }}
+                        >
+                          {t('updates.rebootNow')}
+                        </Button>
+                      )}
+                    </Stack>
+                  </CardContent>
+                </Card>
+              </>
+            )}
+
+            {/* For cluster: completion message, carrying the real outcome */}
+            {clusterMode && (
+              <Alert
+                severity={upgradeStatus === 'COMPLETED' ? 'success' : 'error'}
+                icon={
+                  <i
+                    className={upgradeStatus === 'COMPLETED' ? 'ri-checkbox-circle-fill' : 'ri-error-warning-fill'}
+                    style={{ fontSize: 22 }}
+                  />
+                }
+              >
+                <Typography variant="body2" fontWeight={600}>
+                  {upgradeStatus === 'COMPLETED'
+                    ? t('updates.updateCompletedSuccess')
+                    : t('updates.updateFailed', { error: 'See logs for details' })
+                  }
+                </Typography>
+              </Alert>
+            )}
+
+            {logLines.length > 0 && (
+              <Card variant="outlined">
+                <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
+                  <Typography variant="caption" fontWeight={700} sx={{ display: 'block', mb: 1 }}>
+                    Logs
+                  </Typography>
+                  <Box
+                    sx={{
+                      maxHeight: 200,
+                      overflow: 'auto',
+                      bgcolor: 'background.default',
+                      borderRadius: 1,
+                      p: 1,
+                      fontFamily: '"JetBrains Mono", monospace',
+                      fontSize: 11,
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    {logLines.map((line, i) => (
+                      <Box key={i} sx={{ color: 'text.primary' }}>
+                        {line}
+                      </Box>
+                    ))}
+                  </Box>
+                </CardContent>
+              </Card>
+            )}
+          </Stack>
+        )}
+
+        {/* Loading overlay for initial start */}
+        {loading && (
+          <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', py: 4 }}>
+            <CircularProgress size={40} />
+            <Typography variant="body2" sx={{ mt: 2 }}>
+              {t('updates.startingUpdate')}
+            </Typography>
+          </Box>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ px: 3, py: 2 }}>
+        {/* Pre-flight actions (cluster only) */}
+        {clusterMode && activeStep === STEP.PREFLIGHT && (
+          <>
+            <Button onClick={handleClose}>{t('common.cancel')}</Button>
+            <Button
+              variant="contained"
+              onClick={executePreFlight}
+              disabled={preflightLoading || maintenanceLoading || cephFlagsLoading || vmsLoading || !!vmsDiscoveryError}
+              startIcon={preflightLoading ? <CircularProgress size={16} /> : <i className="ri-arrow-right-line" style={{ fontSize: 18 }} />}
+            >
+              {preflightLoading ? t('updates.preparingCluster') : t('common.next')}
+            </Button>
+          </>
+        )}
+
+        {/* Configuration actions */}
+        {activeStep === STEP.CONFIG && (
+          <>
+            <Button onClick={handleClose}>{t('common.cancel')}</Button>
+            <Button
+              variant="contained"
+              color="warning"
+              onClick={startUpdate}
+              disabled={loading || pkgCount === 0 || repoIssues.length > 0 || repoChecking || sshNotConfigured}
+              startIcon={loading ? <CircularProgress size={16} /> : <i className="ri-play-circle-line" style={{ fontSize: 18 }} />}
+            >
+              {t('updates.startUpdate')}
+            </Button>
+          </>
+        )}
+
+        {/* Post-actions (cluster) */}
+        {clusterMode && activeStep === STEP.POST && (
+          <Button
+            onClick={() => setActiveStep(STEP.COMPLETED)}
+            variant="contained"
+          >
+            {t('updates.finish')}
+          </Button>
+        )}
+
+        {/* Completed */}
+        {activeStep === STEP.COMPLETED && (
+          <Button onClick={handleClose} variant="contained">
+            {t('common.close')}
+          </Button>
+        )}
+      </DialogActions>
+
+      <ConfirmCloseDialog
+        open={confirmCloseOpen}
+        title={t('updates.upgradeInProgress')}
+        message={t('updates.confirmCloseWhileRunning')}
+        confirmLabel={t('common.close')}
+        onConfirm={finishClose}
+        onCancel={() => setConfirmCloseOpen(false)}
+      />
+    </Dialog>
+  )
+}
