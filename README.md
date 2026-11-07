@@ -282,3 +282,5 @@ Automated scanning via **CodeQL**, **Trivy**, and **Dependabot**. Report vulnera
 
 - Community: [GitHub Issues](https://github.com/adminsyspro/proxcenter-ui/issues)
 - Enterprise: [support@proxcenter.io](mailto:support@proxcenter.io)
+#   p r o x c e n t e r - n e w  
+ 
