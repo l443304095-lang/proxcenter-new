@@ -1,0 +1,42 @@
+/** XcpngSource backed by a direct XAPI session on the pool master. */
+import {
+  xapiLogin, xapiLogout, xapiHosts, xapiListVms, xapiGetVmRecord, xapiGetVmConfig, xapiVdiExportUrl, xapiKeepAlive,
+  type XapiSession, type XcpngVmListItem,
+} from "./xapi-client"
+import type { XcpngSource, XcpngCredentials, XcpngHostInfo, XcpngDiskDownload } from "./source"
+import type { XoDiskInfo, XoVmConfig } from "./client"
+import { curlConfigQuoted } from "@/lib/migration/remote-commands"
+
+export class XapiSource implements XcpngSource {
+  readonly kind = "xapi" as const
+
+  private constructor(private readonly c: XcpngCredentials, readonly session: XapiSession) {}
+
+  static async open(c: XcpngCredentials): Promise<XapiSource> {
+    return new XapiSource(c, await xapiLogin(c.baseUrl, c.user, c.password, c.insecureTLS))
+  }
+
+  get displayUrl() { return this.session.baseUrl }
+
+  listHosts(): Promise<XcpngHostInfo[]> { return xapiHosts(this.session) }
+
+  listVms(): Promise<XcpngVmListItem[]> { return xapiListVms(this.session) }
+
+  getVm(uuid: string) { return xapiGetVmRecord(this.session, uuid) }
+
+  getVmConfig(uuid: string): Promise<XoVmConfig> { return xapiGetVmConfig(this.session, uuid) }
+
+  /** The export URL carries the session reference: no auth header, but the URL itself is a secret. */
+  diskDownload(disk: XoDiskInfo, format: "vhd" | "raw"): Promise<XcpngDiskDownload> {
+    if (!disk.vdiRef) return Promise.reject(new Error(`disk ${disk.label} has no XAPI reference`))
+    const url = xapiVdiExportUrl(this.session, disk.vdiRef, format)
+    // Quoted for curl's config syntax: the file is executed as root on the node.
+    const lines = [`url = ${curlConfigQuoted(url)}`, `header = "Accept: application/octet-stream"`]
+    if (this.c.insecureTLS) lines.push("insecure")
+    return Promise.resolve({ url, curlConfig: lines.join("\n") })
+  }
+
+  keepAlive() { return xapiKeepAlive(this.session) }
+
+  close() { return xapiLogout(this.session) }
+}

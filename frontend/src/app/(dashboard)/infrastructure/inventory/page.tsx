@@ -1,0 +1,752 @@
+'use client'
+
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+
+import { Box, Card, CardContent, CircularProgress, Skeleton, Typography, IconButton, Tooltip } from '@mui/material'
+import { useSearchParams } from 'next/navigation'
+
+import { useTranslations } from 'next-intl'
+
+import { usePageTitle } from '@/contexts/PageTitleContext'
+import { useRBACScopeProfile } from '@/hooks/useRBACScopeProfile'
+import { useRunningTasks } from '@/hooks/useRunningTasks'
+import { usePVEConnections } from '@/hooks/useConnections'
+import { useSWRFetch } from '@/hooks/useSWRFetch'
+import { extractTaskVmid } from '@/lib/tasks/scope'
+
+import { findDeepLinkedVm, hasDeepLinkSelection } from './deepLink'
+import InventoryTree, { InventorySelection, ViewMode, AllVmItem, HostItem, PoolItem, TagItem, TreePbsServer, TreeClusterStorage } from './InventoryTree'
+import InventoryDetails from './InventoryDetails'
+import { InventoryLoadedContext } from './inventoryLoadedContext'
+
+type Connection = {
+  id: string
+  name: string
+  baseUrl: string
+  behindProxy?: boolean
+  insecureTLS?: boolean
+}
+
+// Type pour les VMs en migration
+type MigratingVm = {
+  connId: string
+  vmid: string
+  sourceNode: string
+  targetNode?: string
+}
+
+const MIN_LEFT_WIDTH = 200
+const MAX_LEFT_WIDTH = 500
+const DEFAULT_LEFT_WIDTH = 340
+const COLLAPSED_WIDTH = 52
+
+type EnrichedGuest = { ip?: string | null; snapshots?: number | null; osInfo?: AllVmItem['osInfo'] }
+
+type IpSnapTarget = { connId: string; type: string; node: string; vmid: string | number; status?: string }
+
+/** Rounds of `pending` re-asks per page, each bounded by the route's time budget. */
+const IP_SNAP_ROUNDS = 5
+
+const ipSnapKey = (vm: IpSnapTarget) => `${vm.connId}:${vm.type}:${vm.node}:${vm.vmid}`
+
+export default function InventoryPage() {
+  const t = useTranslations()
+  const { setPageInfo } = usePageTitle()
+  const searchParams = useSearchParams()
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  // Connections via shared SWR (dedup with other consumers)
+  const { data: connectionsData, isLoading: connectionsLoading, error: connectionsError } = usePVEConnections()
+  const connections: Connection[] = connectionsData?.data ?? []
+
+  // Favorites via shared SWR (dedup with InventoryTree/useFavorites)
+  const { data: favoritesData, mutate: mutateFavorites } = useSWRFetch('/api/v1/favorites', { revalidateOnFocus: false })
+  const [selection, setSelection] = useState<InventorySelection | null>({ type: 'root', id: 'root' })
+  const [refreshTree, setRefreshTree] = useState<(() => void) | null>(null)
+
+  // RBAC scope profile — determines default view & allowed view modes
+  const { defaultViewMode, allowedViewModes, loading: rbacLoading } = useRBACScopeProfile()
+
+  // Mode de vue actuel et listes de données
+  const [viewMode, setViewMode] = useState<ViewMode>('tree')
+  const [hosts, setHosts] = useState<HostItem[]>([])
+  const [pools, setPools] = useState<PoolItem[]>([])
+  const [tags, setTags] = useState<TagItem[]>([])
+  const [pbsServers, setPbsServers] = useState<TreePbsServer[]>([])
+  const [clusterStorages, setClusterStorages] = useState<TreeClusterStorage[]>([])
+  const [externalHypervisors, setExternalHypervisors] = useState<any[]>([])
+  
+  // État pour IP/Snapshots
+  const [ipSnapLoading, setIpSnapLoading] = useState(false)
+  const [ipSnapLoaded, setIpSnapLoaded] = useState(false)
+
+  // Favoris (derived from SWR above)
+  
+  // État pour collapse la tree (persisté — #538)
+  const [isTreeCollapsed, setIsTreeCollapsed] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('pxc-inventory-tree-collapsed') === 'true'
+    }
+    return false
+  })
+
+  // Show VM ID in tree
+  const [showVmId, setShowVmId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('pxc-show-vmid') === 'true'
+    }
+    return false
+  })
+
+  const toggleShowVmId = useCallback(() => {
+    setShowVmId(prev => {
+      const next = !prev
+      localStorage.setItem('pxc-show-vmid', String(next))
+      return next
+    })
+  }, [])
+
+  // Create VM/LXC dialog requests from tree context menu
+  const [createDialogRequest, setCreateDialogRequest] = useState<{ type: 'createVm' | 'createLxc'; connId: string; node: string; ts: number } | null>(null)
+
+  // Node action requests from tree context menu (reboot/shutdown)
+  const [nodeActionRequest, setNodeActionRequest] = useState<{ action: 'reboot' | 'shutdown'; connId: string; node: string; ts: number } | null>(null)
+
+
+  // Données brutes des VMs (depuis InventoryTree) et données enrichies (IP, snapshots, OS)
+  const [rawVms, setRawVms] = useState<AllVmItem[]>([])
+  const [inventoryLoaded, setInventoryLoaded] = useState(false)
+  const [enrichedData, setEnrichedData] = useState<Record<string, EnrichedGuest>>({})
+
+  // A node/cluster/pbs deep-link owns both the view and the selection, and it
+  // runs at mount. The RBAC effect below settles later on a cold load — a
+  // pasted link, a new tab, a refresh — so without this it would land the user
+  // back on the tree root instead of what the link pointed at.
+  const deepLinked = hasDeepLinkSelection(searchParams)
+
+  // Apply RBAC-aware default view mode — re-apply when defaultViewMode changes
+  // (RBAC may initially return 'vms' before roles load, then settle to 'tree' for admins)
+  useEffect(() => {
+    if (rbacLoading || deepLinked) return
+    setViewMode(defaultViewMode)
+
+    if (defaultViewMode === 'tree') {
+      setSelection({ type: 'root', id: 'root' })
+    }
+  }, [rbacLoading, defaultViewMode, deepLinked])
+
+  // Deep-link: auto-select VM from URL search params (?vmid=123&connId=...&node=...&type=qemu)
+  // Also handles ?selectType=node&selectId=connId:nodeName, ?selectType=pbs&selectId=pbsId and ?selectType=ext&selectId=connId
+  const deepLinkHandled = useRef(false)
+
+  useEffect(() => {
+    if (deepLinkHandled.current) return
+
+    const selectType = searchParams.get('selectType')
+    const selectId = searchParams.get('selectId')
+
+    // Handle node/pbs deep-links (don't need rawVms to be loaded)
+    if (selectType === 'node' && selectId) {
+      deepLinkHandled.current = true
+      setSelection({ type: 'node', id: selectId })
+      setViewMode('hosts')
+
+      return
+    }
+
+    if (selectType === 'pbs' && selectId) {
+      deepLinkHandled.current = true
+      setSelection({ type: 'pbs', id: selectId })
+      setViewMode('tree')
+
+      return
+    }
+
+    // External hypervisor host (roadmap#53: the taskbar entry of a bulk
+    // migration lands here to reopen its follow-up).
+    if (selectType === 'ext' && selectId) {
+      deepLinkHandled.current = true
+      setSelection({ type: 'ext', id: selectId })
+      setViewMode('tree')
+
+      return
+    }
+
+    if (selectType === 'cluster' && selectId) {
+      deepLinkHandled.current = true
+      setSelection({ type: 'cluster', id: selectId })
+      setViewMode('tree')
+
+      return
+    }
+
+    // VM deep-link — needs rawVms loaded
+    if (rawVms.length === 0) return
+
+    const found = findDeepLinkedVm(rawVms, searchParams)
+
+    if (found) {
+      deepLinkHandled.current = true
+      const selectionId = `${found.connId}:${found.node}:${found.type}:${found.vmid}`
+      setSelection({ type: 'vm', id: selectionId })
+      setViewMode('vms')
+
+      // Scroll to the VM after the view switches and renders
+      setTimeout(() => {
+        const el = document.querySelector(`[data-vmkey="${CSS.escape(selectionId)}"]`)
+
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        }
+      }, 300)
+    }
+  }, [rawVms, searchParams])
+
+  // VMs en cours de migration
+  const [migratingVms, setMigratingVms] = useState<MigratingVm[]>([])
+
+  // Référence pour détecter les migrations terminées
+  const prevMigratingVmsRef = useRef<MigratingVm[]>([])
+
+  // Track every running task whose completion changes the inventory tree
+  // (created/deleted/restored/cloned VMs and CTs). The migration watcher
+  // below already handles the move case; this second ref catches the
+  // template-deploy chain (qmcreate, vzcreate, qmrestore, qmclone, imgcopy
+  // and their delete counterparts) which would otherwise require a manual
+  // F5 to surface the new VM in the tree.
+  const prevInventoryAffectingTaskIdsRef = useRef<Set<string>>(new Set())
+
+  // PVE task types that should trigger an inventory refresh once they
+  // disappear from /tasks/running. Kept narrow on purpose — config edits
+  // / start / stop don't reshape the tree, so we skip them and let the
+  // RRD polling refresh the badges instead.
+  const INVENTORY_AFFECTING_TASK_TYPES = new Set([
+    'qmcreate', 'vzcreate',     // template deploy / VM-CT create
+    'qmrestore', 'vzrestore',   // restore from backup
+    'qmclone',                  // clone (deploy from existing VM)
+    'imgcopy',                  // image-copy step of a deploy chain
+    'qmdel', 'vzdel', 'qmdestroy', 'vzdestroy', // deletion
+  ])
+
+  // Detect migrations from shared running-tasks SWR (no duplicate polling)
+  const { data: runningTasksData } = useRunningTasks()
+
+  useEffect(() => {
+    const tasks = runningTasksData?.data || []
+
+    // Filter migration tasks (qmigrate, vzmigrate, hamigrate). hamigrate
+    // carries the HA service id (`vm:100`, optionally `vm:100@target`)
+    // instead of a bare vmid, so route the entity through extractTaskVmid
+    // to normalize to a vmid string.
+    const migrations: MigratingVm[] = tasks
+      .filter((t: any) => t.type === 'qmigrate' || t.type === 'vzmigrate' || t.type === 'hamigrate')
+      .map((t: any) => ({
+        connId: t.connectionId,
+        vmid: extractTaskVmid(t.entity) || '',
+        sourceNode: t.node,
+        targetNode: undefined
+      }))
+      .filter((m: MigratingVm) => m.vmid)
+
+    // Detect finished migrations
+    const currentIds = new Set(migrations.map(m => `${m.connId}:${m.vmid}`))
+
+    const finishedMigrations = prevMigratingVmsRef.current.filter(
+      m => !currentIds.has(`${m.connId}:${m.vmid}`)
+    )
+
+    if (finishedMigrations.length > 0) {
+      setTimeout(() => {
+        if (refreshTree) refreshTree()
+      }, 1000)
+    }
+
+    prevMigratingVmsRef.current = migrations
+
+    // Detect finished create / delete / restore / clone tasks the same way.
+    // We key on the PVE task UPID (unique per task) and treat "was running,
+    // is no longer" as completion. Fires a single refresh after a small
+    // debounce so a chain of imgcopy → qmcreate triggers only one reload.
+    const currentInventoryTaskIds = new Set<string>(
+      tasks
+        .filter((t: any) => INVENTORY_AFFECTING_TASK_TYPES.has(t.type))
+        .map((t: any) => String(t.id ?? t.upid ?? `${t.connectionId}:${t.node}:${t.type}:${t.entity}`))
+    )
+
+    let hasFinishedInventoryTask = false
+    for (const prevId of prevInventoryAffectingTaskIdsRef.current) {
+      if (!currentInventoryTaskIds.has(prevId)) {
+        hasFinishedInventoryTask = true
+        break
+      }
+    }
+
+    if (hasFinishedInventoryTask) {
+      // 1.5 s gives PVE time to flush /cluster/resources after the task
+      // ends — without the delay the refresh sometimes lands while the new
+      // VM is still in "creating" / pre-published state on the API.
+      setTimeout(() => {
+        if (refreshTree) refreshTree()
+      }, 1500)
+    }
+
+    prevInventoryAffectingTaskIdsRef.current = currentInventoryTaskIds
+
+    setMigratingVms(prev => {
+      const prevKey = prev.map(m => `${m.connId}:${m.vmid}`).sort((a, b) => a.localeCompare(b)).join(',')
+      const nextKey = migrations.map(m => `${m.connId}:${m.vmid}`).sort((a, b) => a.localeCompare(b)).join(',')
+
+      return prevKey === nextKey ? prev : migrations
+    })
+  }, [runningTasksData, refreshTree])
+
+  // Page title
+  useEffect(() => {
+    setPageInfo(t('navigation.inventory'), t('inventory.vms') + ' & ' + t('inventory.containers'), 'ri-database-fill')
+    
+return () => setPageInfo('', '', '')
+  }, [setPageInfo, t])
+
+  // Merger automatique des VMs brutes avec les données enrichies et le statut de migration
+  const allVms = useMemo(() => {
+    return rawVms.map(vm => {
+      const key = `${vm.connId}:${vm.type}:${vm.node}:${vm.vmid}`
+      const enriched = enrichedData[key]
+      
+      // Vérifier si cette VM est en cours de migration
+      const migrating = migratingVms.find(m => 
+        m.connId === vm.connId && m.vmid === vm.vmid
+      )
+      
+      const result: AllVmItem = {
+        ...vm,
+        isMigrating: !!migrating,
+        migrationTarget: migrating?.targetNode
+      }
+      
+      if (enriched) {
+        result.ip = enriched.ip ?? vm.ip
+        result.snapshots = enriched.snapshots ?? vm.snapshots
+        result.osInfo = enriched.osInfo ?? (vm as any).osInfo
+      }
+      
+      return result
+    })
+  }, [rawVms, enrichedData, migratingVms])
+
+  // Set des VMs en migration pour InventoryTree (format: "connId:vmid")
+  const migratingVmIds = useMemo(() => {
+    return new Set(migratingVms.map(m => `${m.connId}:${m.vmid}`))
+  }, [migratingVms])
+
+  // Set des VMs avec une action en cours (start, stop, etc.)
+  const [pendingActionVmIds, setPendingActionVmIds] = useState<Set<string>>(new Set())
+
+  const onVmActionStart = useCallback((connId: string, vmid: string) => {
+    setPendingActionVmIds(prev => { const next = new Set(prev); next.add(`${connId}:${vmid}`); return next })
+  }, [])
+
+  const onVmActionEnd = useCallback((connId: string, vmid: string) => {
+    setPendingActionVmIds(prev => { const next = new Set(prev); next.delete(`${connId}:${vmid}`); return next })
+  }, [])
+
+  const [treeOptimisticVmStatus, setTreeOptimisticVmStatus] = useState<((connId: string, vmid: string, status: string) => void) | null>(null)
+  const treeOptimisticVmTagsRef = useRef<((connId: string, vmid: string, tags: string[]) => void) | null>(null)
+
+  // Optimistic update: immediately reflect expected VM status in rawVms + tree clusters
+  const onOptimisticVmStatus = useCallback((connId: string, vmid: string, status: string) => {
+    setRawVms(prev => prev.map(vm =>
+      vm.connId === connId && String(vm.vmid) === String(vmid) ? { ...vm, status } : vm
+    ))
+    treeOptimisticVmStatus?.(connId, vmid, status)
+  }, [treeOptimisticVmStatus])
+
+  // Optimistic update: immediately reflect expected VM tags in rawVms + tree clusters
+  const onVmTagsChange = useCallback((connId: string, vmid: string, tags: string[]) => {
+    setRawVms(prev => prev.map(vm =>
+      vm.connId === connId && String(vm.vmid) === String(vmid) ? { ...vm, tags } : vm
+    ))
+    treeOptimisticVmTagsRef.current?.(connId, vmid, tags)
+  }, [])
+
+  // Derive favorites from SWR data
+  const favorites = useMemo(() => {
+    const favs = favoritesData?.data || []
+    return new Set<string>(favs.map((f: any) => f.vm_key))
+  }, [favoritesData])
+
+  // Toggle favori
+  const toggleFavorite = useCallback(async (vm: { connId: string; node: string; type: string; vmid: string | number; name?: string }) => {
+    const vmKey = `${vm.connId}:${vm.node}:${vm.type}:${vm.vmid}`
+    const isFav = favorites.has(vmKey)
+
+    try {
+      if (isFav) {
+        const res = await fetch(`/api/v1/favorites?vmKey=${encodeURIComponent(vmKey)}`, { method: 'DELETE' })
+        if (res.ok) void mutateFavorites()
+      } else {
+        const res = await fetch('/api/v1/favorites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            connectionId: vm.connId,
+            node: vm.node,
+            vmType: vm.type,
+            vmid: vm.vmid,
+            vmName: vm.name
+          })
+        })
+        if (res.ok) void mutateFavorites()
+      }
+    } catch (e) {
+      console.error('Error toggling favorite:', e)
+    }
+  }, [favorites, mutateFavorites])
+
+  // Largeur du panneau gauche (resizable, persistée — #538)
+  const [leftWidth, setLeftWidth] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = Number(localStorage.getItem('pxc-inventory-tree-width'))
+      if (Number.isFinite(saved) && saved > 0) {
+        return Math.min(MAX_LEFT_WIDTH, Math.max(MIN_LEFT_WIDTH, saved))
+      }
+    }
+    return DEFAULT_LEFT_WIDTH
+  })
+  const [isResizing, setIsResizing] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  const handleRefreshRef = useCallback((refresh: () => void) => {
+    setRefreshTree(() => refresh)
+  }, [])
+
+  const handleOptimisticRef = useCallback((fn: (connId: string, vmid: string, status: string) => void) => {
+    setTreeOptimisticVmStatus(() => fn)
+  }, [])
+
+  // issue #378: the connections-list SWR only warms the shared cache for
+  // dialogs — its result isn't rendered here, and the tree streams its own
+  // data via SSE (and shows its own errors). A 403/500 on this fetch must NOT
+  // blank the whole inventory, which is exactly what happened to low-privilege
+  // roles. Log for diagnostics instead of gating the tree on it.
+  useEffect(() => {
+    if (connectionsError) console.warn('[inventory] connections list fetch failed:', connectionsError.message)
+  }, [connectionsError])
+
+  // Quand on passe en mode tree, sélectionner automatiquement 'root' pour afficher la vue arborescente
+  useEffect(() => {
+    if (viewMode === 'tree' && (!selection || selection.type !== 'root')) {
+      setSelection({ type: 'root', id: 'root' })
+    }
+  }, [viewMode])
+
+  // Gestion du resize
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    setIsResizing(true)
+  }, [])
+
+  useEffect(() => {
+    if (!isResizing) return
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!containerRef.current) return
+      const containerRect = containerRef.current.getBoundingClientRect()
+      const newWidth = e.clientX - containerRect.left
+
+      setLeftWidth(Math.min(MAX_LEFT_WIDTH, Math.max(MIN_LEFT_WIDTH, newWidth)))
+    }
+
+    const handleMouseUp = () => {
+      setIsResizing(false)
+    }
+
+    document.addEventListener('mousemove', handleMouseMove)
+    document.addEventListener('mouseup', handleMouseUp)
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [isResizing])
+
+  // Persiste la largeur du panneau pour la conserver après navigation/reload (#538).
+  // Écrit une fois par redimensionnement (au relâchement), pas à chaque mousemove.
+  useEffect(() => {
+    if (isResizing || typeof window === 'undefined') return
+    localStorage.setItem('pxc-inventory-tree-width', String(leftWidth))
+  }, [isResizing, leftWidth])
+
+  // Persiste l'état replié du panneau (#538).
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    localStorage.setItem('pxc-inventory-tree-collapsed', String(isTreeCollapsed))
+  }, [isTreeCollapsed])
+
+  // Charger IP, snapshots et OS des VMs affichées, page par page (roadmap#179) :
+  // la table passe les lignes de sa page, chaque VM n'est demandée qu'une
+  // fois, et celles que le budget de la route a laissées (`pending`) sont
+  // redemandées aussitôt, au plus IP_SNAP_ROUNDS fois.
+  const ipSnapAsked = useRef(new Set<string>())
+  const ipSnapInFlight = useRef(0)
+
+  const loadIpSnap = useCallback(async (vms: IpSnapTarget[]) => {
+    setIpSnapLoaded(true)
+
+    let batch = vms.filter(vm => !ipSnapAsked.current.has(ipSnapKey(vm)))
+
+    if (batch.length === 0) return
+    batch.forEach(vm => ipSnapAsked.current.add(ipSnapKey(vm)))
+    ipSnapInFlight.current++
+    setIpSnapLoading(true)
+
+    try {
+      for (let round = 0; round < IP_SNAP_ROUNDS && batch.length > 0; round++) {
+        const byConnection = new Map<string, IpSnapTarget[]>()
+
+        batch.forEach(vm => byConnection.set(vm.connId, [...(byConnection.get(vm.connId) ?? []), vm]))
+
+        const answers = await Promise.all(
+          [...byConnection.entries()].map(async ([connId, connVms]) => {
+            try {
+              const res = await fetch('/api/v1/vms/ips', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vms: connVms.map(v => ({ connId: v.connId, type: v.type, node: v.node, vmid: String(v.vmid), status: v.status })) })
+              })
+
+              if (!res.ok) return { data: {}, retry: [] as string[] }
+              const json = await res.json()
+
+              return { data: (json.data || {}) as Record<string, EnrichedGuest>, retry: (json.pending || []) as string[] }
+            } catch (e) {
+              console.error('Error loading IPs for connection:', connId, e)
+
+              return { data: {}, retry: [] as string[] }
+            }
+          })
+        )
+
+        const answered: Record<string, EnrichedGuest> = Object.assign({}, ...answers.map(a => a.data))
+        const retry = new Set(answers.flatMap(a => a.retry))
+
+        setEnrichedData(prev => ({ ...prev, ...answered }))
+        // Ni servie ni à redemander (erreur) : une prochaine page la redemandera.
+        batch.filter(vm => !answered[ipSnapKey(vm)] && !retry.has(ipSnapKey(vm))).forEach(vm => ipSnapAsked.current.delete(ipSnapKey(vm)))
+        batch = batch.filter(vm => retry.has(ipSnapKey(vm)))
+      }
+
+      batch.forEach(vm => ipSnapAsked.current.delete(ipSnapKey(vm)))
+    } finally {
+      ipSnapInFlight.current--
+      if (ipSnapInFlight.current === 0) setIpSnapLoading(false)
+    }
+  }, [])
+
+  return (
+    <Box
+      ref={containerRef}
+      className="ts-layout-content-height-fixed"
+      sx={{
+        // IMPORTANT: permettre aux enfants de scroller
+        minHeight: 0,
+
+        // Remonter les blocs au plus près du header (absorber le padding-top du StyledMain)
+        mt: { lg: '-12px' },
+
+        // Layout : 2 panneaux côte à côte (sur desktop)
+        display: 'flex',
+        flexDirection: { xs: 'column', lg: 'row' },
+
+        // Hauteur dynamique — remplit l'espace entre le navbar et la taskbar
+        // 76px = 44px header + 20px paddings restants (bottom 12px + top absorbé 8px buffer)
+        height: { xs: 'auto', lg: 'calc(100vh - 76px - var(--taskbar-height, 0px) - var(--top-banner-height, 0px))' },
+        maxHeight: { lg: 'calc(100vh - 76px - var(--taskbar-height, 0px) - var(--top-banner-height, 0px))' },
+        overflow: 'hidden',
+        transition: 'height 0.2s ease, max-height 0.2s ease',
+
+        // Pas d'animation pendant le drag-resize de la taskbar (TasksFooter #582)
+        'html[data-taskbar-resizing] &': { transition: 'none' },
+
+        // Curseur de resize global pendant le drag
+        cursor: isResizing ? 'col-resize' : 'default',
+        userSelect: isResizing ? 'none' : 'auto',
+      }}
+    >
+      {/* LEFT: Tree */}
+      <Card
+        variant='outlined'
+        sx={{
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          width: { xs: '100%', lg: isTreeCollapsed ? COLLAPSED_WIDTH : leftWidth },
+          minWidth: { lg: isTreeCollapsed ? COLLAPSED_WIDTH : MIN_LEFT_WIDTH },
+          maxWidth: { lg: isTreeCollapsed ? COLLAPSED_WIDTH : MAX_LEFT_WIDTH },
+          flex: { xs: 'none', lg: '0 0 auto' },
+          transition: 'width 0.2s ease, min-width 0.2s ease, max-width 0.2s ease',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Header fixe (collapsed: juste le bouton expand) */}
+        {isTreeCollapsed && (
+          <CardContent sx={{ pt: 1.5, pb: 1, px: 1, display: 'flex', justifyContent: 'center' }}>
+            <Tooltip title={t('common.showMore')}>
+              <IconButton
+                size='small'
+                onClick={() => setIsTreeCollapsed(false)}
+                sx={{
+                  bgcolor: 'action.hover',
+                  '&:hover': { bgcolor: 'action.selected' }
+                }}
+              >
+                <i className='ri-side-bar-fill' style={{ fontSize: 16 }} />
+              </IconButton>
+            </Tooltip>
+          </CardContent>
+        )}
+
+        {/* Contenu scrollable - masqué quand collapsed */}
+        {!isTreeCollapsed && (
+          <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', px: 2, pb: 2 }}>
+          {loading ? (
+            <Box sx={{ p: 1, display: 'flex', flexDirection: 'column', gap: 1 }}>
+              <Skeleton variant="rounded" height={32} />
+              <Skeleton variant="rounded" height={24} width="80%" />
+              <Skeleton variant="rounded" height={24} width="60%" />
+              <Skeleton variant="rounded" height={24} width="90%" />
+              <Skeleton variant="rounded" height={24} width="70%" />
+            </Box>
+          ) : err ? (
+            <Typography color='error'>{err}</Typography>
+          ) : (
+            <InventoryLoadedContext.Provider value={setInventoryLoaded}>
+              <InventoryTree
+                selected={selection}
+                onSelect={(sel) => setSelection(sel)}
+                onRefreshRef={handleRefreshRef}
+                onOptimisticVmStatusRef={handleOptimisticRef}
+                onOptimisticVmTagsRef={(fn) => { treeOptimisticVmTagsRef.current = fn }}
+                viewMode={viewMode}
+                onViewModeChange={setViewMode}
+                onAllVmsChange={setRawVms}
+                onHostsChange={setHosts}
+                onPoolsChange={setPools}
+                onTagsChange={setTags}
+                onPbsServersChange={setPbsServers}
+                favorites={favorites}
+                onToggleFavorite={toggleFavorite}
+                migratingVmIds={migratingVmIds}
+                pendingActionVmIds={pendingActionVmIds}
+                onRefresh={() => refreshTree?.()}
+                refreshLoading={loading}
+                onCollapse={() => setIsTreeCollapsed(!isTreeCollapsed)}
+                isCollapsed={isTreeCollapsed}
+                allowedViewModes={allowedViewModes}
+                onCreateVm={(connId, node) => setCreateDialogRequest({ type: 'createVm', connId, node, ts: Date.now() })}
+                onCreateLxc={(connId, node) => setCreateDialogRequest({ type: 'createLxc', connId, node, ts: Date.now() })}
+                onNodeAction={(connId, node, action) => setNodeActionRequest({ action, connId, node, ts: Date.now() })}
+                onStoragesChange={setClusterStorages}
+                onExternalHypervisorsChange={setExternalHypervisors}
+                showVmId={showVmId}
+                onToggleShowVmId={toggleShowVmId}
+              />
+            </InventoryLoadedContext.Provider>
+          )}
+        </Box>
+        )}
+      </Card>
+
+      {/* RESIZER - visible uniquement sur desktop et quand la tree n'est pas collapsed */}
+      <Box
+        onMouseDown={isTreeCollapsed ? undefined : handleMouseDown}
+        sx={{
+          display: { xs: 'none', lg: isTreeCollapsed ? 'none' : 'flex' },
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 12,
+          cursor: isTreeCollapsed ? 'default' : 'col-resize',
+          flexShrink: 0,
+          '&:hover': {
+            '& .resizer-handle': {
+              bgcolor: 'primary.main',
+              opacity: 0.5,
+            }
+          },
+          ...(isResizing && {
+            '& .resizer-handle': {
+              bgcolor: 'primary.main',
+              opacity: 0.7,
+            }
+          })
+        }}
+      >
+        <Box
+          className="resizer-handle"
+          sx={{
+            width: 4,
+            height: 48,
+            borderRadius: 2,
+            bgcolor: 'divider',
+            transition: 'background-color 0.15s, opacity 0.15s',
+          }}
+        />
+      </Box>
+
+      {/* RIGHT: Details */}
+      <Card
+        variant='outlined'
+        sx={{
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          flex: 1,
+          width: '100%',
+          overflow: 'hidden',
+        }}
+      >
+        <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+          <InventoryDetails
+            selection={selection}
+            onSelect={(sel: any) => setSelection(sel)}
+            onBack={() => setSelection(null)}
+            viewMode={viewMode}
+            onViewModeChange={setViewMode}
+            allVms={allVms}
+            inventoryLoaded={inventoryLoaded}
+            hosts={hosts}
+            pools={pools}
+            tags={tags}
+            pbsServers={pbsServers}
+            showIpSnap={ipSnapLoaded}
+            ipSnapLoading={ipSnapLoading}
+            onLoadIpSnap={loadIpSnap}
+            favorites={favorites}
+            onToggleFavorite={toggleFavorite}
+            migratingVmIds={migratingVmIds}
+            pendingActionVmIds={pendingActionVmIds}
+            onVmActionStart={onVmActionStart}
+            onVmActionEnd={onVmActionEnd}
+            onOptimisticVmStatus={onOptimisticVmStatus}
+            onVmTagsChange={onVmTagsChange}
+            clusterStorages={clusterStorages}
+            externalHypervisors={externalHypervisors}
+            externalDialogRequest={createDialogRequest}
+            onExternalDialogHandled={() => setCreateDialogRequest(null)}
+            nodeActionRequest={nodeActionRequest}
+            onNodeActionHandled={() => setNodeActionRequest(null)}
+            onRefresh={async () => {
+              if (refreshTree) {
+                refreshTree()
+
+                // Attendre un peu pour que le refresh soit traité
+                await new Promise(resolve => setTimeout(resolve, 500))
+              }
+            }}
+          />
+        </Box>
+      </Card>
+    </Box>
+  )
+}

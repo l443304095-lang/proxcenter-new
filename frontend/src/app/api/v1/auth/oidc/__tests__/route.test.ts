@@ -1,0 +1,564 @@
+/**
+ * Tests for GET/PUT /api/v1/auth/oidc, focused on the SSO-only login flags
+ * (show_local_login / force_sso_redirect) and the anti-lockout coercion.
+ * Route deps are mocked; the handler is imported after the mocks are wired.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest"
+import { callRoute, readJson, deniedPermissionResponse } from "@/__tests__/setup/route-test"
+
+const requireProviderAdminMock = vi.fn()
+const getRBACContextMock = vi.fn()
+const findUniqueMock = vi.fn()
+const upsertMock = vi.fn()
+const encryptSecretMock = vi.fn()
+const normalizeGroupGrantMappingMock = vi.fn()
+const tenantFindManyMock = vi.fn()
+const vdcFindManyMock = vi.fn()
+const auditMock = vi.fn()
+
+vi.mock("@/lib/rbac", () => ({
+  getRBACContext: getRBACContextMock,
+  PERMISSIONS: { ADMIN_SETTINGS: "admin.settings" },
+}))
+
+// Provider-only route: requireProviderAdmin stands for the tenant gate AND
+// admin.settings, so one mock covers both.
+vi.mock("@/lib/tenant/providerGuard", () => ({ requireProviderAdmin: requireProviderAdminMock }))
+
+vi.mock("@/lib/db/prisma", () => ({
+  prisma: {
+    oidcConfig: { findUnique: findUniqueMock, upsert: upsertMock },
+    // The route serves the tenant / vDC picker lists itself, and validates the
+    // mapping targets against them on save.
+    tenant: { findMany: tenantFindManyMock },
+    vdc: { findMany: vdcFindManyMock },
+  },
+}))
+
+vi.mock("@/lib/crypto/secret", () => ({ encryptSecret: encryptSecretMock }))
+
+vi.mock("@/lib/auth/groupMapping", async importOriginal => ({
+  ...(await importOriginal<typeof import("@/lib/auth/groupMapping")>()),
+  normalizeGroupGrantMapping: normalizeGroupGrantMappingMock,
+}))
+
+vi.mock("@/lib/audit", () => ({ audit: auditMock }))
+
+async function importRoute() {
+  return await import("../route")
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // Allowed by default; individual tests override to test the denied path.
+  requireProviderAdminMock.mockResolvedValue(null)
+  // A super admin by default: the protected-role rule is tested on its own.
+  getRBACContextMock.mockResolvedValue({ userId: "u1", isAdmin: true, tenantId: "default" })
+  normalizeGroupGrantMappingMock.mockReturnValue([])
+  tenantFindManyMock.mockResolvedValue([])
+  vdcFindManyMock.mockResolvedValue([])
+  upsertMock.mockResolvedValue({})
+  auditMock.mockResolvedValue(undefined)
+})
+
+// ─── GET ────────────────────────────────────────────────────────────────────
+
+describe("GET /api/v1/auth/oidc", () => {
+  it("returns the denied response when the provider guard refuses (customer tenant admin)", async () => {
+    requireProviderAdminMock.mockResolvedValue(deniedPermissionResponse())
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(res.status).toBe(403)
+    expect(findUniqueMock).not.toHaveBeenCalled()
+  })
+
+  it("returns safe defaults (local visible, no redirect) when no config row exists", async () => {
+    findUniqueMock.mockResolvedValue(null)
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.enabled).toBe(false)
+    expect(body.data.show_local_login).toBe(true)
+    expect(body.data.force_sso_redirect).toBe(false)
+    expect(body.data.hasClientSecret).toBe(false)
+    // The form always receives the entry-list shape, empty here.
+    expect(body.data.group_role_mapping).toBe("[]")
+    expect(body.data.tenants).toEqual([])
+    expect(body.data.vdcs).toEqual([])
+  })
+
+  it("serves the origin the server itself uses towards the IdP", async () => {
+    // The form prints the callback + post-logout URLs the admin must register;
+    // taking them from window.location would show a different host than the one
+    // we actually send whenever NEXTAUTH_URL is set.
+    findUniqueMock.mockResolvedValue(null)
+    const previous = process.env.NEXTAUTH_URL
+    process.env.NEXTAUTH_URL = "https://pxc.example.com/"
+    try {
+      const { GET } = await importRoute()
+      const body = await readJson<any>(await callRoute(GET as any, { method: "GET" }))
+      expect(body.data.app_origin).toBe("https://pxc.example.com")
+    } finally {
+      if (previous === undefined) delete process.env.NEXTAUTH_URL
+      else process.env.NEXTAUTH_URL = previous
+    }
+  })
+
+  it("falls back to the request origin when NEXTAUTH_URL is unset", async () => {
+    findUniqueMock.mockResolvedValue(null)
+    const previous = process.env.NEXTAUTH_URL
+    delete process.env.NEXTAUTH_URL
+    try {
+      const { GET } = await importRoute()
+      const body = await readJson<any>(await callRoute(GET as any, { method: "GET" }))
+      expect(body.data.app_origin).toBe("http://test.local")
+    } finally {
+      if (previous !== undefined) process.env.NEXTAUTH_URL = previous
+    }
+  })
+
+  it("returns the persisted flags and serializes the group mapping when a row exists", async () => {
+    findUniqueMock.mockResolvedValue({
+      enabled: true,
+      providerName: "Okta",
+      issuerUrl: "https://idp.example.com",
+      clientId: "cid",
+      scopes: "openid",
+      authorizationUrl: null,
+      tokenUrl: null,
+      userinfoUrl: null,
+      claimEmail: "email",
+      claimName: "name",
+      claimGroups: "groups",
+      autoProvision: true,
+      defaultRole: "viewer",
+      showLocalLogin: false,
+      forceSsoRedirect: true,
+      groupRoleMapping: { admin: "role_admin" },
+      clientSecretEnc: "enc:secret",
+    })
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.show_local_login).toBe(false)
+    expect(body.data.force_sso_redirect).toBe(true)
+    expect(body.data.hasClientSecret).toBe(true)
+    // A legacy flat row is normalised to entries on the way out, so saving the
+    // form back does not silently rewrite the mapping into something else.
+    normalizeGroupGrantMappingMock.mockReturnValue([
+      { group: "admin", tenantId: "default", vdcId: null, role: "role_admin" },
+    ])
+    const res2 = await callRoute(GET as any, { method: "GET" })
+    expect(await readJson<any>(res2).then(b => b.data.group_role_mapping)).toBe(
+      JSON.stringify([{ group: "admin", tenant: "default", vdc: "", role: "role_admin" }]),
+    )
+  })
+
+  it("returns 500 when the lookup throws", async () => {
+    findUniqueMock.mockRejectedValue(new Error("db down"))
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(res.status).toBe(500)
+  })
+})
+
+// ─── PUT ────────────────────────────────────────────────────────────────────
+
+describe("PUT /api/v1/auth/oidc", () => {
+  it("returns the denied response when the provider guard refuses (customer tenant admin)", async () => {
+    requireProviderAdminMock.mockResolvedValue(deniedPermissionResponse())
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: { enabled: true } })
+    expect(res.status).toBe(403)
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects an enabled config with no issuer URL", async () => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: { enabled: true } })
+    expect(res.status).toBe(400)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe("Issuer URL is required")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects an enabled config with an issuer but no client ID", async () => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: { enabled: true, issuer_url: "https://idp.example.com" },
+    })
+    expect(res.status).toBe(400)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe("Client ID is required")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("persists the SSO-only flags when OIDC is enabled", async () => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: {
+        enabled: true,
+        issuer_url: "https://idp.example.com",
+        client_id: "cid",
+        show_local_login: false,
+        force_sso_redirect: true,
+      },
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.success).toBe(true)
+    expect(upsertMock).toHaveBeenCalledTimes(1)
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.showLocalLogin).toBe(false)
+    expect(arg.update.forceSsoRedirect).toBe(true)
+    expect(arg.create.showLocalLogin).toBe(false)
+    expect(arg.create.forceSsoRedirect).toBe(true)
+    expect(auditMock).toHaveBeenCalledWith(
+      expect.objectContaining({ resourceType: "oidc_config", action: "update" }),
+    )
+  })
+
+  it("coerces the flags to safe values when OIDC is disabled (anti-lockout)", async () => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      // Stale flags carried by the form while disabling OIDC must not stick.
+      body: { enabled: false, show_local_login: false, force_sso_redirect: true },
+    })
+    expect(res.status).toBe(200)
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.showLocalLogin).toBe(true)
+    expect(arg.update.forceSsoRedirect).toBe(false)
+    expect(arg.update.clientSecretEnc).toBeUndefined()
+    expect(encryptSecretMock).not.toHaveBeenCalled()
+  })
+
+  it("encrypts and stores the client secret only when a fresh value is submitted", async () => {
+    encryptSecretMock.mockReturnValue("enc:newsecret")
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: {
+        enabled: true,
+        issuer_url: "https://idp.example.com",
+        client_id: "cid",
+        client_secret: "newsecret",
+      },
+    })
+    expect(res.status).toBe(200)
+    expect(encryptSecretMock).toHaveBeenCalledWith("newsecret")
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.clientSecretEnc).toBe("enc:newsecret")
+    expect(arg.create.clientSecretEnc).toBe("enc:newsecret")
+  })
+
+  it("returns 500 when the upsert throws", async () => {
+    upsertMock.mockRejectedValue(new Error("db down"))
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: { enabled: true, issuer_url: "https://idp.example.com", client_id: "cid" },
+    })
+    expect(res.status).toBe(500)
+  })
+})
+
+// ─── PUT: tenant / vDC mapping targets ──────────────────────────────────────
+
+describe("PUT /api/v1/auth/oidc — group mapping targets", () => {
+  const validBody = {
+    enabled: true,
+    issuer_url: "https://idp.example.com",
+    client_id: "cid",
+  }
+
+  it("rejects a mapping pointing at an unknown tenant", async () => {
+    normalizeGroupGrantMappingMock.mockReturnValue([
+      { group: "ops", tenantId: "t_ghost", vdcId: null, role: "role_operator" },
+    ])
+    tenantFindManyMock.mockResolvedValue([])
+
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: validBody })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toContain("t_ghost")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects a mapping pointing at an unknown vDC", async () => {
+    normalizeGroupGrantMappingMock.mockReturnValue([
+      { group: "ops", tenantId: "t_acme", vdcId: "vdc_ghost", role: "role_operator" },
+    ])
+    tenantFindManyMock.mockResolvedValue([{ id: "t_acme" }])
+    vdcFindManyMock.mockResolvedValue([])
+
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: validBody })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toContain("vdc_ghost")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects a vDC that belongs to another tenant", async () => {
+    // Saving this would grant nothing at login (the sync drops the grant), so
+    // it has to fail loudly at save time instead.
+    normalizeGroupGrantMappingMock.mockReturnValue([
+      { group: "ops", tenantId: "t_acme", vdcId: "vdc_prod", role: "role_operator" },
+    ])
+    tenantFindManyMock.mockResolvedValue([{ id: "t_acme" }])
+    vdcFindManyMock.mockResolvedValue([{ id: "vdc_prod", tenantId: "t_other" }])
+
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: validBody })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toContain("t_other")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("persists the entry list when every target resolves", async () => {
+    const grants = [{ group: "ops", tenantId: "t_acme", vdcId: "vdc_prod", role: "role_operator" }]
+    normalizeGroupGrantMappingMock.mockReturnValue(grants)
+    tenantFindManyMock.mockResolvedValue([{ id: "t_acme" }])
+    vdcFindManyMock.mockResolvedValue([{ id: "vdc_prod", tenantId: "t_acme" }])
+
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: validBody })
+    expect(res.status).toBe(200)
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.groupRoleMapping).toEqual(grants)
+    expect(arg.create.groupRoleMapping).toEqual(grants)
+  })
+})
+
+// ─── Mapping strategy (issue #992) ──────────────────────────────────────────
+
+describe("/api/v1/auth/oidc — group mapping strategy", () => {
+  const validBody = {
+    enabled: true,
+    issuer_url: "https://idp.example.com",
+    client_id: "cid",
+  }
+
+  it("persists the submitted strategy", async () => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: { ...validBody, group_mapping_strategy: "cumulative" },
+    })
+    expect(res.status).toBe(200)
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.groupMappingStrategy).toBe("cumulative")
+    expect(arg.create.groupMappingStrategy).toBe("cumulative")
+  })
+
+  it("falls back to first_match on a missing or unknown strategy", async () => {
+    const { PUT } = await importRoute()
+    await callRoute(PUT as any, { method: "PUT", body: validBody })
+    expect(upsertMock.mock.calls[0][0].update.groupMappingStrategy).toBe("first_match")
+
+    upsertMock.mockClear()
+    await callRoute(PUT as any, {
+      method: "PUT",
+      body: { ...validBody, group_mapping_strategy: "whatever" },
+    })
+    expect(upsertMock.mock.calls[0][0].update.groupMappingStrategy).toBe("first_match")
+  })
+
+  it("serves the stored strategy, and first_match for a row written before v1.5", async () => {
+    findUniqueMock.mockResolvedValue({
+      enabled: true,
+      providerName: "Okta",
+      issuerUrl: "https://idp.example.com",
+      clientId: "cid",
+      claimGroups: "groups",
+      defaultRole: "viewer",
+      showLocalLogin: true,
+      forceSsoRedirect: false,
+      groupRoleMapping: [],
+      groupMappingStrategy: "cumulative",
+    })
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(await readJson<any>(res).then(b => b.data.group_mapping_strategy)).toBe("cumulative")
+
+    findUniqueMock.mockResolvedValue({
+      enabled: true,
+      providerName: "Okta",
+      issuerUrl: "https://idp.example.com",
+      clientId: "cid",
+      claimGroups: "groups",
+      defaultRole: "viewer",
+      showLocalLogin: true,
+      forceSsoRedirect: false,
+      groupRoleMapping: {},
+      groupMappingStrategy: null,
+    })
+    const res2 = await callRoute(GET as any, { method: "GET" })
+    expect(await readJson<any>(res2).then(b => b.data.group_mapping_strategy)).toBe("first_match")
+  })
+
+  it("answers first_match when no config row exists yet", async () => {
+    findUniqueMock.mockResolvedValue(null)
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    expect(await readJson<any>(res).then(b => b.data.group_mapping_strategy)).toBe("first_match")
+  })
+})
+
+// ─── Provider-only gate and protected roles ─────────────────────────────────
+
+describe("/api/v1/auth/oidc — provider tenant and protected roles", () => {
+  const validBody = {
+    enabled: true,
+    issuer_url: "https://idp.example.com",
+    client_id: "cid",
+  }
+
+  it("asks the guard for admin.settings in the provider tenant and never reads the row when refused", async () => {
+    requireProviderAdminMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "This operation is only available from the provider tenant" }), { status: 403 }),
+    )
+    const { GET, PUT } = await importRoute()
+    expect((await callRoute(GET as any, { method: "GET" })).status).toBe(403)
+    expect((await callRoute(PUT as any, { method: "PUT", body: validBody })).status).toBe(403)
+    expect(requireProviderAdminMock).toHaveBeenCalledWith("admin.settings")
+    expect(findUniqueMock).not.toHaveBeenCalled()
+    expect(tenantFindManyMock).not.toHaveBeenCalled()
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("refuses role_super_admin as the default role unless the caller is a super admin", async () => {
+    getRBACContextMock.mockResolvedValue({ userId: "u2", isAdmin: false, tenantId: "default" })
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: { ...validBody, default_role: "role_super_admin" } })
+    expect(res.status).toBe(403)
+    expect((await readJson<any>(res)).error).toBe(
+      "Only a super admin can set role_super_admin as the SSO default role or a group mapping target",
+    )
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("recognises the bare OIDC spelling and a protected group mapping target", async () => {
+    getRBACContextMock.mockResolvedValue({ userId: "u2", isAdmin: false, tenantId: "default" })
+    normalizeGroupGrantMappingMock.mockReturnValue([
+      { group: "ops", tenantId: "default", vdcId: null, role: "role_provider_admin" },
+    ])
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: { ...validBody, default_role: "super_admin" } })
+    expect(res.status).toBe(403)
+    expect((await readJson<any>(res)).error).toContain("role_super_admin, role_provider_admin")
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+
+  it("lets a super admin save a protected default role, and anyone save an ordinary one without the lookup", async () => {
+    const { PUT } = await importRoute()
+    expect((await callRoute(PUT as any, { method: "PUT", body: { ...validBody, default_role: "role_super_admin" } })).status).toBe(200)
+    expect(upsertMock.mock.calls[0][0].update.defaultRole).toBe("role_super_admin")
+
+    getRBACContextMock.mockClear()
+    getRBACContextMock.mockResolvedValue({ userId: "u2", isAdmin: false, tenantId: "default" })
+    expect((await callRoute(PUT as any, { method: "PUT", body: { ...validBody, default_role: "viewer" } })).status).toBe(200)
+    expect(getRBACContextMock).not.toHaveBeenCalled()
+  })
+})
+
+// ─── Outbound proxy towards the IdP (roadmap#78) ────────────────────────────
+
+describe("/api/v1/auth/oidc — outbound proxy", () => {
+  const base = { enabled: true, issuer_url: "https://idp.example.com", client_id: "cid" }
+
+  beforeEach(() => {
+    vi.unstubAllEnvs()
+    vi.stubEnv("HTTPS_PROXY", "")
+    vi.stubEnv("HTTP_PROXY", "")
+  })
+
+  it("serves the saved proxy, flags the password without returning it, and shows the environment proxy", async () => {
+    vi.stubEnv("HTTPS_PROXY", "http://envuser:envpass@squid.corp:3128")
+    findUniqueMock.mockResolvedValue({
+      enabled: true,
+      providerName: "Entra",
+      issuerUrl: "https://login.example.com/t/v2.0",
+      clientId: "cid",
+      clientSecretEnc: "enc",
+      groupRoleMapping: [],
+      groupMappingStrategy: "first_match",
+      proxyUrl: "http://proxy.corp:8080",
+      proxyUsername: "svc-proxcenter",
+      proxyPasswordEnc: "enc:pw",
+      proxyBypass: ".corp.example.com",
+    })
+    const { GET } = await importRoute()
+    const res = await callRoute(GET as any, { method: "GET" })
+    const body = await readJson<any>(res)
+    expect(body.data.proxy_url).toBe("http://proxy.corp:8080")
+    expect(body.data.proxy_username).toBe("svc-proxcenter")
+    expect(body.data.proxy_bypass).toBe(".corp.example.com")
+    expect(body.data.hasProxyPassword).toBe(true)
+    expect(body.data.env_proxy).toBe("http://squid.corp:3128")
+    const raw = JSON.stringify(body)
+    expect(raw).not.toContain("enc:pw")
+    expect(raw).not.toContain("envpass")
+  })
+
+  it("answers empty proxy fields and no environment proxy when nothing is configured", async () => {
+    findUniqueMock.mockResolvedValue(null)
+    const { GET } = await importRoute()
+    const body = await readJson<any>(await callRoute(GET as any, { method: "GET" }))
+    expect(body.data).toMatchObject({ proxy_url: "", proxy_username: "", proxy_bypass: "", hasProxyPassword: false, env_proxy: null })
+  })
+
+  it("normalises the proxy URL and encrypts the password", async () => {
+    encryptSecretMock.mockReturnValue("enc:pw")
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, {
+      method: "PUT",
+      body: { ...base, proxy_url: " http://proxy.corp:3128/ ", proxy_username: " svc ", proxy_password: "P@ss:w%rd!", proxy_bypass: " .corp.example.com " },
+    })
+    expect(res.status).toBe(200)
+    expect(encryptSecretMock).toHaveBeenCalledWith("P@ss:w%rd!")
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update).toMatchObject({ proxyUrl: "http://proxy.corp:3128", proxyUsername: "svc", proxyBypass: ".corp.example.com", proxyPasswordEnc: "enc:pw" })
+    expect(arg.create.proxyPasswordEnc).toBe("enc:pw")
+    const audited = auditMock.mock.calls.find(c => c[0]?.resourceType === "oidc_config")?.[0]
+    expect(audited.details).toMatchObject({ proxy_url: "http://proxy.corp:3128", proxyPasswordChanged: true })
+    expect(JSON.stringify(auditMock.mock.calls)).not.toContain("P@ss")
+  })
+
+  it("keeps the saved proxy password when the field is left blank", async () => {
+    const { PUT } = await importRoute()
+    await callRoute(PUT as any, { method: "PUT", body: { ...base, proxy_url: "http://proxy.corp:3128", proxy_username: "svc", proxy_password: "" } })
+    const arg = upsertMock.mock.calls[0][0]
+    expect(arg.update.proxyUsername).toBe("svc")
+    expect("proxyPasswordEnc" in arg.update).toBe(false)
+    expect(encryptSecretMock).not.toHaveBeenCalled()
+  })
+
+  it("drops the credentials when the proxy URL or the username is cleared", async () => {
+    const { PUT } = await importRoute()
+    await callRoute(PUT as any, { method: "PUT", body: { ...base, proxy_url: "", proxy_username: "svc", proxy_password: "pw" } })
+    let arg = upsertMock.mock.calls[0][0]
+    expect(arg.update).toMatchObject({ proxyUrl: null, proxyUsername: null, proxyPasswordEnc: null })
+    expect(encryptSecretMock).not.toHaveBeenCalled()
+
+    await callRoute(PUT as any, { method: "PUT", body: { ...base, proxy_url: "http://proxy.corp:3128", proxy_username: "  " } })
+    arg = upsertMock.mock.calls[1][0]
+    expect(arg.update).toMatchObject({ proxyUrl: "http://proxy.corp:3128", proxyUsername: null, proxyPasswordEnc: null })
+  })
+
+  it.each([
+    ["http://user:pw@proxy.corp:3128", /username and password fields/],
+    ["socks5://proxy.corp:1080", /only http/],
+    ["not a url", /Invalid proxy URL/],
+  ])("rejects %s without saving", async (proxy_url, message) => {
+    const { PUT } = await importRoute()
+    const res = await callRoute(PUT as any, { method: "PUT", body: { ...base, proxy_url } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toMatch(message)
+    expect(upsertMock).not.toHaveBeenCalled()
+  })
+})

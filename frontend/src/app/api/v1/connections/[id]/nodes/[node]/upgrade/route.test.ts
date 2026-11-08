@@ -1,0 +1,211 @@
+import { spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+
+// The IaaS tenant gate of this route is covered by lib/tenant/iaasGuard.routes.test.ts (roadmap#189).
+vi.mock("@/lib/tenant/iaasGuard", () => ({ denyIaasTenant: async () => null }))
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+import { PveLicenseExcludedError } from '@/lib/license/exclusions'
+
+const checkPermissionMock = vi.fn<(...args: any[]) => Promise<Response | null>>()
+const getConnectionByIdMock = vi.fn<(id: string) => Promise<any>>()
+const getNodeIpMock = vi.fn<(...args: any[]) => Promise<string>>()
+const executeSSHMock = vi.fn<(...args: any[]) => Promise<any>>()
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: checkPermissionMock,
+  buildNodeResourceId: (c: string, n: string) => `${c}:${n}`,
+  PERMISSIONS: { NODE_VIEW: 'node.view', NODE_MANAGE: 'node.manage' },
+}))
+vi.mock('@/lib/connections/getConnection', () => ({ getConnectionById: getConnectionByIdMock }))
+vi.mock('@/lib/ssh/node-ip', () => ({ getNodeIp: getNodeIpMock }))
+vi.mock('@/lib/ssh/exec', () => ({ executeSSH: executeSSHMock }))
+
+beforeEach(() => {
+  checkPermissionMock.mockReset().mockResolvedValue(null)
+  getConnectionByIdMock.mockReset().mockResolvedValue({ baseUrl: 'https://203.0.113.10:8006' })
+  getNodeIpMock.mockReset()
+  executeSSHMock.mockReset()
+})
+
+const importPOST = async () => (await import('./route')).POST as Parameters<typeof callRoute>[0]
+const importGET = async () => (await import('./route')).GET as Parameters<typeof callRoute>[0]
+
+describe('POST upgrade — identity guard', () => {
+  it('launches the upgrade when the target is the connection host and hostname matches', async () => {
+    getNodeIpMock.mockResolvedValue('203.0.113.10')
+    executeSSHMock
+      .mockResolvedValueOnce({ success: true, output: 'pve1' }) // probe
+      .mockResolvedValueOnce({ success: true })                 // script
+    const POST = await importPOST()
+    const res = await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: {} })
+    expect(res.status).toBe(200)
+    expect(await readJson<any>(res)).toEqual({ started: true })
+    expect(executeSSHMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('refuses (409) and does NOT launch when hostname mismatches', async () => {
+    getNodeIpMock.mockResolvedValue('203.0.113.10')
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: 'bastion' }) // probe only
+    const POST = await importPOST()
+    const res = await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: {} })
+    expect(res.status).toBe(409)
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips the probe for a direct-IP resolution and launches', async () => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5') // != connHost
+    executeSSHMock.mockResolvedValueOnce({ success: true }) // script only
+    const POST = await importPOST()
+    const res = await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: {} })
+    expect(res.status).toBe(200)
+    expect(executeSSHMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns the actionable C error when the script SSH fails to a private IP', async () => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5')
+    executeSSHMock.mockResolvedValueOnce({ success: false, error: 'timeout' })
+    const POST = await importPOST()
+    const res = await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: {} })
+    expect(res.status).toBe(500)
+    expect((await readJson<any>(res)).error).toMatch(/private address/)
+  })
+
+  it('answers 403 with its code when the cluster is outside the license (roadmap#58)', async () => {
+    getNodeIpMock.mockResolvedValue('203.0.113.10')
+    executeSSHMock
+      .mockResolvedValueOnce({ success: true, output: 'pve1' })      // the identity probe only reads, so it ran
+      .mockRejectedValueOnce(new PveLicenseExcludedError('c1'))     // the upgrade script: refused by executeSSH
+    const POST = await importPOST()
+    const res = await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: {} })
+    expect(res.status).toBe(403)
+    expect(await readJson<any>(res)).toMatchObject({ code: 'CONNECTION_LICENSE_EXCLUDED' })
+    expect(executeSSHMock.mock.calls[0][4]).toEqual({ readOnly: true })
+    expect(executeSSHMock.mock.calls[1][4]).toBeUndefined()
+  })
+})
+
+describe('GET upgrade poll — shared error', () => {
+  it('returns the actionable C error when polling a private IP fails', async () => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5')
+    executeSSHMock.mockResolvedValueOnce({ success: false, error: 'timeout' })
+    const GET = await importGET()
+    const res = await callRoute(GET, { params: { id: 'c1', node: 'pve1' } })
+    expect(res.status).toBe(500)
+    expect((await readJson<any>(res)).error).toMatch(/private address/)
+  })
+})
+
+describe('upgrade script — apt outcome (discussion #928)', () => {
+  const launch = async (body: any = {}) => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5')
+    executeSSHMock.mockResolvedValueOnce({ success: true })
+    const POST = await importPOST()
+    await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body })
+    return executeSSHMock.mock.calls[0][2] as string
+  }
+
+  it('keeps locally modified conffiles instead of failing on the dpkg prompt', async () => {
+    const script = await launch()
+    expect(script).toContain('-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade')
+  })
+
+  it('writes RUNNING before the background job, outside the tmpfs /tmp', async () => {
+    const script = await launch()
+    expect(script.indexOf('echo RUNNING > /var/log/proxcenter-upgrade.status')).toBe(0)
+    expect(script.indexOf('nohup')).toBeGreaterThan(0)
+    expect(script).not.toContain('/tmp/')
+  })
+
+  it('auto-reboots on a newer installed kernel, not only on /var/run/reboot-required', async () => {
+    const script = await launch({ auto_reboot: true })
+    expect(script).toContain('uname -r')
+    expect(script).toContain('/boot/vmlinuz-')
+  })
+
+  it('embeds no single quote inside the single-quoted background script', async () => {
+    const script = await launch({ auto_reboot: true })
+    const inner = script.slice(script.indexOf("bash -c '") + 9, script.lastIndexOf("' > /dev/null"))
+    expect(inner).not.toContain("'")
+  })
+})
+
+describe('upgrade script — run in bash against stubbed apt-get and reboot', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pc-upgrade-'))
+    mkdirSync(join(dir, 'bin'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  const stub = (name: string, body: string) => {
+    writeFileSync(join(dir, 'bin', name), `#!/bin/sh\n${body}\n`)
+    chmodSync(join(dir, 'bin', name), 0o755)
+  }
+
+  // Runs the background part of the script synchronously and returns every
+  // status write in order (">" is turned into ">>" so the history survives).
+  const run = async (opts: { autoReboot: boolean; aptExit: number; rebootNeeded: boolean; rebootExit?: number }) => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5')
+    executeSSHMock.mockResolvedValueOnce({ success: true })
+    const POST = await importPOST()
+    await callRoute(POST, { params: { id: 'c1', node: 'pve1' }, body: { auto_reboot: opts.autoReboot } })
+    const script = executeSSHMock.mock.calls[0][2] as string
+    const inner = script.slice(script.indexOf("bash -c '") + 9, script.lastIndexOf("' > /dev/null"))
+    const flag = join(dir, 'reboot-required')
+    if (opts.rebootNeeded) writeFileSync(flag, '')
+    stub('apt-get', `exit ${opts.aptExit}`)
+    stub('reboot', `echo called >> ${join(dir, 'reboot-calls')}; exit ${opts.rebootExit ?? 0}`)
+    const local = inner
+      .replaceAll('> /var/log/proxcenter-upgrade.status', `>> ${join(dir, 'status')}`)
+      .replaceAll('/var/log/proxcenter-upgrade.log', join(dir, 'log'))
+      .replaceAll('/var/run/reboot-required', flag)
+      .replaceAll('/boot/vmlinuz-', join(dir, 'no-kernel-'))
+      .replaceAll('sleep 2', 'true')
+    spawnSync('bash', ['-c', local], { env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}` } })
+    const read = (f: string) => (existsSync(join(dir, f)) ? readFileSync(join(dir, f), 'utf8').trim().split('\n') : [])
+    return { statuses: read('status'), rebooted: read('reboot-calls').length > 0 }
+  }
+
+  it('reports FAILED and does not reboot when apt fails, even if a kernel is pending', async () => {
+    expect(await run({ autoReboot: true, aptExit: 100, rebootNeeded: true })).toEqual({ statuses: ['FAILED'], rebooted: false })
+  })
+
+  it('goes straight to REBOOTING, never through COMPLETED, so the dialog cannot reboot a second time', async () => {
+    expect(await run({ autoReboot: true, aptExit: 0, rebootNeeded: true })).toEqual({ statuses: ['REBOOTING'], rebooted: true })
+  })
+
+  it('falls back to COMPLETED when the reboot command itself fails', async () => {
+    expect(await run({ autoReboot: true, aptExit: 0, rebootNeeded: true, rebootExit: 1 })).toEqual({ statuses: ['REBOOTING', 'COMPLETED'], rebooted: true })
+  })
+
+  it('completes without rebooting when no reboot is needed', async () => {
+    expect(await run({ autoReboot: true, aptExit: 0, rebootNeeded: false })).toEqual({ statuses: ['COMPLETED'], rebooted: false })
+  })
+
+  it('never reboots when auto-reboot is off', async () => {
+    expect(await run({ autoReboot: false, aptExit: 0, rebootNeeded: true })).toEqual({ statuses: ['COMPLETED'], rebooted: false })
+  })
+})
+
+describe('GET upgrade poll — reboot detection', () => {
+  it('reads the persistent files and reports the running vs installed kernel check', async () => {
+    getNodeIpMock.mockResolvedValue('10.0.0.5')
+    executeSSHMock.mockResolvedValueOnce({ success: true, output: 'COMPLETED\n---SEPARATOR---\nlog\n---SEPARATOR---\nYES\n' })
+    const GET = await importGET()
+    const res = await callRoute(GET, { params: { id: 'c1', node: 'pve1' } })
+    expect(await readJson<any>(res)).toEqual({ status: 'COMPLETED', logs: 'log', reboot_required: true })
+    const command = executeSSHMock.mock.calls[0][2] as string
+    // The poll only reads, so it still answers on a cluster outside the license (roadmap#58).
+    expect(executeSSHMock.mock.calls[0][4]).toEqual({ readOnly: true })
+    expect(command).toContain('cat /var/log/proxcenter-upgrade.status')
+    expect(command).toContain('uname -r')
+    // an auto-reboot run ends on REBOOTING: once booted after it, it reads as COMPLETED
+    expect(command).toContain('[ "$S" = REBOOTING ]')
+    expect(command).toContain('/proc/uptime')
+  })
+})

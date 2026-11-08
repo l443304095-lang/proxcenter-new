@@ -1,0 +1,119 @@
+import { NextRequest, NextResponse } from "next/server"
+
+import { getOrchestratorClient, parseOrchestratorError } from "@/lib/orchestrator/client"
+import { replicationErrorResponse } from "@/lib/orchestrator/replicationError"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { getTenantConnectionIds } from "@/lib/tenant"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+/** Verify that a replication job belongs to the current tenant */
+async function verifyJobOwnership(id: string) {
+  const client = getOrchestratorClient()
+  const tenantConnectionIds = await getTenantConnectionIds()
+  const response = await client.getReplicationJob(id)
+  const job = response.data
+
+  if (
+    job &&
+    ((job.source_cluster && !tenantConnectionIds.has(job.source_cluster)) ||
+    (job.target_cluster && !tenantConnectionIds.has(job.target_cluster)))
+  ) {
+    return null // not owned by tenant
+  }
+
+  return job
+}
+
+export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_VIEW, "global", "*")
+
+    if (denied) return denied
+
+    const { id } = await params
+    const job = await verifyJobOwnership(id)
+
+    if (!job) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 })
+    }
+
+    return NextResponse.json(job)
+  } catch (e: any) {
+    if ((e as any)?.code !== 'ORCHESTRATOR_UNAVAILABLE') {
+      console.error("Error fetching replication job:", e)
+    }
+
+    return NextResponse.json(
+      { error: e?.message || "Failed to fetch replication job" },
+      { status: 500 }
+    )
+  }
+}
+
+async function handlePut(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_MANAGE, "global", "*")
+
+    if (denied) return denied
+
+    const { id } = await params
+    const job = await verifyJobOwnership(id)
+
+    if (!job) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 })
+    }
+
+    const body = await request.json()
+    const client = getOrchestratorClient()
+    const response = await client.updateReplicationJob(id, body)
+
+    return NextResponse.json(response.data)
+  } catch (e: any) {
+    if ((e as any)?.code !== 'ORCHESTRATOR_UNAVAILABLE') {
+      console.error("Error updating replication job:", e)
+    }
+
+    // The orchestrator refuses some edits for good reasons (a guest whose
+    // replica runs, one a recovery plan lists, one another job replicates):
+    // pass its own message and status through, instead of wrapping them in a
+    // 500 that reads "Orchestrator 400: {json}" in the dialog.
+    const upstream = parseOrchestratorError(e)
+
+    if (upstream) {
+      return NextResponse.json({ error: upstream.message }, { status: upstream.status })
+    }
+
+    return NextResponse.json(
+      { error: e?.message || "Failed to update replication job" },
+      { status: 500 }
+    )
+  }
+}
+
+async function handleDelete(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_MANAGE, "global", "*")
+
+    if (denied) return denied
+
+    const { id } = await params
+    const job = await verifyJobOwnership(id)
+
+    if (!job) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 })
+    }
+
+    const client = getOrchestratorClient()
+    const response = await client.deleteReplicationJob(id)
+
+    return NextResponse.json(response.data)
+  } catch (e: any) {
+    // 409 while a test failover holds the job's replicas: keep the orchestrator's status
+    return replicationErrorResponse(e, "Failed to delete replication job")
+  }
+}
+
+export const PUT = withAudit({ category: "replication", resourceType: "job", resourceParam: "id" }, handlePut)
+export const DELETE = withAudit({ category: "replication", resourceType: "job", resourceParam: "id" }, handleDelete)

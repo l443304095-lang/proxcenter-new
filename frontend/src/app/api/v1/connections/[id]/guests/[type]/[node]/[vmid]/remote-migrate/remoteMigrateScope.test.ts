@@ -1,0 +1,534 @@
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+// The API token guard is covered by routeGuard.test.ts and writeContract.test.ts:
+// pass-through so this file keeps testing the handler, as for a session caller.
+vi.mock("@/lib/api-tokens/routeGuard", () => ({
+  withPublicApiGuard: (_entryId: string, handler: any) => handler,
+}))
+
+import { callRoute } from "../../../../../../../../../../__tests__/setup/route-test"
+
+// Hoist mocks so they are available in vi.mock factories
+const { getInfraMock, checkPermissionMock, getConnectionByIdMock, pveFetchMock, getNodeIpMock, watchMigrationMock, TARGET_FP, tlsState } = vi.hoisted(() => ({
+  getInfraMock: vi.fn(),
+  checkPermissionMock: vi.fn(),
+  getConnectionByIdMock: vi.fn(),
+  pveFetchMock: vi.fn(),
+  getNodeIpMock: vi.fn(),
+  watchMigrationMock: vi.fn(),
+  /** SHA-256 fingerprint the target cluster reports for pve2 (32 colon-separated bytes). */
+  TARGET_FP: Array.from({ length: 32 }, (_, i) => ((i * 7 + 3) % 256).toString(16).padStart(2, "0").toUpperCase()).join(":"),
+  /** What the fake TLS handshake with the resolved host presents. */
+  tlsState: { fingerprint: "" },
+}))
+
+vi.mock("@/lib/tenant/infraScope", async (orig) => ({
+  ...(await orig<typeof import("@/lib/tenant/infraScope")>()),
+  getTenantInfrastructureScope: (...a: any[]) => getInfraMock(...a),
+}))
+
+vi.mock("@/lib/tenant", () => ({
+  getCurrentTenantId: async () => "test-tenant",
+}))
+
+vi.mock("@/lib/rbac", () => ({
+  checkPermission: (...args: any[]) => checkPermissionMock(...args),
+  buildVmResourceId: (id: string, node: string, type: string, vmid: string) => `${id}/${node}/${type}/${vmid}`,
+  PERMISSIONS: { VM_MIGRATE: "vm.migrate" },
+}))
+
+vi.mock("@/lib/connections/getConnection", () => ({
+  getConnectionById: (...args: any[]) => getConnectionByIdMock(...args),
+}))
+
+vi.mock("@/lib/proxmox/client", () => ({
+  pveFetch: (...args: any[]) => pveFetchMock(...args),
+}))
+
+vi.mock("@/lib/ssh/node-ip", () => ({
+  getNodeIp: (...args: any[]) => getNodeIpMock(...args),
+}))
+
+vi.mock("@/lib/migration/cross-cluster-watcher", () => ({
+  watchMigrationAndCleanup: (...args: any[]) => watchMigrationMock(...args),
+}))
+
+vi.mock("@/lib/audit", () => ({ audit: vi.fn() }))
+
+// The route opens a real TLS connection to the resolved host to cross-check the
+// fingerprint the target API reports. Stub it out so the tests reach body
+// execution without a network timeout; `tlsState` says what the host presents.
+vi.mock("tls", () => ({
+  connect: (_opts: any, cb?: () => void) => {
+    const emitter: any = {
+      getPeerCertificate: () => ({ fingerprint256: tlsState.fingerprint }),
+      end: () => {},
+      on: (_event: string, _handler: () => void) => emitter,
+    }
+    if (cb) setTimeout(cb, 0)
+    return emitter
+  },
+}))
+
+/** Target cluster API: pve2 is a member, and its pveproxy certificate is TARGET_FP. */
+function targetClusterAnswers(path: string): unknown {
+  if (path === "/nodes") return [{ node: "pve1" }, { node: "pve2" }]
+  if (path === "/nodes/pve2/certificates/info") return [{ filename: "pve-ssl.pem", fingerprint: "11:".repeat(31) + "11" }, { filename: "pveproxy-ssl.pem", fingerprint: TARGET_FP }]
+  return []
+}
+
+/** The target-endpoint of the latest remote_migrate call, decoded from its form body. */
+function sentTargetEndpoint(): string {
+  const call = pveFetchMock.mock.calls.filter(([, path]: any[]) => path.includes("remote_migrate")).at(-1)
+  return new URLSearchParams(call![2].body).get("target-endpoint") ?? ""
+}
+
+const STUB_SOURCE_CONN = { id: "conn-src", name: "Source", baseUrl: "https://src-pve:8006", apiToken: "tok-src" }
+const STUB_TARGET_CONN = { id: "conn-tgt", name: "Target", baseUrl: "https://tgt-pve:8006", apiToken: "tok-tgt" }
+
+const PARAMS = { id: "conn-src", type: "qemu", node: "pve1", vmid: "100" }
+
+const VALID_BODY = {
+  targetConnectionId: "conn-tgt",
+  targetNode: "pve2",
+  targetStorage: "local-lvm",
+  targetBridge: "vmbr0",
+  online: true,
+  delete: false,
+}
+
+beforeEach(() => {
+  checkPermissionMock.mockReset().mockResolvedValue(null)
+  getConnectionByIdMock.mockReset().mockImplementation((id: string) => {
+    if (id === "conn-src") return Promise.resolve(STUB_SOURCE_CONN)
+    if (id === "conn-tgt") return Promise.resolve(STUB_TARGET_CONN)
+    return Promise.resolve(null)
+  })
+  pveFetchMock.mockReset()
+  getNodeIpMock.mockReset().mockResolvedValue("10.0.0.2")
+  watchMigrationMock.mockReset().mockResolvedValue(undefined)
+  getInfraMock.mockReset()
+  tlsState.fingerprint = TARGET_FP
+})
+
+describe("POST .../remote-migrate — MSP ownership gate", () => {
+  it("provider tenant passes the source gate (reaches body parsing, no 403)", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: PARAMS,
+      body: VALID_BODY,
+    })
+
+    // Provider passes the gate; may fail later on TLS fingerprint logic (500 or 400)
+    // but must NOT return 403
+    expect(res.status).not.toBe(403)
+  })
+
+  it("msp tenant that owns BOTH connections passes the gate", async () => {
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["conn-src", "conn-tgt"]) })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: PARAMS,
+      body: VALID_BODY,
+    })
+
+    expect(res.status).not.toBe(403)
+  })
+
+  it("msp tenant that does NOT own the source connection gets 403", async () => {
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["conn-tgt"]) })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: PARAMS,
+      body: VALID_BODY,
+    })
+
+    expect(res.status).toBe(403)
+    const body = await res.json()
+    expect(body.error).toMatch(/migration is restricted/i)
+  })
+
+  it("msp tenant that owns source but NOT target connection gets 403", async () => {
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["conn-src"]) })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: PARAMS,
+      body: VALID_BODY,
+    })
+
+    expect(res.status).toBe(403)
+    const body = await res.json()
+    expect(body.error).toMatch(/target must be a connection owned by your tenant/i)
+  })
+
+  it("iaas tenant gets 403 regardless of connection ids", async () => {
+    const vdcScope: any = { connectionIds: new Set(["conn-src", "conn-tgt"]), pbsConnectionIds: new Set() }
+    getInfraMock.mockResolvedValue({ kind: "iaas", vdcScope })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: PARAMS,
+      body: VALID_BODY,
+    })
+
+    expect(res.status).toBe(403)
+    const body = await res.json()
+    expect(body.error).toMatch(/migration is restricted/i)
+  })
+
+  it("rejects LXC type before even reaching the gate — returns 400", async () => {
+    // Type check happens before the gate; ensure we don't regress it
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { ...PARAMS, type: "lxc" },
+      body: VALID_BODY,
+    })
+
+    expect(res.status).toBe(400)
+  })
+})
+
+// Spec 6.3: the migration lands a guest on the TARGET cluster, so vm.migrate is
+// also checked on the target connection, for every caller.
+describe("POST .../remote-migrate — vm.migrate on the target connection", () => {
+  const post = async (body: any) => {
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+
+    return callRoute(POST, { method: "POST", params: PARAMS, body })
+  }
+
+  beforeEach(() => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    pveFetchMock.mockImplementation((_conn: any, path: string) =>
+      Promise.resolve(path.includes("remote_migrate") ? "UPID:pve1:0000A:qmigrate:100:root@pam:" : targetClusterAnswers(path)))
+  })
+
+  it("403 without vm.migrate on the target connection, before any cluster is contacted", async () => {
+    checkPermissionMock.mockImplementation(async (_perm: string, resourceType: string) =>
+      resourceType === "connection" ? new Response(JSON.stringify({ error: "Permission denied: vm.migrate" }), { status: 403 }) : null)
+
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(403)
+    expect(checkPermissionMock).toHaveBeenCalledWith("vm.migrate", "connection", "conn-tgt")
+    expect(getConnectionByIdMock).not.toHaveBeenCalled()
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("passes with vm.migrate on the source guest and on the target connection", async () => {
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(200)
+    expect(checkPermissionMock).toHaveBeenCalledWith("vm.migrate", "vm", "conn-src/pve1/qemu/100")
+    expect(checkPermissionMock).toHaveBeenCalledWith("vm.migrate", "connection", "conn-tgt")
+  })
+
+  it("keeps the 400 when targetConnectionId is missing", async () => {
+    const { targetConnectionId: _omit, ...body } = VALID_BODY
+
+    const res = await post(body)
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/targetConnectionId is required/)
+    expect(checkPermissionMock).not.toHaveBeenCalledWith("vm.migrate", "connection", expect.anything())
+  })
+
+  it("400 on a non-string targetConnectionId, before the target check", async () => {
+    const res = await post({ ...VALID_BODY, targetConnectionId: ["conn-tgt"] })
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/targetConnectionId must be a string/)
+    expect(checkPermissionMock).not.toHaveBeenCalledWith("vm.migrate", "connection", expect.anything())
+  })
+
+  it("400 on a malformed JSON body", async () => {
+    const res = await post("{not json")
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/invalid json body/i)
+  })
+
+  it("the tenant gate still answers first for an iaas tenant, even with a malformed body", async () => {
+    getInfraMock.mockResolvedValue({ kind: "iaas", vdcScope: { connectionIds: new Set(["conn-src"]) } })
+    const res = await post("{not json")
+
+    expect(res.status).toBe(403)
+    expect((await res.json()).error).toMatch(/migration is restricted/i)
+  })
+})
+
+// The [vmid] segment reaches `qm unlock ${vmid}` in the cleanup watcher and the
+// [node] segment can become the SSH host (getNodeIp fallback), so both are
+// re-derived at the boundary and injection payloads must 400 before the gate.
+describe("POST .../remote-migrate — node/vmid validation (command injection)", () => {
+  it("rejects a vmid with shell metacharacters (400, before the RBAC gate / watcher)", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { ...PARAMS, vmid: "100; touch /tmp/pwn" },
+      body: VALID_BODY,
+    })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/invalid node name or vmid/i)
+    expect(checkPermissionMock).not.toHaveBeenCalled()
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("rejects a node name with shell metacharacters (400, before the RBAC gate / watcher)", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+    const res = await callRoute(POST, {
+      method: "POST",
+      params: { ...PARAMS, node: "pve1$(reboot)" },
+      body: VALID_BODY,
+    })
+    expect(res.status).toBe(400)
+    expect(checkPermissionMock).not.toHaveBeenCalled()
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+})
+
+// The restore plan is built by the browser and handed to a detached watcher that
+// writes HA resources and replication jobs on the TARGET cluster. It is parsed at
+// the boundary so a malformed capture is dropped rather than replayed.
+describe("POST .../remote-migrate — restore plan", () => {
+  const CAPTURE = {
+    ha: { sid: "vm:100", state: "started", group: "prod", maxRestart: 2, maxRelocate: 3 },
+    replication: [{ id: "100-0", guest: 100, target: "pve2", schedule: "*/15" }],
+    snapshotsDeleted: ["before-upgrade"],
+  }
+  const PLAN = {
+    capture: CAPTURE,
+    restoreHa: true,
+    restoreReplication: true,
+    haState: "started",
+    replicationTarget: "pve2-dr",
+    replicationSchedule: "*/15",
+  }
+
+  function wirePve({ replicationJobs = [] as any[] } = {}) {
+    pveFetchMock.mockImplementation((_conn: any, path: string) => {
+      if (path === "/cluster/replication") return Promise.resolve(replicationJobs)
+      if (path.includes("remote_migrate")) return Promise.resolve("UPID:pve1:0000A:qmigrate:100:root@pam:")
+
+      return Promise.resolve(targetClusterAnswers(path))
+    })
+  }
+
+  const post = async (body: any, params = PARAMS) => {
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+
+    return callRoute(POST, { method: "POST", params, body })
+  }
+
+  beforeEach(() => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    wirePve()
+  })
+
+  it("hands a well-formed plan to the watcher, with the target it was given", async () => {
+    const res = await post({ ...VALID_BODY, targetVmid: "9100", restore: PLAN })
+
+    expect(res.status).toBe(200)
+    expect(watchMigrationMock).toHaveBeenCalledTimes(1)
+    expect(watchMigrationMock.mock.calls[0][0]).toMatchObject({
+      targetVmid: "9100",
+      targetNode: "pve2",
+      restore: { restoreHa: true, restoreReplication: true, haState: "started", replicationTarget: "pve2-dr" },
+    })
+    expect(watchMigrationMock.mock.calls[0][0].restore.capture.replication[0].id).toBe("100-0")
+  })
+
+  it("falls back to the source vmid when no target vmid is asked for", async () => {
+    await post({ ...VALID_BODY, restore: PLAN })
+
+    expect(watchMigrationMock.mock.calls[0][0].targetVmid).toBe("100")
+  })
+
+  // A guest with no HA resource captures `ha: null`, and an older client may not
+  // send the key at all. Both must survive: dropping the plan would also drop the
+  // rollback that puts the source back together after a failed migration.
+  it.each([
+    ["explicit null", null],
+    ["absent", undefined],
+  ])("keeps a plan whose ha capture is %s", async (_label, ha) => {
+    const capture: Record<string, unknown> = { ...CAPTURE, ha }
+    if (ha === undefined) delete capture.ha
+
+    await post({ ...VALID_BODY, restore: { ...PLAN, capture } })
+
+    expect(watchMigrationMock).toHaveBeenCalledTimes(1)
+    expect(watchMigrationMock.mock.calls[0][0].restore).toBeDefined()
+  })
+
+  it.each([
+    ["no capture at all", { restoreHa: true }],
+    ["a capture that is not an object", { capture: "vm:100" }],
+    ["an ha entry without a sid", { capture: { ...CAPTURE, ha: { state: "started" } } }],
+    ["an ha entry with an empty sid", { capture: { ...CAPTURE, ha: { sid: "" } } }],
+    ["an ha entry with a non-string group", { capture: { ...CAPTURE, ha: { sid: "vm:100", group: 7 } } }],
+    ["an ha entry with a non-finite maxRestart", { capture: { ...CAPTURE, ha: { sid: "vm:100", maxRestart: Number.NaN } } }],
+    ["a replication list that is not an array", { capture: { ...CAPTURE, replication: "100-0" } }],
+    ["a replication job without an id", { capture: { ...CAPTURE, replication: [{ guest: 100, target: "pve2" }] } }],
+    ["a replication job whose guest is not a positive integer", { capture: { ...CAPTURE, replication: [{ id: "100-0", guest: 0, target: "pve2" }] } }],
+    ["a replication job whose target is not a string", { capture: { ...CAPTURE, replication: [{ id: "100-0", guest: 100, target: 2 }] } }],
+    ["a replication job whose rate is not a number", { capture: { ...CAPTURE, replication: [{ id: "100-0", guest: 100, target: "pve2", rate: "fast" }] } }],
+    ["a snapshot list holding something else than names", { capture: { ...CAPTURE, snapshotsDeleted: [{ name: "s1" }] } }],
+    ["a non-boolean restoreHa", { capture: CAPTURE, restoreHa: "yes" }],
+    ["a non-string haState", { capture: CAPTURE, haState: 1 }],
+    ["a non-number replicationRate", { capture: CAPTURE, replicationRate: "10" }],
+  ])("drops a plan with %s", async (_label, restore) => {
+    const res = await post({ ...VALID_BODY, restore })
+
+    expect(res.status).toBe(200)
+    expect(watchMigrationMock).toHaveBeenCalledTimes(1)
+    expect(watchMigrationMock.mock.calls[0][0].restore).toBeUndefined()
+  })
+
+  // Proxmox keeps refusing remote_migrate while a replication job is still being
+  // torn down, and answers with a raw perl error. Catch it before the migration.
+  it("returns 409 while Proxmox is still removing the replication job", async () => {
+    wirePve({ replicationJobs: [{ id: "100-0", guest: 100, target: "pve2" }] })
+
+    const res = await post({ ...VALID_BODY, restore: PLAN })
+
+    expect(res.status).toBe(409)
+    expect((await res.json()).error).toMatch(/still removing replication job\(s\) 100-0/i)
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("ignores a replication job that belongs to another guest", async () => {
+    wirePve({ replicationJobs: [{ id: "101-0", guest: 101, target: "pve2" }] })
+
+    const res = await post({ ...VALID_BODY, restore: PLAN })
+
+    expect(res.status).toBe(200)
+    expect(watchMigrationMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Without a plan there is nothing to put back, so the guard must not cost a
+  // round trip to /cluster/replication on every ordinary migration.
+  it("does not query replication when no plan is sent", async () => {
+    const res = await post({ ...VALID_BODY })
+
+    expect(res.status).toBe(200)
+    expect(pveFetchMock.mock.calls.some(([, path]: any[]) => path === "/cluster/replication")).toBe(false)
+  })
+})
+
+// The target node name is resolved to an address (DNS as a last resort) and the
+// target cluster's API token is sent there, so the name must be a PVE node name
+// AND a member of the target cluster, and the certificate pinned must be the one
+// the cluster reports for that node, not whatever the resolved host presents.
+describe("POST .../remote-migrate — target node and fingerprint", () => {
+  const post = async (body: any) => {
+    const POST = (await import("./route")).POST as Parameters<typeof callRoute>[0]
+
+    return callRoute(POST, { method: "POST", params: PARAMS, body })
+  }
+  const targetCalls = () => pveFetchMock.mock.calls.filter(([conn]: any[]) => conn === STUB_TARGET_CONN).map(([, path]: any[]) => path)
+
+  beforeEach(() => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    pveFetchMock.mockImplementation((_conn: any, path: string) =>
+      Promise.resolve(path.includes("remote_migrate") ? "UPID:pve1:0000A:qmigrate:100:root@pam:" : targetClusterAnswers(path)))
+  })
+
+  it("400 on a targetNode with shell metacharacters, before the target cluster is contacted", async () => {
+    const res = await post({ ...VALID_BODY, targetNode: "pve2$(id)" })
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/invalid targetNode/i)
+    expect(targetCalls()).toEqual([])
+    expect(getNodeIpMock).not.toHaveBeenCalled()
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("400 when the node is not in the target cluster's node list, before any resolution", async () => {
+    const res = await post({ ...VALID_BODY, targetNode: "pve9.attacker.example" })
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/not a node of the target cluster/)
+    expect(targetCalls()).toEqual(["/nodes"])
+    expect(getNodeIpMock).not.toHaveBeenCalled()
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("400 when the target cluster's node list cannot be read", async () => {
+    pveFetchMock.mockImplementation((_conn: any, path: string) =>
+      path === "/nodes" ? Promise.reject(new Error("401 permission denied")) : Promise.resolve([]))
+
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/Could not list the nodes of the target cluster/)
+    expect(getNodeIpMock).not.toHaveBeenCalled()
+  })
+
+  it("pins the fingerprint the target API reports for the node's pveproxy certificate", async () => {
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(200)
+    expect(targetCalls()).toEqual(["/nodes", "/nodes/pve2/certificates/info"])
+    expect(sentTargetEndpoint()).toContain(`fingerprint=${TARGET_FP}`)
+    expect(sentTargetEndpoint()).toContain("host=10.0.0.2")
+  })
+
+  it("refuses when the resolved host presents another certificate than the one the cluster reports", async () => {
+    tlsState.fingerprint = "EE:".repeat(31) + "EE"
+
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/does not present the certificate the target cluster reports/)
+    expect(pveFetchMock.mock.calls.some(([, path]: any[]) => path.includes("remote_migrate"))).toBe(false)
+    expect(watchMigrationMock).not.toHaveBeenCalled()
+  })
+
+  it("falls back to the cluster's pve_fp, then to the TLS capture, when the node's certificate list is unreadable", async () => {
+    const clusterFp = "22:".repeat(31) + "22"
+    pveFetchMock.mockImplementation((_conn: any, path: string) => {
+      if (path.includes("remote_migrate")) return Promise.resolve("UPID:pve1:0000A:qmigrate:100:root@pam:")
+      if (path === "/nodes/pve2/certificates/info") return Promise.reject(new Error("403"))
+      if (path === "/cluster/config/nodes") return Promise.resolve([{ name: "pve1", pve_fp: "33:".repeat(31) + "33" }, { name: "pve2", pve_fp: clusterFp }])
+      return Promise.resolve(targetClusterAnswers(path))
+    })
+    tlsState.fingerprint = clusterFp
+    expect((await post(VALID_BODY)).status).toBe(200)
+    expect(sentTargetEndpoint()).toContain(`fingerprint=${clusterFp}`)
+
+    pveFetchMock.mockImplementation((_conn: any, path: string) => {
+      if (path.includes("remote_migrate")) return Promise.resolve("UPID:pve1:0000A:qmigrate:100:root@pam:")
+      if (path === "/nodes") return Promise.resolve([{ node: "pve2" }])
+      return Promise.reject(new Error("403"))
+    })
+    tlsState.fingerprint = "44:".repeat(31) + "44"
+    expect((await post(VALID_BODY)).status).toBe(200)
+    expect(sentTargetEndpoint()).toContain(`fingerprint=${"44:".repeat(31)}44`)
+  })
+
+  it("400 when neither the API nor the handshake yields a fingerprint", async () => {
+    pveFetchMock.mockImplementation((_conn: any, path: string) =>
+      path === "/nodes" ? Promise.resolve([{ node: "pve2" }]) : Promise.reject(new Error("403")))
+    tlsState.fingerprint = ""
+
+    const res = await post(VALID_BODY)
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/Could not retrieve TLS fingerprint/)
+  })
+})

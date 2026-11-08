@@ -1,0 +1,156 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+// The API token guard is covered by routeGuard.test.ts and writeContract.test.ts:
+// pass-through so this file keeps testing the handler, as for a session caller.
+// The vDC guest guard (lib/vdc/guestGuard.ts) has its own tests: pass-through
+// here, as for a provider session.
+vi.mock('@/lib/vdc/guestGuard', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/vdc/guestGuard')>()),
+  guardSessionGuest: async () => null,
+}))
+vi.mock('@/lib/api-tokens/routeGuard', () => ({
+  withPublicApiGuard: (_entryId: string, handler: any) => handler,
+}))
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+
+vi.mock('@/lib/connections/getConnection', () => ({
+  getConnectionById: vi.fn<(id: string) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/proxmox/client', () => ({
+  pveFetch: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: vi.fn<(...args: any[]) => Promise<any>>(),
+  buildVmResourceId: vi.fn<(id: string, node: string, type: string, vmid: string) => string>(
+    (id, node, type, vmid) => `${id}/${node}/${type}/${vmid}`,
+  ),
+  PERMISSIONS: { VM_CONFIG: 'vm.config', VM_VIEW: 'vm.view' },
+}))
+
+vi.mock('@/lib/ssh/exec', () => ({
+  executeSSH: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/ssh/node-ip', () => ({
+  getNodeIp: vi.fn<(...args: any[]) => Promise<string>>(),
+}))
+// Routes resolve the node through resolveNodeSshEndpoint; keep the address
+// coming from the getNodeIp mock above and the connection port (22).
+vi.mock('@/lib/ssh/node-endpoint', async () => {
+  const nodeIp = await import('@/lib/ssh/node-ip')
+  return {
+    ...(await import('@/lib/ssh/node-endpoint-core')),
+    resolveNodeSshEndpoint: async (conn: any, node: string) =>
+      ({ host: await nodeIp.getNodeIp(conn, node), port: 22, source: 'proxmox' }),
+  }
+})
+
+// NOTE: @/lib/ssh/validate is intentionally NOT mocked — the real assertVmid
+// is what this suite exercises.
+
+import { POST } from './route'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { pveFetch } from '@/lib/proxmox/client'
+import { checkPermission } from '@/lib/rbac'
+import { executeSSH } from '@/lib/ssh/exec'
+import { getNodeIp } from '@/lib/ssh/node-ip'
+import { PveLicenseExcludedError } from '@/lib/license/exclusions'
+
+const getConnectionByIdMock = getConnectionById as any
+const pveFetchMock = pveFetch as any
+const checkPermissionMock = checkPermission as any
+const executeSSHMock = executeSSH as any
+const getNodeIpMock = getNodeIp as any
+
+const CONN_ID = 'conn-1'
+const NODE = 'pve-node-01'
+const NODE_IP = '10.0.0.1'
+
+const baseParams = { id: CONN_ID, type: 'qemu', node: NODE, vmid: '100' }
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  checkPermissionMock.mockResolvedValue(null)
+  getConnectionByIdMock.mockResolvedValue({ id: CONN_ID })
+  pveFetchMock.mockResolvedValue({ lock: 'backup' })
+  getNodeIpMock.mockResolvedValue(NODE_IP)
+  executeSSHMock.mockResolvedValue({ success: true, output: 'ok' })
+})
+
+describe('POST .../unlock — happy path', () => {
+  it('unlocks a QEMU VM and runs `qm unlock <vmid>` over SSH', async () => {
+    const res = await callRoute(POST as any, { method: 'POST', params: baseParams })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.unlocked).toBe(true)
+    expect(executeSSHMock).toHaveBeenCalledWith(CONN_ID, expect.objectContaining({ host: NODE_IP }), 'qm unlock 100')
+  })
+
+  it('uses `pct unlock` for LXC containers', async () => {
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: { ...baseParams, type: 'lxc' },
+    })
+    expect(res.status).toBe(200)
+    expect(executeSSHMock).toHaveBeenCalledWith(CONN_ID, expect.objectContaining({ host: NODE_IP }), 'pct unlock 100')
+  })
+
+  it('rejects a vmid with leading zeros (grammar) with 400', async () => {
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: { ...baseParams, vmid: '00100' },
+    })
+    expect(res.status).toBe(400)
+    expect(executeSSHMock).not.toHaveBeenCalled()
+  })
+
+  it('answers 403 with its code when the cluster is outside the license (roadmap#58)', async () => {
+    // executeSSH refused the unlock itself, before any SSH: the route must
+    // say so with the code the UI recognises, not a generic 500.
+    executeSSHMock.mockRejectedValue(new PveLicenseExcludedError(CONN_ID))
+    const res = await callRoute(POST as any, { method: 'POST', params: baseParams })
+    expect(res.status).toBe(403)
+    const body = await readJson<any>(res)
+    expect(body).toMatchObject({ code: 'CONNECTION_LICENSE_EXCLUDED' })
+    expect(body.error).toBe('This cluster is outside the license: ProxCenter refuses any change on it.')
+  })
+})
+
+describe('POST .../unlock — vmid validation (command injection)', () => {
+  const MALICIOUS = [
+    '100; touch /tmp/pwn',
+    '$(id)',
+    '`whoami`',
+    '100 && reboot',
+    '100|cat /etc/passwd',
+    '100abc',
+  ]
+
+  for (const vmid of MALICIOUS) {
+    it(`rejects ${JSON.stringify(vmid)} with 400 and never runs SSH`, async () => {
+      const res = await callRoute(POST as any, { method: 'POST', params: { ...baseParams, vmid } })
+      expect(res.status).toBe(400)
+      const body = await readJson<any>(res)
+      expect(body.error).toMatch(/invalid vmid/i)
+      // Rejection happens before RBAC / config probe / SSH.
+      expect(checkPermissionMock).not.toHaveBeenCalled()
+      expect(pveFetchMock).not.toHaveBeenCalled()
+      expect(executeSSHMock).not.toHaveBeenCalled()
+    })
+  }
+})
+
+describe('POST .../unlock: SSH failure (roadmap#99)', () => {
+  it('answers a generic message with the manual hint, never the raw SSH error', async () => {
+    executeSSHMock.mockResolvedValueOnce({ success: false, error: 'connect ECONNREFUSED 10.42.0.250:22' })
+    const res = await callRoute(POST as any, { method: 'POST', params: baseParams })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('The unlock command could not be run on the node')
+    expect(body.hint).toBe('Run manually on PVE node: qm unlock 100')
+    expect(JSON.stringify(body)).not.toContain('10.42.0.250')
+  })
+})

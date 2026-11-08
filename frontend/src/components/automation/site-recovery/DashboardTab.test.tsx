@@ -1,0 +1,147 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup } from '@testing-library/react'
+
+import { renderWithProviders, screen } from '@/__tests__/setup/renderWithProviders'
+import type { ReplicationHealthStatus, ReplicationJob } from '@/lib/orchestrator/site-recovery.types'
+
+import DashboardTab from './DashboardTab'
+
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+function health(overrides: Partial<ReplicationHealthStatus> = {}): ReplicationHealthStatus {
+  return {
+    sites: [{
+      cluster_id: 'source-cluster',
+      name: 'Source cluster',
+      role: 'primary',
+      status: 'online',
+      node_count: 1,
+      vm_count: 3,
+    }],
+    connectivity: 'connected',
+    latency_ms: 2,
+    kpis: {
+      protected_vms: 3,
+      unprotected_vms: 0,
+      avg_rpo_seconds: 60,
+      last_sync: '',
+      replicated_bytes: 0,
+      error_count: 0,
+      total_jobs: 3,
+      rpo_compliance: 100,
+      concurrent_jobs: 0,
+      max_concurrent_jobs: 2,
+    },
+    recent_activity: [],
+    job_summary: {
+      synced: 1,
+      syncing: 0,
+      pending: 0,
+      error: 0,
+      paused: 0,
+      no_match: 0,
+      partial: 0,
+    },
+    ...overrides,
+  }
+}
+
+function renderDashboard(value: ReplicationHealthStatus | undefined) {
+  renderWithProviders(
+    <DashboardTab
+      health={value}
+      loading={false}
+      jobs={[]}
+      connections={[]}
+      vmNamesByConn={{}}
+      onSyncJob={vi.fn()}
+    />,
+  )
+}
+
+describe('DashboardTab job status distribution', () => {
+  it('renders the no-match segment and count', () => {
+    renderDashboard(health({
+      job_summary: {
+        synced: 1,
+        syncing: 0,
+        pending: 0,
+        error: 0,
+        paused: 0,
+        no_match: 2,
+        partial: 0,
+      },
+    }))
+
+    const label = screen.getByText(/No matching VMs/)
+    expect(label).toHaveTextContent('No matching VMs: 2')
+  })
+
+  it('renders the partially synced segment and count', () => {
+    renderDashboard(health({
+      job_summary: {
+        synced: 1,
+        syncing: 0,
+        pending: 0,
+        error: 0,
+        paused: 0,
+        no_match: 0,
+        partial: 1,
+      },
+    }))
+
+    expect(screen.getByText(/Partially synced/)).toHaveTextContent('Partially synced: 1')
+  })
+
+  it('treats a missing partial count (older orchestrator) as zero', () => {
+    renderDashboard(health({
+      job_summary: {
+        synced: 1,
+        syncing: 0,
+        pending: 0,
+        error: 0,
+        paused: 0,
+        no_match: 0,
+      } as any,
+    }))
+
+    expect(screen.getByText(/Synced/)).toHaveTextContent('Synced: 1')
+    expect(screen.queryByText(/Partially synced/)).not.toBeInTheDocument()
+  })
+
+  it('treats a missing no_match count as zero', () => {
+    renderDashboard(health({
+      job_summary: {
+        synced: 1,
+        syncing: 0,
+        pending: 0,
+        error: 0,
+        paused: 0,
+      } as any,
+    }))
+
+    expect(screen.getByText(/Synced/)).toHaveTextContent('Synced: 1')
+    expect(screen.queryByText(/No matching VMs/)).not.toBeInTheDocument()
+  })
+
+  it('renders the empty state when health is unavailable', () => {
+    renderDashboard(undefined)
+
+    expect(screen.getByText('No replication job configured')).toBeInTheDocument()
+  })
+})
+
+it.each(['single', 'multiple', 'mixed'] as const)('renders engine glyphs and ZFS target nodes for %s replication pairs', mode => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]')))
+  const base = { id: 'j1', name: 'ZFS job', storage_engine: 'zfs', source_cluster: 'source-cluster', target_cluster: 'dr', target_pool: 'local-zfs', target_node: 'dr1', status: 'synced', vm_ids: [100], vm_names: ['web'], tags: [], rpo_target: 900, throughput_bps: 0, progress_percent: 0 }
+  const jobs = [base]
+  if (mode === 'multiple') jobs.push({ ...base, id: 'j2', target_cluster: 'dr2', target_node: 'dr2' })
+  if (mode === 'mixed') jobs.push({ ...base, id: 'j2', storage_engine: 'rbd', target_pool: 'rbd', target_node: '' })
+  const value = health()
+  value.sites.push({ ...value.sites[0], cluster_id: 'dr', name: 'DR', role: 'dr' })
+  renderWithProviders(<DashboardTab health={value} loading={false} jobs={jobs as ReplicationJob[]} connections={[]} onSyncJob={vi.fn()} />)
+  expect(screen.getAllByRole('img', { name: 'ZFS' }).length).toBeGreaterThanOrEqual(2)
+  expect(screen.getByText(/local-zfs · dr1/)).toBeInTheDocument()
+  if (mode === 'mixed') expect(screen.getAllByRole('img', { name: 'Ceph RBD' }).length).toBeGreaterThanOrEqual(2)
+  else expect(screen.queryByRole('img', { name: 'Ceph RBD' })).not.toBeInTheDocument()
+})

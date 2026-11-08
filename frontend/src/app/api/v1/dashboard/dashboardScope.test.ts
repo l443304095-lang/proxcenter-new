@@ -1,0 +1,700 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+import { callRoute } from "../../../../__tests__/setup/route-test"
+import { vmScope } from "@/__tests__/setup/rbacScope"
+
+// Hoist mocks so they can be referenced in vi.mock factories
+const { globalFindMany, sessionFindMany, alertFindUniqueMock, alertUpdateManyMock, getInfraMock, mockGetServerSession, mockListSnapshotsInNamespace, mockPbsFetch, rbacScopeMock, fetchOrchAlertsMock } = vi.hoisted(() => ({
+  globalFindMany: vi.fn(),
+  sessionFindMany: vi.fn(),
+  alertFindUniqueMock: vi.fn().mockResolvedValue(null),
+  alertUpdateManyMock: vi.fn().mockResolvedValue({}),
+  getInfraMock: vi.fn(),
+  mockGetServerSession: vi.fn(),
+  mockListSnapshotsInNamespace: vi.fn(),
+  mockPbsFetch: vi.fn(),
+  rbacScopeMock: vi.fn(),
+  fetchOrchAlertsMock: vi.fn(),
+}))
+
+// G20: the bell's tenant filter (isAlertVisibleToTenant) runs on the merged
+// orchestrator alerts; its inputs are driven per test.
+const alertTenant = vi.hoisted(() => ({
+  current: "default",
+  connectionIds: new Set<string>(["p1", "p2"]),
+  vdcVmids: new Map<string, Set<string>>(),
+  ruleOwners: new Map<string, string>(),
+}))
+vi.mock("@/lib/alerts/vdcVmids", () => ({ getVdcVmidsByConnection: async () => alertTenant.vdcVmids }))
+vi.mock("@/lib/alerts/ruleOwners", () => ({
+  ruleVisibleToTenant: async (ruleId: string, tenantId: string) => (alertTenant.ruleOwners.get(ruleId) ?? "default") === tenantId,
+}))
+
+// Keep REAL inventoryConnectionPlan + maskingScope; only mock getTenantInfrastructureScope
+vi.mock("@/lib/tenant/infraScope", async (orig) => ({
+  ...(await orig<typeof import("@/lib/tenant/infraScope")>()),
+  getTenantInfrastructureScope: (...a: any[]) => getInfraMock(...a),
+}))
+
+// Session prisma (tenant-scoped client) -- also stubs alert table used by syncAlertsToDatabase
+vi.mock("@/lib/tenant", () => ({
+  getSessionPrisma: async () => ({
+    connection: { findMany: sessionFindMany },
+    alert: {
+      findUnique: alertFindUniqueMock,
+      create: vi.fn().mockResolvedValue({}),
+      update: vi.fn().mockResolvedValue({}),
+      updateMany: alertUpdateManyMock,
+    },
+  }),
+  getCurrentTenantId: async () => alertTenant.current,
+  getTenantConnectionIds: async () => alertTenant.connectionIds,
+  DEFAULT_TENANT_ID: "default",
+}))
+
+// Global prisma -- also stubs alert table used by syncAlertsToDatabase
+vi.mock("@/lib/db/prisma", () => ({
+  prisma: {
+    connection: { findMany: globalFindMany },
+    alert: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({}),
+      update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({}),
+    },
+  },
+}))
+
+// Auth session -- use hoisted mock so we can change tenantId per test
+vi.mock("next-auth", () => ({
+  getServerSession: mockGetServerSession,
+}))
+
+// Stub getConnectionById so PVE/PBS fetches short-circuit (no baseUrl means the handler returns null early)
+const { getConnByIdMock, getPbsConnByIdMock } = vi.hoisted(() => ({
+  getConnByIdMock: vi.fn().mockResolvedValue({ baseUrl: "", apiToken: "" }),
+  getPbsConnByIdMock: vi.fn().mockResolvedValue({ baseUrl: "", apiToken: "" }),
+}))
+vi.mock("@/lib/connections/getConnection", () => ({
+  getConnectionById: (...a: any[]) => getConnByIdMock(...a),
+  getPbsConnectionById: (...a: any[]) => getPbsConnByIdMock(...a),
+}))
+
+// No-op PVE fetch
+vi.mock("@/lib/proxmox/client", () => ({ pveFetch: vi.fn().mockResolvedValue([]) }))
+// PBS fetch — controlled per-test via mockPbsFetch
+vi.mock("@/lib/proxmox/pbs-client", () => ({ pbsFetch: (...a: any[]) => mockPbsFetch(...a) }))
+// PBS namespace helper — controlled per-test via mockListSnapshotsInNamespace
+vi.mock("@/lib/proxmox/pbsNamespace", () => ({
+  listSnapshotsInNamespace: (...a: any[]) => mockListSnapshotsInNamespace(...a),
+}))
+
+// No stored threshold settings
+vi.mock("@/lib/db/settings", () => ({ getSetting: vi.fn().mockResolvedValue(null) }))
+
+// RBAC -- pass everything through
+vi.mock("@/lib/rbac", () => ({
+  filterVmsByPermission: (_uid: any, list: any[]) => Promise.resolve(list),
+  filterNodesByPermission: (_uid: any, list: any[]) => Promise.resolve(list),
+  checkPermission: vi.fn().mockResolvedValue(null),
+  getCurrentRbacInfraScope: rbacScopeMock,
+  PERMISSIONS: { VM_VIEW: "vm.view", NODE_VIEW: "node.view", ALERTS_VIEW: "alerts.view" },
+}))
+vi.mock("@/lib/alerts/visibility", async (orig) => ({
+  ...(await orig<typeof import("@/lib/alerts/visibility")>()),
+  isAlertInRbacScope: vi.fn().mockReturnValue(true),
+}))
+
+// Stub orchestrator + alert helpers
+vi.mock("@/lib/orchestrator/client", () => ({
+  alertsApi: { getAlerts: vi.fn().mockRejectedValue(new Error("no orch")) },
+}))
+vi.mock("@/lib/alerts/dashboardOrchAlerts", () => ({
+  fetchDashboardOrchAlerts: (...a: any[]) => fetchOrchAlertsMock(...a),
+}))
+vi.mock("@/lib/alerts/silenceFilter", () => ({
+  loadActiveSilenceFingerprints: vi.fn().mockResolvedValue(new Set()),
+}))
+vi.mock("@/lib/alerts/dashboardAlertMerge", () => ({
+  mergeAndFilterDashboardAlerts: vi.fn().mockReturnValue([]),
+}))
+vi.mock("@/lib/demo/demo-api", () => ({ demoResponse: vi.fn().mockReturnValue(null) }))
+vi.mock("@/lib/auth/config", () => ({ authOptions: {} }))
+// Stub vdc/scope so the current code path (getVdcScope) does not blow up before we replace it
+vi.mock("@/lib/vdc/scope", () => ({
+  getVdcScope: vi.fn().mockResolvedValue(null),
+  applyVdcFilter: vi.fn((items: any[]) => items),
+}))
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // Reset finders to return empty lists
+  globalFindMany.mockResolvedValue([])
+  sessionFindMany.mockResolvedValue([])
+  rbacScopeMock.mockResolvedValue(null)
+  getConnByIdMock.mockResolvedValue({ baseUrl: "", apiToken: "" })
+  getPbsConnByIdMock.mockResolvedValue({ baseUrl: "", apiToken: "" })
+  // Default session: provider tenant
+  mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "default" } })
+  // Default PBS fetch: return empty arrays (no-op)
+  mockPbsFetch.mockResolvedValue([])
+  // Default namespace snapshot fetch: return empty
+  mockListSnapshotsInNamespace.mockResolvedValue([])
+  fetchOrchAlertsMock.mockResolvedValue({})
+  alertTenant.current = "default"
+  alertTenant.connectionIds = new Set(["p1", "p2"])
+  alertTenant.vdcVmids = new Map()
+  alertTenant.ruleOwners = new Map()
+})
+
+describe("RBAC infra scope (issue #525)", () => {
+  beforeEach(() => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    globalFindMany.mockResolvedValue([
+      { id: "p1", name: "PVE 1", type: "pve", hasCeph: false, tenantId: "default" },
+      { id: "p2", name: "PVE 2", type: "pve", hasCeph: false, tenantId: "default" },
+      { id: "pbs-1", name: "PBS 1", type: "pbs", hasCeph: false, tenantId: "default" },
+      { id: "pbs-2", name: "PBS 2", type: "pbs", hasCeph: false, tenantId: "default" },
+    ])
+  })
+
+  it("loads only the granted PVE connection for a node scope", async () => {
+    rbacScopeMock.mockResolvedValue({
+      fullConnections: new Set(),
+      nodesByConnection: new Map([["p1", new Set(["n1"])]]),
+      guestDerived: false,
+    })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    const body = await res.json()
+    const clusterIds = (body.data.clusters ?? []).map((cluster: any) => cluster.id)
+
+    expect(getConnByIdMock).toHaveBeenCalledWith("p1", "default")
+    expect(getConnByIdMock).not.toHaveBeenCalledWith("p2", expect.anything())
+    expect(getPbsConnByIdMock).not.toHaveBeenCalled()
+    expect(clusterIds).not.toContain("p2")
+    expect(body.data.summary.standalones + body.data.summary.clusters).toBe(1)
+  })
+
+  it("loads only fully granted PVE and PBS connections", async () => {
+    rbacScopeMock.mockResolvedValue({
+      fullConnections: new Set(["p1", "pbs-1"]),
+      nodesByConnection: new Map(),
+      guestDerived: false,
+    })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+
+    expect(res.status).toBe(200)
+    expect(getConnByIdMock).toHaveBeenCalledWith("p1", "default")
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-1", "default")
+    expect(getPbsConnByIdMock).not.toHaveBeenCalledWith("pbs-2", expect.anything())
+  })
+
+  it("opens every provider connection for an admin", async () => {
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+
+    expect(res.status).toBe(200)
+    expect(getConnByIdMock).toHaveBeenCalledWith("p1", "default")
+    expect(getConnByIdMock).toHaveBeenCalledWith("p2", "default")
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-1", "default")
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-2", "default")
+    expect(rbacScopeMock).toHaveBeenCalledWith(["vm.view", "node.view"])
+  })
+
+  it("fetches only guests and omits infrastructure aggregates for a VM-only user", async () => {
+    rbacScopeMock.mockResolvedValue(vmScope("p1", "n1", "100"))
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    const body = await res.json()
+
+    expect(getConnByIdMock).toHaveBeenCalledWith("p1", "default")
+    expect(getConnByIdMock).not.toHaveBeenCalledWith("p2", expect.anything())
+    expect(body.data.clusters).toEqual([])
+    expect(body.data.summary.clusters + body.data.summary.standalones).toBe(0)
+    expect(getPbsConnByIdMock).not.toHaveBeenCalled()
+  })
+
+  it("skips alert synchronization for a scoped caller", async () => {
+    rbacScopeMock.mockResolvedValue(vmScope("p1", "n1", "100"))
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    await res.json()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(alertUpdateManyMock).not.toHaveBeenCalled()
+    expect(alertFindUniqueMock).not.toHaveBeenCalled()
+  })
+
+  it("runs alert synchronization for an unrestricted admin", async () => {
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    await vi.waitFor(() => expect(alertUpdateManyMock).toHaveBeenCalled())
+  })
+})
+
+describe("GET /api/v1/dashboard scope routing", () => {
+  it("provider: uses the GLOBAL prisma client and does not call session client", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    expect(globalFindMany).toHaveBeenCalled()
+    expect(sessionFindMany).not.toHaveBeenCalled()
+  })
+
+  it("provider: passes each connection's own tenantId to getConnectionById and getPbsConnectionById", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    // Return one PVE connection owned by an MSP tenant and one PBS connection owned by the same
+    globalFindMany.mockResolvedValue([
+      { id: "conn-msp-1", name: "MSP PVE", type: "pve", hasCeph: false, tenantId: "msp-1" },
+      { id: "pbs-msp-1", name: "MSP PBS", type: "pbs", hasCeph: false, tenantId: "msp-1" },
+    ])
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    expect(getConnByIdMock).toHaveBeenCalledWith("conn-msp-1", "msp-1")
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-msp-1", "msp-1")
+  })
+
+  it("msp: uses the SESSION (tenant-scoped) prisma client and does not call global client", async () => {
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["c1"]) })
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "msp-1" } })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    expect(sessionFindMany).toHaveBeenCalled()
+    expect(globalFindMany).not.toHaveBeenCalled()
+  })
+
+  it("iaas: uses GLOBAL client and PVE connections are filtered to vDC ids", async () => {
+    const vdcScope = {
+      connectionIds: new Set(["p1"]),
+      pbsConnectionIds: new Set(["pbs-allowed"]),
+      nodesByConnection: new Map<string, Set<string>>(),
+      poolsByConnection: new Map<string, Set<string>>(),
+    }
+    getInfraMock.mockResolvedValue({ kind: "iaas", vdcScope })
+
+    // Return two PVE connections (only p1 is in-scope) plus two PBS connections
+    // (pbs-allowed is in-scope, pbs-other must be excluded for the tenant)
+    globalFindMany.mockResolvedValue([
+      { id: "p1", name: "PVE 1", type: "pve", hasCeph: false, tenantId: "default" },
+      { id: "p2", name: "PVE 2", type: "pve", hasCeph: false, tenantId: "default" },
+      { id: "pbs-allowed", name: "PBS Allowed", type: "pbs", hasCeph: false, tenantId: "default" },
+      { id: "pbs-other", name: "PBS Other", type: "pbs", hasCeph: false, tenantId: "default" },
+    ])
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    // Global client used, session client not called
+    expect(globalFindMany).toHaveBeenCalled()
+    expect(sessionFindMany).not.toHaveBeenCalled()
+
+    // p2 must not appear in the clusters list
+    const body = await res.clone().json()
+    const clusterIds = (body.data?.clusters ?? []).map((c: any) => c.id)
+    expect(clusterIds).not.toContain("p2")
+
+    // PBS filter: only the in-scope PBS connection must be opened
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-allowed", "default")
+    // The out-of-scope PBS must never be opened (cross-tenant data leak guard)
+    expect(getPbsConnByIdMock).not.toHaveBeenCalledWith("pbs-other", expect.anything())
+  })
+
+  it("provider: out-of-pool PBS connections are loaded (no PBS filter for provider)", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    // Provider sees all PBS servers regardless of tenant ownership
+    globalFindMany.mockResolvedValue([
+      { id: "pbs-tenant-a", name: "PBS Tenant A", type: "pbs", hasCeph: false, tenantId: "tenant-a" },
+      { id: "pbs-tenant-b", name: "PBS Tenant B", type: "pbs", hasCeph: false, tenantId: "tenant-b" },
+    ])
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    // Both PBS connections must be opened for the provider (full NOC visibility)
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-tenant-a", "tenant-a")
+    expect(getPbsConnByIdMock).toHaveBeenCalledWith("pbs-tenant-b", "tenant-b")
+  })
+
+  it("provider: uses bulk /snapshots endpoint and does NOT use listSnapshotsInNamespace", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+
+    globalFindMany.mockResolvedValue([
+      { id: "pbs-1", name: "PBS Main", type: "pbs", hasCeph: false, tenantId: "default" },
+    ])
+    getPbsConnByIdMock.mockResolvedValue({ baseUrl: "https://pbs.example.com", apiToken: "tok" })
+
+    // PBS /admin/datastore returns two stores
+    const now = Math.floor(Date.now() / 1000)
+    mockPbsFetch.mockImplementation(async (_conn: any, path: string) => {
+      if (path === "/admin/datastore") return [{ store: "store1" }, { store: "store2" }]
+      if (path.includes("/status")) return { total: 1000, used: 500, avail: 500 }
+      if (path.includes("/snapshots")) return [{ "backup-time": now - 100, "backup-type": "vm" }]
+      if (path.includes("/tasks")) return []
+      return []
+    })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    // Provider must NOT use namespace-scoped snapshots
+    expect(mockListSnapshotsInNamespace).not.toHaveBeenCalled()
+
+    // The bulk /snapshots endpoint must have been called for both stores
+    const snapshotCalls = mockPbsFetch.mock.calls.filter(([, p]: [any, string]) =>
+      typeof p === "string" && p.includes("/snapshots")
+    )
+    expect(snapshotCalls.length).toBeGreaterThanOrEqual(2)
+
+    // Provider must fetch /status for each datastore and report real capacity (not zeros).
+    const statusCalls = mockPbsFetch.mock.calls.filter(([, p]: [any, string]) =>
+      typeof p === "string" && p.includes("/status")
+    )
+    expect(statusCalls.length).toBeGreaterThanOrEqual(2)
+
+    const body = await res.clone().json()
+    const pbsData = body.data?.pbs
+    // Real total/used values from the mock (1000 * 2 stores = 2000)
+    expect(pbsData?.totalSize).toBe(2000)
+    expect(pbsData?.totalUsed).toBe(1000)
+    expect(pbsData?.usagePct).toBe(50)
+  })
+
+  it("iaas: PBS aggregation is namespace-scoped (only store1/tenant-a, not store2)", async () => {
+    // IaaS tenant whose vDC grants access to store1 / namespace tenant-a only.
+    const pbsNamespacesByConnection = new Map([
+      ["pbs-shared", [{ datastore: "store1", namespace: "tenant-a" }]],
+    ])
+    const vdcScope = {
+      connectionIds: new Set<string>(),
+      pbsConnectionIds: new Set(["pbs-shared"]),
+      nodesByConnection: new Map<string, Set<string>>(),
+      poolsByConnection: new Map<string, Set<string>>(),
+      storagesByConnection: new Map<string, Set<string>>(),
+      pbsNamespacesByConnection,
+    }
+    getInfraMock.mockResolvedValue({ kind: "iaas", vdcScope })
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "iaas-tenant" } })
+
+    globalFindMany.mockResolvedValue([
+      { id: "pbs-shared", name: "PBS Shared", type: "pbs", hasCeph: false, tenantId: "default" },
+    ])
+    getPbsConnByIdMock.mockResolvedValue({ baseUrl: "https://pbs.example.com", apiToken: "tok" })
+
+    // PBS /admin/datastore returns two stores; only store1 belongs to the tenant
+    const now = Math.floor(Date.now() / 1000)
+    mockPbsFetch.mockImplementation(async (_conn: any, path: string) => {
+      if (path === "/admin/datastore") return [{ store: "store1" }, { store: "store2" }]
+      if (path.includes("store1") && path.includes("/status")) return { total: 2000, used: 800, avail: 1200 }
+      if (path.includes("store2") && path.includes("/status")) return { total: 5000, used: 3000, avail: 2000 }
+      // Tasks must NOT be called for IaaS
+      if (path.includes("/tasks")) throw new Error("tasks must not be fetched for IaaS")
+      return []
+    })
+
+    // listSnapshotsInNamespace returns 2 recent snapshots for store1/tenant-a
+    mockListSnapshotsInNamespace.mockImplementation(
+      async (_conn: any, datastore: string, namespace: string) => {
+        if (datastore === "store1" && namespace === "tenant-a") {
+          return [
+            { "backup-time": now - 3600, "backup-type": "vm" },
+            { "backup-time": now - 7200, "backup-type": "ct" },
+          ]
+        }
+        return []
+      }
+    )
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    // listSnapshotsInNamespace called for store1/tenant-a and NOT for store2
+    expect(mockListSnapshotsInNamespace).toHaveBeenCalledWith(
+      expect.anything(), "store1", "tenant-a"
+    )
+    expect(mockListSnapshotsInNamespace).not.toHaveBeenCalledWith(
+      expect.anything(), "store2", expect.anything()
+    )
+
+    // The bulk /snapshots endpoint must NOT have been called (namespace path used instead)
+    const bulkSnapshotCalls = mockPbsFetch.mock.calls.filter(([, p]: [any, string]) =>
+      typeof p === "string" && p.includes("/snapshots")
+    )
+    expect(bulkSnapshotCalls).toHaveLength(0)
+
+    const body = await res.clone().json()
+    const pbsData = body.data?.pbs
+
+    // Only store1 processed: datastoreCount = 1
+    expect(pbsData?.datastores).toBe(1)
+
+    // Backup count reflects the 2 namespace snapshots (no task-based additions)
+    expect(pbsData?.backups24h?.total).toBe(2)
+    expect(pbsData?.backups24h?.ok).toBe(2)
+    expect(pbsData?.backups24h?.error).toBe(0)
+
+    // No recent task errors for IaaS
+    expect(pbsData?.recentErrors).toHaveLength(0)
+
+    // IaaS must NOT expose datastore-wide capacity (cross-tenant storage leak guard).
+    // The /status endpoint must never be called for IaaS — capacity is zeroed out.
+    const statusCalls = mockPbsFetch.mock.calls.filter(([, p]: [any, string]) =>
+      typeof p === "string" && p.includes("/status")
+    )
+    expect(statusCalls).toHaveLength(0)
+
+    // Aggregated PBS capacity must be zero for IaaS (no shared capacity exposed).
+    expect(pbsData?.totalSize).toBe(0)
+    expect(pbsData?.totalUsed).toBe(0)
+    expect(pbsData?.usagePct).toBe(0)
+
+    // Per-datastore capacity must also be zeroed.
+    const ds = (pbsData?.serverDetails ?? [])[0]
+    expect(ds?.totalSize).toBe(0)
+    expect(ds?.totalUsed).toBe(0)
+  })
+
+  it("iaas: PBS connection with no assigned namespace is skipped entirely", async () => {
+    // IaaS tenant that has pbs-shared in pbsConnectionIds but no namespace entries
+    const pbsNamespacesByConnection = new Map<string, Array<{ datastore: string; namespace: string }>>()
+    const vdcScope = {
+      connectionIds: new Set<string>(),
+      pbsConnectionIds: new Set(["pbs-shared"]),
+      nodesByConnection: new Map<string, Set<string>>(),
+      poolsByConnection: new Map<string, Set<string>>(),
+      storagesByConnection: new Map<string, Set<string>>(),
+      pbsNamespacesByConnection,
+    }
+    getInfraMock.mockResolvedValue({ kind: "iaas", vdcScope })
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "iaas-tenant-2" } })
+
+    globalFindMany.mockResolvedValue([
+      { id: "pbs-shared", name: "PBS Shared", type: "pbs", hasCeph: false, tenantId: "default" },
+    ])
+    getPbsConnByIdMock.mockResolvedValue({ baseUrl: "https://pbs.example.com", apiToken: "tok" })
+
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    // No datastores or snapshots should be fetched if the tenant has no namespaces on this PBS
+    expect(mockPbsFetch).not.toHaveBeenCalled()
+    expect(mockListSnapshotsInNamespace).not.toHaveBeenCalled()
+
+    const body = await res.clone().json()
+    expect(body.data?.pbs?.datastores).toBe(0)
+  })
+})
+
+describe("orchestrator alerts (#1012)", () => {
+  const active = [{ connection_id: "p1", type: "cpu", resource: "n1" }]
+  const acknowledged = [{ connection_id: "p1", type: "memory", resource: "n1" }]
+
+  beforeEach(() => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    vi.stubEnv("ORCHESTRATOR_URL", "http://orchestrator:8080")
+    fetchOrchAlertsMock.mockResolvedValue({ active, acknowledged })
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it("hands the active and acknowledged alerts to the merge", async () => {
+    const { mergeAndFilterDashboardAlerts } = await import("@/lib/alerts/dashboardAlertMerge")
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+
+    expect(fetchOrchAlertsMock).toHaveBeenCalledWith(undefined)
+    expect(vi.mocked(mergeAndFilterDashboardAlerts)).toHaveBeenCalledWith(
+      expect.objectContaining({ orchAlerts: active, acknowledgedAlerts: acknowledged }),
+    )
+  })
+
+  it("gates both lists by the caller's RBAC scope", async () => {
+    rbacScopeMock.mockResolvedValue(vmScope("p1", "n1", "100"))
+    const { isAlertInRbacScope } = await import("@/lib/alerts/visibility")
+    const { GET } = await import("./route")
+    await callRoute(GET, { method: "GET" })
+
+    const gate = fetchOrchAlertsMock.mock.calls[0][0]
+    expect(gate).toEqual(expect.any(Function))
+    gate(active[0])
+    expect(vi.mocked(isAlertInRbacScope)).toHaveBeenCalledWith(active[0], expect.anything(), "default")
+  })
+
+  it("skips the orchestrator when it is not configured", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "")
+    const { GET } = await import("./route")
+    await callRoute(GET, { method: "GET" })
+
+    expect(fetchOrchAlertsMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("Ceph of a shared cluster (IaaS tenant)", () => {
+  const conn = { id: "p1", name: "PVE 1", type: "pve", hasCeph: true, tenantId: "default" }
+  const cephStatus = {
+    health: { status: "HEALTH_WARN", checks: { OSD_DOWN: {} } },
+    pgmap: { num_pgs: 128, bytes_total: 1000, bytes_used: 500, read_bytes_sec: 10, write_bytes_sec: 20 },
+    osdmap: { num_osds: 3, num_up_osds: 2, num_in_osds: 3 },
+  }
+
+  async function run() {
+    const { pveFetch } = await import("@/lib/proxmox/client")
+    vi.mocked(pveFetch).mockImplementation((async (_c: any, path: string) => {
+      if (path === "/nodes") return [{ node: "n1", status: "online" }, { node: "n2", status: "online" }]
+      if (path === "/cluster/status") return [{ type: "cluster", name: "shared" }]
+      if (path === "/cluster/ceph/status") return cephStatus
+      if (path.endsWith("/ceph/osd")) return { root: { children: [] } }
+      if (path.endsWith("/status")) return {}
+      return []
+    }) as any)
+    getConnByIdMock.mockResolvedValue({ baseUrl: "https://pve.invalid:8006", apiToken: "t" })
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const { mergeAndFilterDashboardAlerts } = await import("@/lib/alerts/dashboardAlertMerge")
+    const baseAlerts = vi.mocked(mergeAndFilterDashboardAlerts).mock.calls.at(-1)?.[0]?.baseAlerts ?? []
+    const cephPaths = vi.mocked(pveFetch).mock.calls.map(c => String(c[1])).filter(p => p.includes("ceph"))
+    return { body, baseAlerts, cephPaths }
+  }
+
+  it("iaas: Ceph is never read and no Ceph field, cluster health or alert comes back", async () => {
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "tenant-iaas" } })
+    getInfraMock.mockResolvedValue({
+      kind: "iaas",
+      vdcScope: {
+        connectionIds: new Set(["p1"]),
+        pbsConnectionIds: new Set(),
+        nodesByConnection: new Map([["p1", new Set(["n1"])]]),
+        poolsByConnection: new Map([["p1", new Set(["pool-a"])]]),
+        pbsNamespacesByConnection: new Map(),
+      },
+    })
+    globalFindMany.mockResolvedValue([conn])
+
+    const { body, baseAlerts, cephPaths } = await run()
+
+    expect(cephPaths).toEqual([])
+    expect(body.data.ceph).toBeNull()
+    expect(body.data.cephClusters).toEqual([])
+    expect(body.data.clusters.map((c: any) => c.cephHealth)).toEqual([null])
+    expect(baseAlerts.filter((a: any) => a.sourceType === "ceph")).toEqual([])
+  })
+
+  it("provider: the same cluster keeps its Ceph block, health and alert", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    globalFindMany.mockResolvedValue([conn])
+
+    const { body, baseAlerts, cephPaths } = await run()
+
+    expect(cephPaths).toContain("/cluster/ceph/status")
+    expect(body.data.ceph).toMatchObject({ available: true, health: "HEALTH_WARN", osdsTotal: 3 })
+    expect(body.data.cephClusters).toHaveLength(1)
+    expect(body.data.clusters[0].cephHealth).toBe("HEALTH_WARN")
+    expect(baseAlerts.filter((a: any) => a.sourceType === "ceph")).toHaveLength(1)
+  })
+
+  it("msp: its own cluster keeps its Ceph block", async () => {
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "tenant-msp" } })
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["p1"]) })
+    sessionFindMany.mockResolvedValue([{ ...conn, tenantId: "tenant-msp" }])
+
+    const { body, cephPaths } = await run()
+
+    expect(cephPaths).toContain("/cluster/ceph/status")
+    expect(body.data.cephClusters).toHaveLength(1)
+    expect(body.data.clusters[0].cephHealth).toBe("HEALTH_WARN")
+  })
+})
+
+describe("orchestrator alerts filtered like the bell (G20)", () => {
+  // Built-in alerts of the shared cluster: Ceph noout on a CRUSH host, OSD latency, node CPU.
+  const cephNoout = { connection_id: "p1", type: "ceph_noout", resource_type: "ceph", resource: "host:pve3", message: "noout set on pve3" }
+  const osdLatency = { connection_id: "p1", type: "osd_latency", resource_type: "osd", resource: "osd.3" }
+  const nodeCpu = { connection_id: "p1", type: "cpu", resource_type: "node", resource: "n1", node: "n1" }
+  // Alerts of a rule the IaaS tenant owns: one on a guest of its vDC, one on a connection outside its scope.
+  const ownGuest = { connection_id: "p1", rule_id: "r-iaas", type: "cpu", resource_type: "qemu", resource_id: 100, node: "n1" }
+  const foreignConn = { connection_id: "p2", rule_id: "r-iaas", type: "cpu", resource_type: "qemu", resource_id: 200, node: "n9" }
+
+  beforeEach(() => {
+    vi.stubEnv("ORCHESTRATOR_URL", "http://orchestrator:8080")
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  async function mergedOrchAlerts() {
+    const { mergeAndFilterDashboardAlerts } = await import("@/lib/alerts/dashboardAlertMerge")
+    const { GET } = await import("./route")
+    const res = await callRoute(GET, { method: "GET" })
+    expect(res.status).toBe(200)
+    return vi.mocked(mergeAndFilterDashboardAlerts).mock.calls.at(-1)?.[0]?.orchAlerts
+  }
+
+  it("iaas: no Ceph alert of the shared cluster, no alert of a connection outside its scope, its own guest alert kept", async () => {
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "tenant-iaas" } })
+    alertTenant.current = "tenant-iaas"
+    alertTenant.connectionIds = new Set(["p1"])
+    alertTenant.vdcVmids = new Map([["p1", new Set(["100"])]])
+    alertTenant.ruleOwners = new Map([["r-iaas", "tenant-iaas"]])
+    getInfraMock.mockResolvedValue({
+      kind: "iaas",
+      vdcScope: {
+        connectionIds: new Set(["p1"]),
+        pbsConnectionIds: new Set(),
+        nodesByConnection: new Map([["p1", new Set(["n1"])]]),
+        poolsByConnection: new Map([["p1", new Set(["pool-a"])]]),
+        pbsNamespacesByConnection: new Map(),
+      },
+    })
+    fetchOrchAlertsMock.mockResolvedValue({ active: [cephNoout, osdLatency, nodeCpu, ownGuest, foreignConn], acknowledged: [] })
+
+    expect(await mergedOrchAlerts()).toEqual([ownGuest])
+  })
+
+  it("provider: every alert of its fleet still reaches the merge", async () => {
+    getInfraMock.mockResolvedValue({ kind: "provider" })
+    const providerRule = { ...foreignConn, rule_id: "r-provider" }
+    fetchOrchAlertsMock.mockResolvedValue({ active: [cephNoout, osdLatency, nodeCpu, providerRule], acknowledged: [] })
+
+    expect(await mergedOrchAlerts()).toEqual([cephNoout, osdLatency, nodeCpu, providerRule])
+  })
+
+  it("msp: the built-in alerts of its own connection reach the merge, not those of another connection", async () => {
+    mockGetServerSession.mockResolvedValue({ user: { id: "u1", tenantId: "tenant-msp" } })
+    alertTenant.current = "tenant-msp"
+    alertTenant.connectionIds = new Set(["p1"])
+    getInfraMock.mockResolvedValue({ kind: "msp", connectionIds: new Set(["p1"]) })
+    const otherCpu = { ...nodeCpu, connection_id: "p2" }
+    fetchOrchAlertsMock.mockResolvedValue({ active: [cephNoout, nodeCpu, otherCpu], acknowledged: [] })
+
+    expect(await mergedOrchAlerts()).toEqual([cephNoout, nodeCpu])
+  })
+})

@@ -1,0 +1,139 @@
+# ============================================================
+# Build and Publish the Community-Modified Frontend Image
+#
+# Adapted from the vendor docker-publish.yml for this modified
+# source tree. Scope is intentionally narrower than the vendor
+# workflow: the community stack (docker-compose.community.yml)
+# ships exactly two images and only ONE needs building here —
+#
+#   frontend   ← built from ./frontend/Dockerfile (this repo,
+#                carries the community OIDC/SSO settings tab)
+#   postgres   ← stock postgres:16-alpine, pulled, not built
+#
+# The image is published to GHCR under the fork owner's own
+# namespace so it never collides with the vendor image:
+#
+#   ghcr.io/<owner>/proxcenter-frontend-community
+#
+# Deploy it with the community compose through its REGISTRY /
+# VERSION variables:
+#
+#   REGISTRY=ghcr.io/<owner> VERSION=latest \
+#     docker compose -f docker-compose.community.yml up -d
+#
+# Build args match the Dockerfile contract used by CI:
+#   GIT_SHA      → commit shown in the app banner
+#   APP_VERSION  → version label shown in the app banner
+#
+# Actions are pinned by commit SHA (same pins the vendor file
+# uses) so the workflow is reproducible and supply-chain safe.
+# ============================================================
+
+name: Build and Publish Docker Image (community-modified)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label baked into the image, e.g. 1.4.14-oidc (defaults to latest)'
+        required: false
+        default: 'latest'
+
+# The publish steps below declare their own packages:write grant;
+# pull_request runs only read the code and never push.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-frontend:
+    name: Build & publish frontend image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # GHCR image names must be lowercase; normalise the owner once.
+      - name: Resolve image name
+        run: |
+          echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/proxcenter-frontend-community" >> "$GITHUB_ENV"
+
+      # APP_VERSION shown in the UI banner:
+      #   tag push v1.4.14      → 1.4.14
+      #   manual dispatch       → the version input
+      #   push to main / PR     → dev
+      - name: Resolve APP_VERSION
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v* ]] && [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "APP_VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "APP_VERSION=dev" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags & OCI labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.title=ProxCenter Frontend (community-modified)
+            org.opencontainers.image.description=ProxCenter community frontend with the community OIDC/SSO settings tab enabled
+
+      # PR runs build-only (push: false) so pull requests are compile-
+      # checked without touching the registry.
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ env.APP_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Job summary
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "### Published \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "APP_VERSION=${APP_VERSION} - GIT_SHA=${GITHUB_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy: \`REGISTRY=${REGISTRY}/\$(owner) VERSION=<tag> docker compose -f docker-compose.community.yml up -d\`" >> "$GITHUB_STEP_SUMMARY"

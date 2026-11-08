@@ -1,0 +1,2816 @@
+'use client'
+
+import React, { useEffect, useMemo, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import { useRBAC } from '@/contexts/RBACContext'
+import { useTenant } from '@/contexts/TenantContext'
+import { useNicIdentityPermissions } from '@/hooks/useNicIdentityPermissions'
+import { getOsSvgIcon } from '@/lib/utils/osIcons'
+import { extractCustomCpuModels } from '@/lib/inventory/cpuModels'
+import { vmDiskFormats } from '@/lib/proxmox/storage'
+import { cpuGroupHeaderSx } from './cpuSelectStyles'
+
+import {
+  Alert,
+  Box,
+  Button,
+  Card,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  FormHelperText,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  LinearProgress,
+  ListSubheader,
+  MenuItem,
+  Select,
+  Slider,
+  Stack,
+  Switch,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+  useTheme,
+} from '@mui/material'
+import { alpha } from '@mui/material/styles'
+
+import AppDialogTitle from '@/components/ui/AppDialogTitle'
+import { onPrimaryTextColor } from '@/lib/theme/onPrimary'
+import NumericTextField from '@/components/ui/NumericTextField'
+import QuotaDonut from '@/components/mydc/QuotaDonut'
+import { usedVmidsOnConnection } from '@/components/hardware/utils'
+import { IsoUploadControls } from '@/components/hardware/IsoUploadControls'
+import BridgePicker from '@/components/hardware/BridgePicker'
+import { sortNetworkChoices, typedBridgeOption } from '@/components/hardware/bridgeChoices'
+import { SMALL_SELECT_SX } from '@/components/settings/destinations/DestinationDialogParts'
+import { readVdcContextCookie } from '@/lib/vdc/contextCookie'
+import { blankVmVdcs } from '@/lib/vdc/blankVms'
+import { formatBytes } from '@/utils/format'
+import { AllVmItem } from './InventoryTree'
+import CpuFlagsSelector, { cpuWithFlags, type CpuFlags } from './components/CpuFlagsSelector'
+import type { QemuMachineVersion } from '@/lib/inventory/qemuMachines'
+
+type DiskConfig = {
+  bus: string
+  index: number
+  storage: string
+  size: number
+  format: string
+  cache: string
+  discard: boolean
+  ioThread: boolean
+  ssd: boolean
+  backup: boolean
+  /** When true, import an existing disk image instead of creating an empty one.
+   *  Uses PVE 8.2+ import-from syntax: `target:0,import-from=source:volid`. */
+  importMode: boolean
+  /** Source storage containing the disk image to import (e.g. "local", "nfs-images"). */
+  importStorage: string
+  /** Full volume ID to import (e.g. "local:iso/myvm.qcow2" or "nfs:images/disk.raw"). */
+  importVolume: string
+}
+
+const createDefaultDisk = (): DiskConfig => ({
+  bus: 'scsi',
+  index: 0,
+  storage: '',
+  size: 32,
+  format: 'raw',
+  cache: 'none',
+  discard: false,
+  ioThread: true,
+  ssd: false,
+  backup: true,
+  importMode: false,
+  importStorage: '',
+  importVolume: '',
+})
+
+type NicConfig = {
+  bridge: string
+  model: string
+  vlanTag: string
+  macAddress: string
+  firewall: boolean
+  disconnect: boolean
+  rateLimit: string
+  // VirtIO only. Empty MTU = bridge MTU, like PVE when the key is absent (#1194).
+  mtu: string
+  queues: string
+}
+
+// PVE starts a VirtIO NIC only with mtu=1 (bridge MTU) or 576..bridge MTU;
+// anything else is accepted at creation and fails at the first start (#1194).
+// A bridge without a declared MTU runs at 1500 unless its ports raise it,
+// so going above that is only a warning.
+export function checkNicMtu(mtu: string, bridgeMtu: number | null): { level: 'error' | 'warning'; key: string; max?: number } | null {
+  if (mtu === '' || mtu === '1') return null
+  const n = Number(mtu)
+  if (!Number.isInteger(n) || n < 576 || n > 65520) return { level: 'error', key: 'mtuRange' }
+  if (bridgeMtu && n > bridgeMtu) return { level: 'error', key: 'mtuAboveBridge', max: bridgeMtu }
+  if (!bridgeMtu && n > 1500) return { level: 'warning', key: 'mtuAboveDefault' }
+  return null
+}
+
+const createDefaultNic = (): NicConfig => ({
+  bridge: 'vmbr0',
+  model: 'virtio',
+  vlanTag: '',
+  macAddress: 'auto',
+  firewall: true,
+  disconnect: false,
+  rateLimit: '',
+  mtu: '',
+  queues: '',
+})
+
+const OS_PRESETS: { id: string; label: string; icon?: string; svgIcon?: string; type: string; version: string }[] = [
+  { id: 'ubuntu', label: 'Ubuntu', svgIcon: '/images/os/ubuntu.svg', type: 'Linux', version: 'l26' },
+  { id: 'debian', label: 'Debian', svgIcon: '/images/os/debian.svg', type: 'Linux', version: 'l26' },
+  { id: 'centos', label: 'CentOS / Rocky', svgIcon: '/images/os/centos.svg', type: 'Linux', version: 'l26' },
+  { id: 'rhel', label: 'RHEL', svgIcon: '/images/os/redhat.svg', type: 'Linux', version: 'l26' },
+  { id: 'fedora', label: 'Fedora', svgIcon: '/images/os/fedora.svg', type: 'Linux', version: 'l26' },
+  { id: 'win11', label: 'Windows 11', icon: 'ri-windows-fill', type: 'Windows', version: 'win11' },
+  { id: 'win10', label: 'Windows 10', icon: 'ri-windows-fill', type: 'Windows', version: 'win10' },
+  { id: 'winserver', label: 'Windows Server', icon: 'ri-windows-fill', type: 'Windows', version: 'win11' },
+]
+
+// PVE ostype values and their PVE labels, per OS type.
+const GUEST_OS_VERSIONS: Record<string, { value: string; label: string }[]> = {
+  Linux: [
+    { value: 'l26', label: 'Linux 6.x - 2.6 Kernel' },
+    { value: 'l24', label: 'Linux 2.4 Kernel' },
+  ],
+  Windows: [
+    { value: 'win11', label: 'Windows 11/2022/2025' },
+    { value: 'win10', label: 'Windows 10/2016/2019' },
+    { value: 'win8', label: 'Windows 8.x/2012/2012r2' },
+    { value: 'win7', label: 'Windows 7/2008r2' },
+    { value: 'wvista', label: 'Windows Vista/2008' },
+    { value: 'wxp', label: 'Windows XP/2003' },
+    { value: 'w2k', label: 'Windows 2000' },
+  ],
+  Solaris: [{ value: 'solaris', label: 'Solaris Kernel' }],
+  Other: [{ value: 'other', label: 'Other' }],
+}
+
+/** Confirm-step label: the PVE label of the ostype, after the preset name while the
+ *  preset still matches ("Windows Server · Windows 11/2022/2025"), never the raw code. */
+export function guestOsSummaryLabel(type: string, version: string, presetId: string | null): string {
+  const versionLabel = GUEST_OS_VERSIONS[type]?.find(v => v.value === version)?.label ?? `${type} ${version}`
+  const preset = OS_PRESETS.find(p => p.id === presetId)
+
+  return preset && preset.type === type && preset.version === version ? `${preset.label} · ${versionLabel}` : versionLabel
+}
+
+// Least-loaded online node. Score = cpuPct + 1.5*memPct, RAM weighted higher
+// because it's the harder constraint at provisioning time. Falls back to the
+// first online node, then to the first node.
+const pickBestNode = (pool: any[]): any => {
+  if (pool.length === 0) return null
+  const online = pool.filter(n => n.status === 'online')
+  const candidates = online.length > 0 ? online : pool
+  const scored = candidates.map(n => ({
+    node: n,
+    score: (n.cpuPct ?? 0) + 1.5 * (n.memPct ?? 0),
+  }))
+  scored.sort((a, b) => a.score - b.score)
+  return scored[0].node
+}
+
+/** Nodes of `vdc` among the loaded nodes: its connection, and its node list
+ *  when the vDC pins one. */
+export function vdcNodePool(vdc: any, nodes: any[]): any[] {
+  const connId = vdc.connectionId ?? vdc.connection_id
+  const pinned = new Set<string>(Array.isArray(vdc.nodes) ? vdc.nodes : [])
+  return nodes.filter(n => n.connId === connId && (pinned.size === 0 || pinned.has(n.node)))
+}
+
+/** Storage rows for a vDC tenant on one node: the node route scopes them to
+ *  the vDC (the cluster route drops the shared primary storage), and its iso
+ *  listing adds the ISO libraries, kept out of the disk pickers. */
+export async function loadTenantNodeStorages(connId: string, node: string): Promise<any[]> {
+  const base = `/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/storages`
+  const read = async (url: string): Promise<any[]> => {
+    try {
+      const res = await fetch(url)
+      if (!res.ok) return []
+      const json = await res.json()
+      return Array.isArray(json?.data) ? json.data : []
+    } catch {
+      return []
+    }
+  }
+  const [main, iso] = await Promise.all([read(base), read(`${base}?content=iso`)])
+  const byName = new Map<string, any>(main.map(s => [s.storage, { ...s, node }]))
+  for (const s of iso) {
+    const known = byName.get(s.storage)
+    byName.set(s.storage, known ? { ...known, tenantCanUpload: s.tenantCanUpload } : { ...s, node, isoOnly: true })
+  }
+  return [...byName.values()]
+}
+
+function CreateVmDialog({
+  open,
+  onClose,
+  allVms = [],
+  onCreated,
+  defaultConnId,
+  defaultNode,
+}: {
+  open: boolean
+  onClose: () => void
+  allVms: AllVmItem[]
+  onCreated?: (vmid: string, connId: string, node: string) => void
+  defaultConnId?: string
+  defaultNode?: string
+}) {
+  const t = useTranslations()
+  const theme = useTheme()
+  const { isAdmin } = useRBAC()
+  // Tenants other than the provider get the cloud abstraction: no node
+  // picker, smart auto-placement on the least-loaded node.
+  const { currentTenant, loading: tenantLoading, isFullClusterView } = useTenant()
+  const { canEditMac, canEditVlan } = useNicIdentityPermissions()
+  const isProviderTenant = !tenantLoading && currentTenant?.id === 'default'
+  const hideNodePicker = !tenantLoading && !!currentTenant && !isFullClusterView
+
+  // MSP tenant VMID range (null when no enforcement applies)
+  const tenantVmidRange = useMemo(() => {
+    const start = currentTenant?.vmidRangeStart
+    const end = currentTenant?.vmidRangeEnd
+    return typeof start === 'number' && typeof end === 'number' ? { start, end } : null
+  }, [currentTenant])
+
+  // États du formulaire
+  const [activeTab, setActiveTab] = useState(0)
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  
+  // Données dynamiques
+  const [connections, setConnections] = useState<any[]>([])
+  const [nodes, setNodes] = useState<any[]>([])
+  const [customCpuModels, setCustomCpuModels] = useState<string[]>([])
+  // vDC compute policy (#893) from the cpu-models answer: allowed models
+  // (null = unrestricted), a default model for this wizard, and whether the
+  // advanced CPU controls (units, limit, NUMA) are exposed.
+  const [cpuPolicy, setCpuPolicy] = useState<{ allowed: Set<string> | null; advanced: boolean; defaultModel: string | null } | null>(null)
+  // Set once the user picks a CPU model by hand, so a policy default arriving
+  // later does not override an explicit choice.
+  const cpuTypeTouched = React.useRef(false)
+  const [storages, setStorages] = useState<any[]>([])
+  const [isoImages, setIsoImages] = useState<any[]>([])
+  // An ISO upload in flight freezes the Create button (#1171).
+  const [isoBusy, setIsoBusy] = useState(false)
+  // vDC tenant (#1171): the vDCs open to blank VMs and the one the VM goes in.
+  const [blankVdcs, setBlankVdcs] = useState<any[]>([])
+  const [tenantVdcId, setTenantVdcId] = useState('')
+  const [networks, setNetworks] = useState<any[]>([])
+  const [bridges, setBridges] = useState<any[]>([])
+  const bridgeOptions = useMemo(() => bridges.map(typedBridgeOption), [bridges])
+  const [pools, setPools] = useState<any[]>([])
+  // True when the API narrowed the list to the caller's own pools: the guest
+  // must land in one of them, so the picker is shown even to a non-admin.
+  const [poolsRestricted, setPoolsRestricted] = useState(false)
+  const [loadingData, setLoadingData] = useState(false)
+  
+  // Formulaire - Général
+  const [selectedConnection, setSelectedConnection] = useState('')
+  const [selectedNodeValue, setSelectedNodeValue] = useState('')  // valeur du Select (peut être "cluster:xxx" ou "pve1")
+  const [resolvedNode, setResolvedNode] = useState('')            // vrai node pour les API calls
+  const [pendingClusterSelect, setPendingClusterSelect] = useState<string | null>(null)
+  const [vmid, setVmid] = useState('')
+  const [vmidError, setVmidError] = useState<string | null>(null)
+  const [vmName, setVmName] = useState('')
+  const [resourcePool, setResourcePool] = useState('')
+  const [startOnBoot, setStartOnBoot] = useState(false)
+  const [startupOrder, setStartupOrder] = useState('')
+  const [startupDelay, setStartupDelay] = useState('')
+  const [shutdownTimeout, setShutdownTimeout] = useState('')
+  
+  // Formulaire - OS
+  const [osMediaType, setOsMediaType] = useState<'iso' | 'none'>('iso')
+  const [isoStorage, setIsoStorage] = useState('')
+  const [isoImage, setIsoImage] = useState('')
+  const [guestOsType, setGuestOsType] = useState('Linux')
+  const [guestOsVersion, setGuestOsVersion] = useState('l26')
+  
+  // Formulaire - System
+  const [graphicCard, setGraphicCard] = useState('default')
+  const [machine, setMachine] = useState('i440fx')
+  // 'latest' = no pin; otherwise a versioned id from the node (`pc-q35-10.1`).
+  const [machineVersion, setMachineVersion] = useState('latest')
+  const [machineVersions, setMachineVersions] = useState<QemuMachineVersion[]>([])
+  const [bios, setBios] = useState('seabios')
+  const [scsiController, setScsiController] = useState('virtio-scsi-single')
+  const [qemuAgent, setQemuAgent] = useState(false)
+  const [addTpm, setAddTpm] = useState(false)
+  
+  // Formulaire - Disks (array-based)
+  const [disks, setDisks] = useState<DiskConfig[]>([createDefaultDisk()])
+  const [expandedDisks, setExpandedDisks] = useState<Set<number>>(new Set([0]))
+  // Cache of fetched volume lists per disk index + source storage, keyed as "idx:storage"
+  const [importVolumes, setImportVolumes] = useState<Record<string, { volid: string; format?: string; size?: number }[]>>({})
+  
+  // Formulaire - CPU
+  const [cpuSockets, setCpuSockets] = useState(1)
+  const [cpuCores, setCpuCores] = useState(1)
+  const [cpuType, setCpuType] = useState('x86-64-v2-AES')
+  const [cpuUnits, setCpuUnits] = useState(100)
+  const [cpuLimit, setCpuLimit] = useState(0)
+  const [enableNuma, setEnableNuma] = useState(false)
+  const [cpuFlags, setCpuFlags] = useState<CpuFlags>({})
+  
+  // Formulaire - Memory
+  const [memorySize, setMemorySize] = useState(2048)
+  const [minMemory, setMinMemory] = useState(2048)
+  const [ballooning, setBallooning] = useState(true)
+
+  // vDC quota awareness (tenants only — super admins get `null` here and pass
+  // through unchecked). Fetched when dialog opens + connection resolved.
+  const [vdcQuota, setVdcQuota] = useState<{ maxVcpus: number | null; maxRamMb: number | null; maxStorageMb: number | null; maxVms: number | null } | null>(null)
+  const [vdcUsage, setVdcUsage] = useState<{ usedVcpus: number; usedRamMb: number; usedStorageMb: number; usedVms: number } | null>(null)
+  
+  // UI collapse states
+  const [bootSectionExpanded, setBootSectionExpanded] = useState(false)
+  const [cpuAdvancedExpanded, setCpuAdvancedExpanded] = useState(false)
+  const [memAdvancedExpanded, setMemAdvancedExpanded] = useState(false)
+  const [selectedOsPreset, setSelectedOsPreset] = useState<string | null>(null)
+
+  // Formulaire - Network (array-based)
+  const [noNetwork, setNoNetwork] = useState(false)
+  const [nics, setNics] = useState<NicConfig[]>([createDefaultNic()])
+  const [expandedNics, setExpandedNics] = useState<Set<number>>(new Set([0]))
+
+  // Client-side fallback when the nextid API is unreachable — range-aware so
+  // it never proposes an out-of-range VMID for MSP tenants.
+  const fallbackNextVmid = () => {
+    const usedVmids = new Set(usedVmidsOnConnection(allVms, selectedConnection))
+    const startId = tenantVmidRange ? tenantVmidRange.start : 100
+    const maxId = tenantVmidRange ? tenantVmidRange.end : 999999999
+    let nextId = startId
+    while (usedVmids.has(nextId) && nextId <= maxId) nextId++
+    if (nextId > maxId && tenantVmidRange) {
+      setVmid('')
+      setVmidError(t('inventory.createVm.vmIdRangeExhausted', { start: tenantVmidRange.start, end: tenantVmidRange.end }))
+      return
+    }
+    setVmid(String(nextId))
+    setVmidError(null)
+  }
+
+  // Load next VMID from the Proxmox cluster API
+  const loadNextVmid = async (connId: string) => {
+    try {
+      const res = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/cluster/nextid`)
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.data) {
+        setVmid(String(json.data))
+        setVmidError(null)
+        return
+      }
+      // Range exhausted (409) or explicit error while a range applies: show
+      // it — the client fallback could only propose out-of-range ids.
+      if (tenantVmidRange && json?.error) {
+        setVmid('')
+        setVmidError(String(json.error))
+        return
+      }
+    } catch (e) {
+      console.error('Error loading next VMID from API:', e)
+    }
+    fallbackNextVmid()
+  }
+
+  // Load bridges from node via network-choices endpoint
+  const loadBridges = async (connId: string, node: string) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/network-choices?node=${encodeURIComponent(node)}`
+      )
+      if (res.ok) {
+        const json = await res.json()
+        // Natural order, bridges then VNets then shared bridges (#195).
+        const choices = sortNetworkChoices(Array.isArray(json.data) ? json.data : [])
+        const bridgeList = choices.map((c: any) => ({
+          iface: c.name,
+          // VNets carry a hashed iface (the actual PVE ID) but a friendly
+          // display name from the user. Surface displayName as label so the
+          // picker shows "lan" instead of "v8a3f9e2b".
+          type: c.kind === 'vnet' ? 'vnet' : c.kind === 'shared' ? 'shared' : (c.type || 'bridge'),
+          label: c.kind === 'vnet' ? (c.displayName ?? null) : (c.label ?? null),
+          vdc: c.vdc ?? null,
+          mtu: Number(c.mtu) > 0 ? Number(c.mtu) : null,
+        }))
+        setBridges(bridgeList)
+        // Sync nic state with what the server actually authorises: valid
+        // picks stay, invalid ones (e.g. the default 'vmbr0' when the tenant
+        // has no bridge) fall back to the first valid choice — or to '' if
+        // nothing is available, so networkBlocked below catches it.
+        setNics(prev => prev.map(nic =>
+          bridgeList.some((b: any) => b.iface === nic.bridge)
+            ? nic
+            : { ...nic, bridge: bridgeList[0]?.iface || '' }
+        ))
+      }
+    } catch (e) {
+      console.error('Error loading bridges:', e)
+      setBridges([])
+    }
+  }
+
+  // Charge les modèles CPU custom du cluster (cpu-models.conf) pour le Select
+  // CPU Type, sinon impossible de créer une VM avec un modèle custom (#665)
+  const loadCustomCpuModels = async (connId: string, node: string) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/cpu-models`
+      )
+      if (res.ok) {
+        const json = await res.json()
+        setCustomCpuModels(extractCustomCpuModels(json?.data))
+        const p = json?.policy
+        setCpuPolicy(p && typeof p === 'object'
+          ? {
+              allowed: Array.isArray(p.allowedModels) ? new Set<string>(p.allowedModels.map(String)) : null,
+              advanced: p.cpuAdvancedSettings !== false,
+              defaultModel: typeof p.cpuDefaultModel === 'string' && p.cpuDefaultModel ? p.cpuDefaultModel : null,
+            }
+          : { allowed: null, advanced: true, defaultModel: null })
+        return
+      }
+      setCustomCpuModels([])
+      setCpuPolicy(null)
+    } catch {
+      setCustomCpuModels([])
+      setCpuPolicy(null)
+    }
+  }
+  const cpuAdvancedHidden = cpuPolicy?.advanced === false
+
+  // Versioned machine types of the node's QEMU build, to pin one (#1194)
+  const loadMachineVersions = async (connId: string, node: string) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/machines`
+      )
+      const json = res.ok ? await res.json() : null
+      setMachineVersions(Array.isArray(json?.data) ? json.data : [])
+    } catch {
+      setMachineVersions([])
+    }
+  }
+  const familyMachineVersions = useMemo(
+    () => machineVersions.filter(m => m.type === machine),
+    [machineVersions, machine]
+  )
+  // A pin the node does not offer (node switched, list failed) reads as
+  // Latest: the Select and the payload both go through pinnedMachine.
+  const pinnedMachine = familyMachineVersions.find(m => m.id === machineVersion)
+
+  // A restrictive policy pins the wizard onto an allowed model: the vDC
+  // default when it is allowed, else the first allowed one. An explicit user
+  // pick that is already allowed is kept.
+  useEffect(() => {
+    const allowed = cpuPolicy?.allowed
+    if (!allowed || allowed.size === 0) return
+    if (cpuTypeTouched.current && allowed.has(cpuType)) return
+    const preferred = cpuPolicy?.defaultModel && allowed.has(cpuPolicy.defaultModel)
+      ? cpuPolicy.defaultModel
+      : (allowed.has(cpuType) ? cpuType : [...allowed][0])
+    if (preferred !== cpuType) setCpuType(preferred)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpuPolicy])
+
+  // CPU Type options as data so the policy can filter them; groups left
+  // empty are dropped, and allowed models the static list does not know
+  // are still offered under "Other".
+  const cpuOptionGroups = useMemo(() => {
+    const plain = (values: string[]) => values.map(v => ({ value: v, label: v }))
+    const groups: Array<{ header: string; items: Array<{ value: string; label: string }> }> = [
+      { header: 'Custom', items: plain(customCpuModels) },
+      { header: 'Special', items: plain(['host', 'max', 'kvm64', 'kvm32', 'qemu64', 'qemu32']) },
+      { header: 'x86-64 Levels', items: [
+        { value: 'x86-64-v2', label: 'x86-64-v2' },
+        { value: 'x86-64-v2-AES', label: 'x86-64-v2-AES (Recommended)' },
+        { value: 'x86-64-v3', label: 'x86-64-v3' },
+        { value: 'x86-64-v4', label: 'x86-64-v4' },
+      ] },
+      { header: 'Intel', items: plain([
+        'Conroe', 'Penryn', 'Nehalem', 'Westmere', 'SandyBridge', 'IvyBridge', 'Haswell', 'Broadwell',
+        'Skylake-Client', 'Skylake-Server', 'Cascadelake-Server', 'Cooperlake', 'Icelake-Server',
+        'SapphireRapids', 'GraniteRapids',
+      ]) },
+      { header: 'AMD', items: [
+        { value: 'Opteron_G5', label: 'Opteron G5' },
+        ...plain(['EPYC', 'EPYC-Rome', 'EPYC-Milan', 'EPYC-Genoa']),
+      ] },
+    ]
+    const allowed = cpuPolicy?.allowed ?? null
+    const filtered = groups.map(g => ({ ...g, items: allowed ? g.items.filter(i => allowed.has(i.value)) : g.items }))
+    if (allowed) {
+      const listed = new Set(filtered.flatMap(g => g.items.map(i => i.value)))
+      const other = [...allowed].filter(v => !listed.has(v))
+      if (other.length > 0) filtered.push({ header: 'Other', items: plain(other) })
+    }
+    return filtered.filter(g => g.items.length > 0)
+  }, [customCpuModels, cpuPolicy])
+
+  // Disk array helpers
+  const addDisk = () => {
+    setDisks(prev => {
+      const bus = 'scsi'
+      const usedIndices = prev.filter(d => d.bus === bus).map(d => d.index)
+      let nextIndex = 0
+      while (usedIndices.includes(nextIndex)) nextIndex++
+      setExpandedDisks(s => new Set(s).add(prev.length))
+      return [...prev, { ...createDefaultDisk(), bus, index: nextIndex, storage: prev[0]?.storage || '' }]
+    })
+  }
+
+  const removeDisk = (idx: number) => {
+    setDisks(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  /** Format PVE would use on that storage when the request names none. */
+  const storageDefaultFormat = (storageName: string): string => {
+    const s = storages.find((x: any) => x.storage === storageName)
+
+    return s?.defaultFormat || vmDiskFormats({ type: s?.type }).defaultFormat
+  }
+
+  const updateDisk = (idx: number, updates: Partial<DiskConfig>) => {
+    setDisks(prev => {
+      const updated = [...prev]
+      updated[idx] = { ...updated[idx], ...updates }
+
+      // Follow the storage: PVE picks the format the storage defaults to, so
+      // announcing a fixed raw lied on any storage defaulting to qcow2, and a
+      // PVE 9 LVM storage with snapshot-as-volume-chain does (issue #735).
+      if (updates.storage && updates.storage !== prev[idx].storage) {
+        updated[idx].format = storageDefaultFormat(updates.storage)
+      }
+
+      if (updates.bus && updates.bus !== prev[idx].bus) {
+        const usedIndices = prev.filter((d, i) => i !== idx && d.bus === updates.bus).map(d => d.index)
+        let nextIndex = 0
+        while (usedIndices.includes(nextIndex)) nextIndex++
+        updated[idx].index = nextIndex
+      }
+      return updated
+    })
+  }
+
+  // NIC array helpers
+  const addNic = () => {
+    setNics(prev => {
+      setExpandedNics(s => new Set(s).add(prev.length))
+      return [...prev, { ...createDefaultNic(), bridge: prev[0]?.bridge || 'vmbr0' }]
+    })
+  }
+
+  const removeNic = (idx: number) => {
+    setNics(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  const updateNic = (idx: number, updates: Partial<NicConfig>) => {
+    setNics(prev => {
+      const updated = [...prev]
+      updated[idx] = { ...updated[idx], ...updates }
+      return updated
+    })
+  }
+
+  // Reset form when dialog opens
+  useEffect(() => {
+    if (open) {
+      setActiveTab(0)
+      setError(null)
+      setSelectedNodeValue('')
+      setResolvedNode('')
+      setSelectedConnection('')
+      setPendingClusterSelect(null)
+      setDisks([createDefaultDisk()])
+      setNics([createDefaultNic()])
+      setExpandedNics(new Set([0]))
+      setNoNetwork(false)
+      setBlankVdcs([])
+      setTenantVdcId('')
+      void loadAllData()
+    }
+  }, [open])
+
+  // Clear a stale server-side error (e.g. previous 409 "Quota exceeded") as
+  // soon as the user tweaks a quota-affecting field — otherwise the red alert
+  // lingers next to an updated green banner and confuses them.
+  useEffect(() => {
+    setError(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cpuSockets, cpuCores, memorySize, disks, nics])
+
+  // Charger les storages quand un node est sélectionné
+  useEffect(() => {
+    if (selectedConnection && resolvedNode) {
+      void loadStorages(selectedConnection)
+    }
+  }, [selectedConnection, resolvedNode])
+
+  // Charger les bridges quand un node est sélectionné
+  useEffect(() => {
+    if (selectedConnection && resolvedNode) {
+      void loadBridges(selectedConnection, resolvedNode)
+    }
+  }, [selectedConnection, resolvedNode])
+
+  // Charger les modèles CPU custom quand un node est sélectionné
+  useEffect(() => {
+    if (selectedConnection && resolvedNode) {
+      void loadCustomCpuModels(selectedConnection, resolvedNode)
+      void loadMachineVersions(selectedConnection, resolvedNode)
+    }
+  }, [selectedConnection, resolvedNode])
+
+  // Charger le quota+usage du vDC du tenant pour la connexion sélectionnée.
+  // Super admin → /api/v1/vdcs renvoie [] (pas de vDC sur le provider tenant),
+  // on reste donc à vdcQuota=null → validation passante.
+  useEffect(() => {
+    if (!open || !selectedConnection) {
+      setVdcQuota(null)
+      setVdcUsage(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const res = await fetch('/api/v1/vdcs')
+        if (!res.ok) { if (!cancelled) { setVdcQuota(null); setVdcUsage(null) } ; return }
+        const json = await res.json()
+        const vdcs: any[] = Array.isArray(json?.data) ? json.data : []
+        const match = tenantVdcId
+          ? vdcs.find(v => v.id === tenantVdcId)
+          : vdcs.find(v => v.connectionId === selectedConnection || v.connection_id === selectedConnection)
+        if (cancelled) return
+        if (match?.quota) {
+          setVdcQuota({
+            maxVcpus: match.quota.maxVcpus ?? null,
+            maxRamMb: match.quota.maxRamMb ?? null,
+            maxStorageMb: match.quota.maxStorageMb ?? null,
+            maxVms: match.quota.maxVms ?? null,
+          })
+          setVdcUsage({
+            usedVcpus: match.usage?.usedVcpus ?? 0,
+            usedRamMb: match.usage?.usedRamMb ?? 0,
+            usedStorageMb: match.usage?.usedStorageMb ?? 0,
+            usedVms: match.usage?.usedVms ?? 0,
+          })
+        } else {
+          setVdcQuota(null)
+          setVdcUsage(null)
+        }
+      } catch {
+        if (!cancelled) { setVdcQuota(null); setVdcUsage(null) }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [open, selectedConnection, tenantVdcId])
+
+  // Charger les pools de ressources quand la connexion change
+  useEffect(() => {
+    if (!open || !selectedConnection) {
+      setPools([])
+      setPoolsRestricted(false)
+      return
+    }
+
+    const loadPools = async () => {
+      try {
+        const res = await fetch(`/api/v1/connections/${encodeURIComponent(selectedConnection)}/pools`)
+        const json = await res.json()
+
+        if (json.data && Array.isArray(json.data)) {
+          setPools(json.data.map((p: any) => ({ poolid: p.poolid, comment: p.comment })))
+
+          // Pool-scoped caller: the list is their whole scope and the guest has
+          // to land in it, so preselect when there is only one candidate
+          // instead of showing a one-option dropdown (issue #262).
+          setPoolsRestricted(!!json.restricted)
+          if (json.restricted && json.data.length === 1) setResourcePool(json.data[0].poolid)
+        }
+      } catch (e) {
+        console.error('Error loading pools:', e)
+        setPools([])
+        setPoolsRestricted(false)
+      }
+    }
+
+    void loadPools()
+  }, [open, selectedConnection])
+
+  // Charger les ISOs quand un storage ISO est sélectionné
+  useEffect(() => {
+    if (selectedConnection && isoStorage && resolvedNode) {
+      void loadIsoImages(selectedConnection, resolvedNode, isoStorage)
+    }
+  }, [selectedConnection, resolvedNode, isoStorage])
+
+  // Valider le VMID quand il change
+  const handleVmidChange = (value: string) => {
+    // Autoriser uniquement les chiffres
+    const numericValue = value.replace(/[^0-9]/g, '')
+
+    setVmid(numericValue)
+    
+    // Vérifier si le VMID est valide
+    if (!numericValue) {
+      setVmidError(null)
+      
+return
+    }
+    
+    const vmidNum = Number.parseInt(numericValue, 10)
+    
+    // Vérifier les limites Proxmox (100-999999999)
+    if (vmidNum < 100) {
+      setVmidError(t('inventory.createVm.vmIdMin'))
+      
+return
+    }
+
+    if (vmidNum > 999999999) {
+      setVmidError(t('inventory.createVm.vmIdMax'))
+
+return
+    }
+
+    if (tenantVmidRange && (vmidNum < tenantVmidRange.start || vmidNum > tenantVmidRange.end)) {
+      setVmidError(t('inventory.createVm.vmIdOutOfRange', { start: tenantVmidRange.start, end: tenantVmidRange.end }))
+      return
+    }
+
+    // Vérifier si le VMID est déjà utilisé, sur la connexion cible uniquement:
+    // le même id sur un autre cluster ne gêne pas cette création (#724).
+    const isUsed = usedVmidsOnConnection(allVms, selectedConnection).includes(vmidNum)
+
+    if (isUsed) {
+      setVmidError(t('inventory.createVm.vmIdInUse', { id: vmidNum }))
+      
+return
+    }
+    
+    setVmidError(null)
+  }
+
+  // Générer le prochain VMID disponible via API
+  const generateNextVmid = async () => {
+    if (selectedConnection) {
+      await loadNextVmid(selectedConnection)
+    } else {
+      fallbackNextVmid()
+    }
+  }
+
+  // Charger toutes les connexions et tous leurs nodes
+  const loadAllData = async () => {
+    setLoadingData(true)
+
+    try {
+      // 1. Charger les connexions
+      // includeGuestScoped: a tag/pool scoped user is absent from the plain
+      // connection list, which would leave the Node picker empty and block the
+      // wizard on its first tab (issue #262).
+      const connRes = await fetch('/api/v1/connections?type=pve&includeGuestScoped=1')
+      const connJson = await connRes.json()
+      const connectionsList = connJson.data || []
+
+      setConnections(connectionsList)
+
+      // 2. Charger les nodes de toutes les connexions en parallèle
+      const allNodes: any[] = []
+
+      await Promise.all(
+        connectionsList.map(async (conn: any) => {
+          try {
+            const nodesRes = await fetch(`/api/v1/connections/${encodeURIComponent(conn.id)}/nodes`)
+            const nodesJson = await nodesRes.json()
+            const nodesList = nodesJson.data || []
+
+            // Ajouter l'info de connexion et calculs de pourcentages à chaque node
+            nodesList.forEach((node: any) => {
+              const cpuPct = node.maxcpu ? (node.cpu || 0) * 100 : 0
+              const memPct = node.maxmem ? ((node.mem || 0) / node.maxmem) * 100 : 0
+              allNodes.push({
+                ...node,
+                connId: conn.id,
+                connName: conn.name,
+                cpuPct,
+                memPct,
+              })
+            })
+          } catch (e) {
+            console.error(`Error loading nodes for connection ${conn.id}:`, e)
+          }
+        })
+      )
+
+      setNodes(allNodes)
+
+      // 3. Sélectionner le node par défaut. For tenants we always go through
+      // pickBestNode (auto-placement, picker is hidden). The provider keeps
+      // the legacy precedence (defaultNode/defaultConnId/first).
+      if (allNodes.length > 0) {
+        if (hideNodePicker) {
+          // Tenant: the VM goes in one of its vDCs open to blank VMs (#1171),
+          // the context vDC or the hinted cluster's first, on its least-loaded
+          // node. No such vDC leaves the wizard without a target.
+          const vdcsRes = await fetch('/api/v1/vdcs')
+          const vdcsJson = vdcsRes.ok ? await vdcsRes.json() : null
+          const eligible = blankVmVdcs(Array.isArray(vdcsJson?.data) ? vdcsJson.data : [], readVdcContextCookie())
+          setBlankVdcs(eligible)
+          const target = (defaultConnId && eligible.find(v => (v.connectionId ?? v.connection_id) === defaultConnId)) || eligible[0]
+          if (target) placeInVdc(target, allNodes)
+        } else if (defaultConnId && defaultNode) {
+          const match = allNodes.find((n: any) => n.connId === defaultConnId && n.node === defaultNode)
+          const target = match || allNodes[0]
+          setSelectedNodeValue(target.node)
+          setResolvedNode(target.node)
+          setSelectedConnection(target.connId)
+          void loadNextVmid(target.connId)
+        } else if (defaultConnId) {
+          const clusterNodes = allNodes.filter((n: any) => n.connId === defaultConnId)
+          if (clusterNodes.length > 0) {
+            setPendingClusterSelect(defaultConnId)
+            setSelectedConnection(defaultConnId)
+            void loadNextVmid(defaultConnId)
+          } else {
+            setSelectedNodeValue(allNodes[0].node)
+            setResolvedNode(allNodes[0].node)
+            setSelectedConnection(allNodes[0].connId)
+            void loadNextVmid(allNodes[0].connId)
+          }
+        } else {
+          setSelectedNodeValue(allNodes[0].node)
+          setResolvedNode(allNodes[0].node)
+          setSelectedConnection(allNodes[0].connId)
+          void loadNextVmid(allNodes[0].connId)
+        }
+      }
+
+    } catch (e) {
+      console.error('Error loading data:', e)
+    } finally {
+      setLoadingData(false)
+    }
+  }
+
+  // vDC tenant (#1171): the VM goes in the picked vDC, on its least-loaded node.
+  const placeInVdc = (vdc: any, pool: any[]) => {
+    setTenantVdcId(vdc.id)
+    const target = pickBestNode(vdcNodePool(vdc, pool))
+    if (!target) {
+      setSelectedNodeValue('')
+      setResolvedNode('')
+      setSelectedConnection(vdc.connectionId ?? vdc.connection_id ?? '')
+      return
+    }
+    setSelectedNodeValue(target.node)
+    setResolvedNode(target.node)
+    setSelectedConnection(target.connId)
+    void loadNextVmid(target.connId)
+  }
+
+  const handleTenantVdcChange = (vdcId: string) => {
+    const vdc = blankVdcs.find(v => v.id === vdcId)
+    if (!vdc || vdc.id === tenantVdcId) return
+    // Storages, bridges and ISOs picked in the vDC left behind do not apply.
+    setDisks([createDefaultDisk()])
+    setNics([createDefaultNic()])
+    setIsoStorage('')
+    setIsoImage('')
+    placeInVdc(vdc, nodes)
+  }
+
+  // Grouper les nodes par cluster avec stats agrégées
+  const groupedNodes = useMemo(() => {
+    const groups: {
+      connId: string
+      connName: string
+      isCluster: boolean
+      nodes: any[]
+      avgCpu: number
+      avgMem: number
+    }[] = []
+
+    // Grouper par connexion
+    const connMap = new Map<string, any[]>()
+    nodes.forEach(n => {
+      if (!connMap.has(n.connId)) {
+        connMap.set(n.connId, [])
+      }
+      connMap.get(n.connId)!.push(n)
+    })
+
+    // Créer les groupes avec stats
+    connMap.forEach((nodeList, connId) => {
+      const connName = nodeList[0]?.connName || connId
+      const onlineNodes = nodeList.filter(n => n.status === 'online')
+      const avgCpu = onlineNodes.length > 0
+        ? onlineNodes.reduce((sum, n) => sum + (n.cpuPct || 0), 0) / onlineNodes.length
+        : 0
+      const avgMem = onlineNodes.length > 0
+        ? onlineNodes.reduce((sum, n) => sum + (n.memPct || 0), 0) / onlineNodes.length
+        : 0
+
+      groups.push({
+        connId,
+        connName,
+        isCluster: nodeList.length > 1,
+        nodes: nodeList.sort((a, b) => a.node.localeCompare(b.node)),
+        avgCpu,
+        avgMem,
+      })
+    })
+
+    return groups.sort((a, b) => a.connName.localeCompare(b.connName))
+  }, [nodes])
+
+  // Trouver le meilleur node d'un cluster (moins de charge CPU+RAM)
+  const findBestNode = (connId: string): string | null => {
+    const group = groupedNodes.find(g => g.connId === connId)
+    if (!group) return null
+
+    const onlineNodes = group.nodes.filter(n => n.status === 'online')
+    if (onlineNodes.length === 0) return null
+
+    // Score = CPU% + RAM%, le plus bas est le meilleur
+    const bestNode = onlineNodes.reduce((best, node) => {
+      const score = (node.cpuPct || 0) + (node.memPct || 0)
+      const bestScore = (best.cpuPct || 0) + (best.memPct || 0)
+      return score < bestScore ? node : best
+    }, onlineNodes[0])
+
+    return bestNode.node
+  }
+
+  // Appliquer la sélection cluster en attente une fois groupedNodes calculé
+  useEffect(() => {
+    if (pendingClusterSelect && groupedNodes.length > 0) {
+      const group = groupedNodes.find(g => g.connId === pendingClusterSelect)
+      if (group && group.isCluster) {
+        handleNodeChange(`cluster:${pendingClusterSelect}`)
+      } else if (group) {
+        const nodeName = group.nodes[0]?.node || ''
+        setSelectedNodeValue(nodeName)
+        setResolvedNode(nodeName)
+        setSelectedConnection(pendingClusterSelect)
+      }
+      setPendingClusterSelect(null)
+    }
+  }, [pendingClusterSelect, groupedNodes])
+
+  // Quand on sélectionne un node ou cluster
+  const handleNodeChange = (value: string) => {
+    setSelectedNodeValue(value)
+    if (value.startsWith('cluster:')) {
+      const connId = value.replaceAll('cluster:', '')
+      const bestNode = findBestNode(connId)
+      if (bestNode) {
+        setResolvedNode(bestNode)
+        setSelectedConnection(connId)
+        void loadNextVmid(connId)
+      }
+    } else {
+      setResolvedNode(value)
+      const nodeData = nodes.find(n => n.node === value)
+      if (nodeData) {
+        setSelectedConnection(nodeData.connId)
+        void loadNextVmid(nodeData.connId)
+      }
+    }
+  }
+
+  const loadStorages = async (connId: string) => {
+    try {
+      let allStorages: any[]
+      if (hideNodePicker) {
+        allStorages = await loadTenantNodeStorages(connId, resolvedNode)
+      } else {
+        const storagesRes = await fetch(`/api/v1/connections/${encodeURIComponent(connId)}/storage`)
+        const storagesJson = await storagesRes.json()
+        allStorages = storagesJson.data || []
+      }
+      setStorages(allStorages)
+
+      // Auto-select defaults from filtered storages (only shared + local for resolvedNode)
+      const filteredIso = allStorages.filter((s: any) =>
+        s.content?.includes('iso') && (s.shared || s.node === resolvedNode)
+      )
+      const filteredDisk = allStorages.filter((s: any) =>
+        !s.isoOnly && (s.content?.includes('images') || s.content?.includes('rootdir')) && (s.shared || s.node === resolvedNode)
+      )
+
+      if (filteredIso.length > 0 && !isoStorage) {
+        setIsoStorage(filteredIso[0].storage)
+      }
+
+      if (filteredDisk.length > 0) {
+        setDisks(prev => {
+          if (prev.length > 0 && !prev[0].storage) {
+            const updated = [...prev]
+            const seeded = filteredDisk[0]
+
+            updated[0] = {
+              ...updated[0],
+              storage: seeded.storage,
+              format: seeded.defaultFormat || vmDiskFormats({ type: seeded.type }).defaultFormat,
+            }
+            return updated
+          }
+          return prev
+        })
+      }
+    } catch (e) {
+      console.error('Error loading storages:', e)
+    }
+  }
+
+  const loadIsoImages = async (connId: string, node: string, storage: string) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(connId)}/nodes/${encodeURIComponent(node)}/storage/${encodeURIComponent(storage)}/content?content=iso`
+      )
+
+      if (res.ok) {
+        const json = await res.json()
+
+        setIsoImages(json.data || [])
+      }
+    } catch (e) {
+      // API might not exist, fallback to empty
+      setIsoImages([])
+    }
+  }
+
+  const handleCreate = async () => {
+    setCreating(true)
+    setError(null)
+    
+    try {
+      const payload: any = {
+        vmid: Number.parseInt(vmid, 10),
+        ostype: guestOsVersion,
+        sockets: cpuSockets,
+        cores: cpuCores,
+        memory: memorySize,
+        scsihw: scsiController,
+        agent: qemuAgent ? 1 : 0,
+        onboot: startOnBoot ? 1 : 0,
+      }
+
+      // Nom (optionnel)
+      if (vmName) payload.name = vmName
+
+      // CPU type (seulement si différent de défaut). Sous une policy
+      // restrictive on l'envoie toujours : le défaut PVE n'est pas forcément
+      // dans la liste autorisée.
+      const flags = cpuAdvancedHidden ? {} : cpuFlags
+      if (cpuType && (cpuType !== 'kvm64' || cpuPolicy?.allowed || Object.keys(flags).length > 0)) {
+        payload.cpu = cpuWithFlags(cpuType, flags)
+      }
+
+      // Ballooning
+      if (ballooning && minMemory < memorySize) {
+        payload.balloon = minMemory
+      }
+
+      // BIOS (seulement si OVMF/UEFI)
+      if (bios === 'ovmf') payload.bios = 'ovmf'
+
+      // Machine type: a pinned version goes as its versioned id; i440fx
+      // unpinned is the PVE default and needs no key.
+      if (pinnedMachine) payload.machine = pinnedMachine.id
+      else if (machine === 'q35') payload.machine = 'q35'
+
+      // Carte graphique : "default" laisse PVE choisir selon l'OS (#1157)
+      if (graphicCard !== 'default') payload.vga = graphicCard
+
+      // Disques
+      for (const disk of disks) {
+        if (disk.importMode && disk.storage && disk.importVolume) {
+          // Import existing disk: PVE 8.2+ syntax
+          // target-storage:0 means "auto-allocate from source size"
+          // import-from=<source-volid> points to the existing disk image
+          let diskConfig = `${disk.storage}:0,import-from=${disk.importVolume}`
+          if (disk.format !== 'raw') diskConfig += `,format=${disk.format}`
+          if (disk.cache !== 'none') diskConfig += `,cache=${disk.cache}`
+          if (disk.discard) diskConfig += ',discard=on'
+          if (disk.ioThread) diskConfig += ',iothread=1'
+          if (disk.ssd) diskConfig += ',ssd=1'
+          if (!disk.backup) diskConfig += ',backup=0'
+          payload[`${disk.bus}${disk.index}`] = diskConfig
+        } else if (disk.storage) {
+          // Create new empty disk
+          let diskConfig = `${disk.storage}:${disk.size}`
+          if (disk.format !== 'raw') diskConfig += `,format=${disk.format}`
+          if (disk.cache !== 'none') diskConfig += `,cache=${disk.cache}`
+          if (disk.discard) diskConfig += ',discard=on'
+          if (disk.ioThread) diskConfig += ',iothread=1'
+          if (disk.ssd) diskConfig += ',ssd=1'
+          if (!disk.backup) diskConfig += ',backup=0'
+          payload[`${disk.bus}${disk.index}`] = diskConfig
+        }
+      }
+
+      // ISO
+      if (osMediaType === 'iso' && isoStorage && isoImage) {
+        payload.cdrom = `${isoStorage}:iso/${isoImage}`
+      }
+
+      // Réseau
+      if (!noNetwork) {
+        nics.forEach((nic, i) => {
+          const selectedBridge = bridges.find((b: any) => b.iface === nic.bridge)
+          // Skip the 802.1Q tag on VXLAN SDN VNets — the VNI already carries
+          // isolation, tagging on top is virtually never intended.
+          const skipVlanTag = selectedBridge?.type === 'vnet'
+          let netStr = `${nic.model},bridge=${nic.bridge}`
+          if (canEditVlan && nic.vlanTag && !skipVlanTag) netStr += `,tag=${nic.vlanTag}`
+          if (canEditMac && nic.macAddress && nic.macAddress !== 'auto') netStr += `,macaddr=${nic.macAddress}`
+          if (nic.firewall) netStr += ',firewall=1'
+          if (nic.rateLimit) netStr += `,rate=${nic.rateLimit}`
+          if (nic.disconnect) netStr += ',link_down=1'
+          if (nic.model === 'virtio' && nic.mtu) netStr += `,mtu=${nic.mtu}`
+          if (nic.model === 'virtio' && nic.queues) netStr += `,queues=${nic.queues}`
+          ;(payload as any)[`net${i}`] = netStr
+        })
+      }
+
+      // CPU (advanced controls are hidden by the vDC compute policy when
+      // cpuAdvancedHidden, and the server would refuse them)
+      if (!cpuAdvancedHidden) {
+        if (cpuUnits !== 1024) payload.cpuunits = cpuUnits
+        if (cpuLimit > 0) payload.cpulimit = cpuLimit
+        if (enableNuma) payload.numa = 1
+      }
+
+      // Startup
+      if (startupOrder || startupDelay || shutdownTimeout) {
+        const parts = []
+
+        if (startupOrder) parts.push(`order=${startupOrder}`)
+        if (startupDelay) parts.push(`up=${startupDelay}`)
+        if (shutdownTimeout) parts.push(`down=${shutdownTimeout}`)
+        payload.startup = parts.join(',')
+      }
+
+      // Pool
+      if (resourcePool) payload.pool = resourcePool
+
+      console.log('Creating VM with payload:', payload)
+
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(selectedConnection)}/guests/qemu/${encodeURIComponent(resolvedNode)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }
+      )
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+
+        throw new Error(err?.error || `HTTP ${res.status}`)
+      }
+
+      // Appeler le callback avec les infos de la VM créée
+      onCreated?.(vmid, selectedConnection, resolvedNode)
+      onClose()
+    } catch (e: any) {
+      setError(e?.message || t('errors.addError'))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const tabs = [
+    t('inventory.createVm.tabs.general'),
+    t('inventory.createVm.tabs.os'),
+    t('inventory.createVm.tabs.system'),
+    t('inventory.createVm.tabs.disks'),
+    t('inventory.createVm.tabs.cpu'),
+    t('inventory.createVm.tabs.memory'),
+    t('inventory.createVm.tabs.network'),
+    t('inventory.createVm.tabs.confirm'),
+  ]
+  
+  // Filtrer les storages selon leur contenu ET le node sélectionné
+  const isoStoragesList = useMemo(() =>
+    storages.filter(s => s.content?.includes('iso') && (s.shared || s.node === resolvedNode)),
+    [storages, resolvedNode]
+  )
+  const diskStoragesList = useMemo(() =>
+    storages.filter(s => !s.isoOnly && (s.content?.includes('images') || s.content?.includes('rootdir')) && (s.shared || s.node === resolvedNode)),
+    [storages, resolvedNode]
+  )
+
+  const renderTabContent = () => {
+    switch (activeTab) {
+      case 0: // General
+        return (
+          <Stack spacing={1.5}>
+            {/* Node picker hidden for tenants: placement is auto-resolved on
+                the least-loaded node in their vDC scope. The selectedNodeValue
+                state is still set silently so downstream API calls work. */}
+            {!hideNodePicker && (
+            <FormControl fullWidth size="small">
+              <InputLabel>{t('inventory.createVm.node')}</InputLabel>
+              <Select
+                value={selectedNodeValue}
+                onChange={(e) => handleNodeChange(e.target.value)}
+                label={t('inventory.createVm.node')}
+                MenuProps={{ PaperProps: { sx: { maxHeight: 400 } } }}
+              >
+                {groupedNodes.map(group => [
+                  // Cluster header (si multi-nodes) — hidden for vDC tenant users
+                  isAdmin && group.isCluster && (
+                    <MenuItem
+                      key={`cluster:${group.connId}`}
+                      value={`cluster:${group.connId}`}
+                      sx={{
+                        bgcolor: 'action.hover',
+                        borderBottom: '1px solid',
+                        borderColor: 'divider',
+                        '&:hover': { bgcolor: 'action.selected' }
+                      }}
+                    >
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: '100%' }}>
+                        <Box sx={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: 16, height: 16, flexShrink: 0 }}>
+                          <i className="ri-server-fill" style={{ fontSize: 16, color: theme.palette.primary.main }} />
+                          <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 8, height: 8, borderRadius: '50%', bgcolor: group.nodes.every((nn: any) => nn.status === 'online') ? 'success.main' : 'warning.main', border: '1.5px solid', borderColor: 'background.paper' }} />
+                        </Box>
+                        <Box sx={{ flex: 1 }}>
+                          <Typography variant="body2" fontWeight={600}>
+                            {group.connName}
+                            <Typography component="span" sx={{ ml: 1, opacity: 0.6, fontSize: '0.8em' }}>
+                              (auto)
+                            </Typography>
+                          </Typography>
+                        </Box>
+                        <Stack direction="row" spacing={1.5} sx={{ mr: 1 }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 70 }}>
+                            <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.7 }}>CPU</Typography>
+                            <Box sx={{ width: 40, height: 14, position: 'relative', bgcolor: 'action.disabledBackground', borderRadius: 0, overflow: 'hidden' }}>
+                              <Box sx={{ width: `${Math.min(100, group.avgCpu)}%`, height: '100%', bgcolor: group.avgCpu > 90 ? 'error.main' : 'primary.main', borderRadius: 0 }} />
+                              <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{group.avgCpu.toFixed(0)}%</Typography>
+                            </Box>
+                          </Box>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 70 }}>
+                            <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.7 }}>RAM</Typography>
+                            <Box sx={{ width: 40, height: 14, position: 'relative', bgcolor: 'action.disabledBackground', borderRadius: 0, overflow: 'hidden' }}>
+                              <Box sx={{ width: `${Math.min(100, group.avgMem)}%`, height: '100%', bgcolor: group.avgMem > 90 ? 'error.main' : 'primary.main', borderRadius: 0 }} />
+                              <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{group.avgMem.toFixed(0)}%</Typography>
+                            </Box>
+                          </Box>
+                        </Stack>
+                      </Box>
+                    </MenuItem>
+                  ),
+                  // Nodes du groupe
+                  ...group.nodes.map(n => {
+                    const isMaintenance = n.hastate === 'maintenance'
+                    const isDisabled = n.status !== 'online' || isMaintenance
+
+                    return (
+                    <MenuItem
+                      key={`${n.connId}-${n.node}`}
+                      value={n.node}
+                      disabled={isDisabled}
+                      sx={{ pl: (isAdmin && group.isCluster) ? 4 : 2 }}
+                    >
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, width: '100%' }}>
+                        <Box sx={{ position: 'relative', display: 'inline-flex', alignItems: 'center', width: 14, height: 14, flexShrink: 0 }}>
+                          <img
+                            src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'}
+                            alt="" width={14} height={14}
+                            style={{ opacity: n.status === 'online' ? 0.8 : 0.3 }}
+                          />
+                          <Box sx={{ position: 'absolute', bottom: -2, right: -2, width: 7, height: 7, borderRadius: '50%', bgcolor: isMaintenance ? 'warning.main' : n.status === 'online' ? 'success.main' : 'error.main', border: '1.5px solid', borderColor: 'background.paper' }} />
+                        </Box>
+                        <Box sx={{ flex: 1 }}>
+                          <Typography variant="body2" sx={{ opacity: isDisabled ? 0.5 : 1 }}>
+                            {n.node}
+                            {!group.isCluster && (
+                              <Typography component="span" sx={{ ml: 1, opacity: 0.6, fontSize: '0.8em' }}>
+                                ({n.connName})
+                              </Typography>
+                            )}
+                          </Typography>
+                        </Box>
+                        {n.status === 'online' && !isMaintenance && (
+                          <Stack direction="row" spacing={1.5} sx={{ mr: 1 }}>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 70 }}>
+                              <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.7 }}>CPU</Typography>
+                              <Box sx={{ width: 40, height: 14, position: 'relative', bgcolor: 'action.disabledBackground', borderRadius: 0, overflow: 'hidden' }}>
+                                <Box sx={{ width: `${Math.min(100, n.cpuPct || 0)}%`, height: '100%', bgcolor: (n.cpuPct || 0) > 90 ? 'error.main' : 'primary.main', borderRadius: 0 }} />
+                                <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{(n.cpuPct || 0).toFixed(0)}%</Typography>
+                              </Box>
+                            </Box>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 70 }}>
+                              <Typography variant="caption" sx={{ fontSize: 10, opacity: 0.7 }}>RAM</Typography>
+                              <Box sx={{ width: 40, height: 14, position: 'relative', bgcolor: 'action.disabledBackground', borderRadius: 0, overflow: 'hidden' }}>
+                                <Box sx={{ width: `${Math.min(100, n.memPct || 0)}%`, height: '100%', bgcolor: (n.memPct || 0) > 90 ? 'error.main' : 'primary.main', borderRadius: 0 }} />
+                                <Typography variant="caption" sx={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', fontWeight: 700, color: '#fff', lineHeight: 1, textShadow: '0 0 2px rgba(0,0,0,0.5)' }}>{(n.memPct || 0).toFixed(0)}%</Typography>
+                              </Box>
+                            </Box>
+                          </Stack>
+                        )}
+                        {isMaintenance && (
+                          <Chip label="maintenance" size="small" color="warning" sx={{ height: 18, fontSize: 10 }} />
+                        )}
+                        {n.status !== 'online' && !isMaintenance && (
+                          <Chip label="offline" size="small" sx={{ height: 18, fontSize: 10 }} />
+                        )}
+                      </Box>
+                    </MenuItem>
+                    )
+                  })
+                ]).flat().filter(Boolean)}
+              </Select>
+            </FormControl>
+            )}
+            {/* vDC tenant (#1171): the vDC replaces the node picker, among those
+                open to blank VMs, when there is a choice to make. */}
+            {hideNodePicker && blankVdcs.length > 1 && (
+              <FormControl fullWidth size="small">
+                <InputLabel id="create-vm-vdc-label">{t('myVdc.selectVdc')}</InputLabel>
+                <Select
+                  labelId="create-vm-vdc-label"
+                  value={tenantVdcId}
+                  label={t('myVdc.selectVdc')}
+                  onChange={(e) => handleTenantVdcChange(String(e.target.value))}
+                >
+                  {blankVdcs.map(v => (
+                    <MenuItem key={v.id} value={v.id}>{v.name}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            )}
+            {hideNodePicker && !loadingData && blankVdcs.length === 0 && (
+              <Alert severity="info">{t('inventory.createVm.noBlankVmVdc')}</Alert>
+            )}
+            {hideNodePicker && !loadingData && !!tenantVdcId && !resolvedNode && (
+              <Alert severity="warning">{t('inventory.createVm.noVdcNode')}</Alert>
+            )}
+            {/* Resource pool selector, hidden for vDC tenants (pool assigned
+                automatically). Pool-scoped callers keep it: the list is their
+                own scope and the guest has to land inside it (issue #262). */}
+            {(isAdmin || poolsRestricted) && (
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('inventory.createVm.resourcePool')}</InputLabel>
+                <Select value={resourcePool} onChange={(e) => setResourcePool(e.target.value)} label={t('inventory.createVm.resourcePool')}>
+                  {!poolsRestricted && <MenuItem value="">({t('common.none')})</MenuItem>}
+                  {pools.map((p) => (
+                    <MenuItem key={p.poolid} value={p.poolid}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <i className="ri-folder-line" style={{ fontSize: 14, opacity: 0.7 }} />
+                        <Box>
+                          <Typography variant="body2">{p.poolid}</Typography>
+                          {p.comment && (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontSize: '0.65rem' }}>
+                              {p.comment}
+                            </Typography>
+                          )}
+                        </Box>
+                      </Box>
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            )}
+            {/* VMID is a Proxmox implementation detail — hidden from tenants
+                (auto-generated via /cluster/nextid in loadNextVmid). Provider
+                keeps the field visible to set/override manually. */}
+            {!hideNodePicker && (
+              <TextField
+                label="VM ID"
+                value={vmid}
+                onChange={(e) => handleVmidChange(e.target.value)}
+                size="small"
+                error={!!vmidError}
+                helperText={vmidError}
+                inputProps={{ inputMode: 'numeric', pattern: '[0-9]*' }}
+                slotProps={{
+                  input: {
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        <Tooltip title={t('inventory.createVm.generateVmId')}>
+                          <IconButton size="small" onClick={generateNextVmid} edge="end">
+                            <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+                          </IconButton>
+                        </Tooltip>
+                      </InputAdornment>
+                    )
+                  }
+                }}
+              />
+            )}
+            <TextField label={t('inventory.createVm.vmName')} value={vmName} onChange={(e) => setVmName(e.target.value)} size="small" fullWidth />
+
+            {/* Boot & Shutdown — collapsible */}
+            <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
+              <Box
+                onClick={() => setBootSectionExpanded(v => !v)}
+                sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25, cursor: 'pointer', '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) } }}
+              >
+                <i className={bootSectionExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                <i className="ri-timer-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.bootShutdown')}</Typography>
+                <Box sx={{ flex: 1 }} />
+                {startOnBoot && <Chip label={t('inventory.createVm.startAtBoot')} size="small" variant="outlined" color="success" sx={{ fontSize: 10, height: 20 }} />}
+              </Box>
+              <Collapse in={bootSectionExpanded}>
+                <Box sx={{ px: 2, pb: 2, pt: 0.5, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                  <FormControlLabel
+                    control={<Switch checked={startOnBoot} onChange={(e) => setStartOnBoot(e.target.checked)} size="small" />}
+                    label={t('inventory.createVm.startAtBoot')}
+                    sx={{ gridColumn: '1 / -1' }}
+                  />
+                  <TextField label={t('inventory.createVm.startupShutdownOrder')} value={startupOrder} onChange={(e) => setStartupOrder(e.target.value)} size="small" placeholder="any" />
+                  <TextField label={t('inventory.createVm.startupDelay')} value={startupDelay} onChange={(e) => setStartupDelay(e.target.value)} size="small" placeholder="default" />
+                  <TextField label={t('inventory.createVm.shutdownTimeout')} value={shutdownTimeout} onChange={(e) => setShutdownTimeout(e.target.value)} size="small" placeholder="default" />
+                </Box>
+              </Collapse>
+            </Box>
+          </Stack>
+        )
+
+      case 1: // OS
+        {
+          return (
+            <Stack spacing={2}>
+              {/* Quick presets */}
+              <Box>
+                <Typography variant="caption" fontWeight={700} sx={{ display: 'block', opacity: 0.5, mb: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {t('inventory.createVm.osPresets')}
+                </Typography>
+                <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 1 }}>
+                  {OS_PRESETS.map((p) => {
+                    const isActive = selectedOsPreset === p.id
+                    return (
+                      <Box
+                        key={p.id}
+                        onClick={() => { setGuestOsType(p.type); setGuestOsVersion(p.version); setSelectedOsPreset(p.id) }}
+                        sx={{
+                          border: '1px solid', borderColor: isActive ? 'primary.main' : 'divider', borderRadius: 2,
+                          px: 1.5, py: 1, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1,
+                          bgcolor: isActive ? alpha(theme.palette.primary.main, 0.06) : 'transparent',
+                          transition: 'all 0.15s',
+                          '&:hover': { borderColor: 'primary.main', bgcolor: alpha(theme.palette.primary.main, 0.03) },
+                        }}
+                      >
+                        {p.svgIcon
+                          ? <img src={p.svgIcon} alt="" width={20} height={20} style={{ opacity: isActive ? 1 : 0.5 }} />
+                          : <i className={p.icon} style={{ fontSize: 20, opacity: isActive ? 1 : 0.5 }} />
+                        }
+                        <Typography variant="body2" fontSize={12} fontWeight={isActive ? 700 : 400}>{p.label}</Typography>
+                      </Box>
+                    )
+                  })}
+                </Box>
+              </Box>
+
+              {/* ISO media section */}
+              <Box sx={{ border: '1px solid', borderColor: osMediaType === 'iso' ? 'primary.main' : 'divider', borderRadius: 2, overflow: 'hidden', transition: 'border-color 0.2s' }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25 }}>
+                  <i className="ri-disc-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                  <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.installMedia')}</Typography>
+                  <Box sx={{ flex: 1 }} />
+                  <FormControlLabel
+                    control={<Switch checked={osMediaType === 'iso'} onChange={(e) => setOsMediaType(e.target.checked ? 'iso' : 'none')} size="small" />}
+                    label=""
+                    sx={{ mr: 0 }}
+                  />
+                </Box>
+
+                <Collapse in={osMediaType === 'iso'}>
+                  <Box sx={{ px: 2, pb: 2, pt: 0.5, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>{t('inventory.createVm.storage')}</InputLabel>
+                      <Select value={isoStorage} onChange={(e) => setIsoStorage(e.target.value)} label={t('inventory.createVm.storage')}>
+                        {isoStoragesList.map(s => (
+                          <MenuItem key={s.id || s.storage} value={s.storage}>
+                            {s.storage} ({s.type}){!hideNodePicker && !s.shared && s.node ? ` — ${s.node}` : ''}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl fullWidth size="small">
+                      <InputLabel>{t('inventory.createVm.isoImage')}</InputLabel>
+                      <Select value={isoImage} onChange={(e) => setIsoImage(e.target.value)} label={t('inventory.createVm.isoImage')}>
+                        {isoImages.length > 0 ? (
+                          isoImages.map((iso: any) => (
+                            <MenuItem key={iso.volid || iso.name} value={iso.name || iso.volid?.split('/').pop()}>
+                              {iso.name || iso.volid?.split('/').pop()}
+                            </MenuItem>
+                          ))
+                        ) : (
+                          <MenuItem value="" disabled>{t('common.noData')}</MenuItem>
+                        )}
+                      </Select>
+                    </FormControl>
+                    {/* Bring your own ISO (#1171): renders only on a storage
+                        the tenant may upload to, so the provider sees nothing. */}
+                    {isoStoragesList.find(s => s.storage === isoStorage)?.tenantCanUpload && (
+                    <Box sx={{ gridColumn: '1 / -1' }}>
+                      <IsoUploadControls
+                        connId={selectedConnection}
+                        node={resolvedNode}
+                        storage={isoStorage}
+                        storageRow={isoStoragesList.find(s => s.storage === isoStorage)}
+                        selectedIso={isoImage}
+                        onBusy={setIsoBusy}
+                        onUploaded={async (filename) => { await loadIsoImages(selectedConnection, resolvedNode, isoStorage); setIsoImage(filename) }}
+                        onDeleted={async () => { setIsoImage(''); await loadIsoImages(selectedConnection, resolvedNode, isoStorage) }}
+                      />
+                    </Box>
+                    )}
+                  </Box>
+                </Collapse>
+
+                {osMediaType === 'none' && (
+                  <Box sx={{ px: 2, pb: 2, display: 'flex', alignItems: 'center', gap: 1, opacity: 0.4 }}>
+                    <i className="ri-close-circle-line" style={{ fontSize: 16 }} />
+                    <Typography variant="body2" fontSize={12}>{t('inventory.createVm.doNotUseMedia')}</Typography>
+                  </Box>
+                )}
+              </Box>
+
+              {/* Guest OS type + version */}
+              <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 2 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+                  {guestOsType === 'Linux' ? <img src="/images/os/linux.svg" alt="" width={16} height={16} style={{ opacity: 0.6 }} />
+                    : guestOsType === 'Windows' ? <i className="ri-windows-fill" style={{ fontSize: 16, opacity: 0.6 }} />
+                    : guestOsType === 'Solaris' ? <i className="ri-sun-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                    : <i className="ri-question-line" style={{ fontSize: 16, opacity: 0.6 }} />}
+                  <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.guestOs')}</Typography>
+                </Box>
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>{t('inventory.createVm.osType')}</InputLabel>
+                    <Select
+                      value={guestOsType}
+                      onChange={(e) => { setGuestOsType(e.target.value); setGuestOsVersion(GUEST_OS_VERSIONS[e.target.value]?.[0]?.value ?? 'other') }}
+                      label={t('inventory.createVm.osType')}
+                      renderValue={(val) => (
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          {val === 'Linux' ? <img src="/images/os/linux.svg" alt="" width={18} height={18} style={{ opacity: 0.8 }} />
+                            : val === 'Windows' ? <i className="ri-windows-fill" style={{ fontSize: 18, opacity: 0.8 }} />
+                            : val === 'Solaris' ? <i className="ri-sun-line" style={{ fontSize: 18, opacity: 0.8 }} />
+                            : <i className="ri-question-line" style={{ fontSize: 18, opacity: 0.8 }} />}
+                          {t(`inventory.createVm.os${val}`)}
+                        </Box>
+                      )}
+                    >
+                      <MenuItem value="Linux"><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><img src="/images/os/linux.svg" alt="" width={18} height={18} style={{ opacity: 0.8 }} />{t('inventory.createVm.osLinux')}</Box></MenuItem>
+                      <MenuItem value="Windows"><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-windows-fill" style={{ fontSize: 18, opacity: 0.8 }} />{t('inventory.createVm.osWindows')}</Box></MenuItem>
+                      <MenuItem value="Solaris"><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-sun-line" style={{ fontSize: 18, opacity: 0.8 }} />{t('inventory.createVm.osSolaris')}</Box></MenuItem>
+                      <MenuItem value="Other"><Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><i className="ri-question-line" style={{ fontSize: 18, opacity: 0.8 }} />{t('inventory.createVm.osOther')}</Box></MenuItem>
+                    </Select>
+                  </FormControl>
+                  <FormControl fullWidth size="small">
+                    <InputLabel>{t('inventory.createVm.osVersion')}</InputLabel>
+                    <Select value={guestOsVersion} onChange={(e) => setGuestOsVersion(e.target.value)} label={t('inventory.createVm.osVersion')}>
+                      {(GUEST_OS_VERSIONS[guestOsType] ?? []).map(v => <MenuItem key={v.value} value={v.value}>{v.label}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                </Box>
+              </Box>
+            </Stack>
+          )
+        }
+
+      case 2: // System
+        return (
+          <Stack spacing={1.5}>
+            {/* Hardware card */}
+            <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 2 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+                <i className="ri-cpu-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.hardware')}</Typography>
+              </Box>
+              <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('inventory.createVm.machine')}</InputLabel>
+                  <Select value={machine} onChange={(e) => { setMachine(e.target.value); setMachineVersion('latest') }} label={t('inventory.createVm.machine')}>
+                    <MenuItem value="i440fx">Default (i440fx)</MenuItem>
+                    <MenuItem value="q35">q35</MenuItem>
+                  </Select>
+                </FormControl>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('inventory.createVm.machineVersion')}</InputLabel>
+                  <Select
+                    value={pinnedMachine ? machineVersion : 'latest'}
+                    onChange={(e) => setMachineVersion(e.target.value)}
+                    label={t('inventory.createVm.machineVersion')}
+                    renderValue={(v) => familyMachineVersions.find(m => m.id === v)?.version ?? t('inventory.createVm.machineVersionLatest')}
+                    MenuProps={{ PaperProps: { sx: { maxHeight: 360 } } }}
+                  >
+                    <MenuItem value="latest">{t('inventory.createVm.machineVersionLatest')}</MenuItem>
+                    {familyMachineVersions.map(m => (
+                      <MenuItem key={m.id} value={m.id} sx={{ display: 'block' }}>
+                        {m.version}
+                        {m.changes && (
+                          <Typography variant="caption" sx={{ display: 'block', opacity: 0.6, whiteSpace: 'normal', maxWidth: 360 }}>{m.changes}</Typography>
+                        )}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('inventory.createVm.scsiController')}</InputLabel>
+                  <Select value={scsiController} onChange={(e) => setScsiController(e.target.value)} label={t('inventory.createVm.scsiController')}>
+                    <MenuItem value="virtio-scsi-single">VirtIO SCSI single</MenuItem>
+                    <MenuItem value="virtio-scsi-pci">VirtIO SCSI</MenuItem>
+                    <MenuItem value="lsi">LSI 53C895A</MenuItem>
+                    <MenuItem value="lsi53c810">LSI 53C810</MenuItem>
+                    <MenuItem value="megasas">MegaRAID SAS</MenuItem>
+                    <MenuItem value="pvscsi">VMware PVSCSI</MenuItem>
+                  </Select>
+                </FormControl>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('inventory.createVm.graphicCard')}</InputLabel>
+                  <Select value={graphicCard} onChange={(e) => setGraphicCard(e.target.value)} label={t('inventory.createVm.graphicCard')}>
+                    <MenuItem value="default">Default</MenuItem>
+                    <MenuItem value="std">Standard VGA</MenuItem>
+                    <MenuItem value="vmware">VMware compatible</MenuItem>
+                    <MenuItem value="qxl">SPICE (qxl)</MenuItem>
+                    <MenuItem value="virtio">VirtIO-GPU</MenuItem>
+                    <MenuItem value="none">None</MenuItem>
+                  </Select>
+                </FormControl>
+                <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                  <FormControlLabel
+                    control={<Switch checked={qemuAgent} onChange={(e) => setQemuAgent(e.target.checked)} size="small" />}
+                    label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.qemuAgent')}</Typography>}
+                  />
+                </Box>
+              </Box>
+            </Box>
+
+            {/* Firmware card */}
+            <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 2 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1.5 }}>
+                <i className="ri-flashlight-line" style={{ fontSize: 16, opacity: 0.6 }} />
+                <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.firmware')}</Typography>
+              </Box>
+              {/* BIOS presets */}
+              <Box sx={{ display: 'flex', gap: 0.75, mb: 1.5 }}>
+                {([
+                  { val: 'seabios', label: 'SeaBIOS (Legacy)', icon: 'ri-terminal-box-line' },
+                  { val: 'ovmf', label: 'OVMF (UEFI)', icon: 'ri-shield-check-line' },
+                ] as const).map(fw => (
+                  <Box
+                    key={fw.val}
+                    onClick={() => setBios(fw.val)}
+                    sx={{
+                      flex: 1, border: '1px solid', borderColor: bios === fw.val ? 'primary.main' : 'divider', borderRadius: 2,
+                      px: 1.5, py: 1, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1,
+                      bgcolor: bios === fw.val ? alpha(theme.palette.primary.main, 0.06) : 'transparent',
+                      transition: 'all 0.15s',
+                      '&:hover': { borderColor: 'primary.main', bgcolor: alpha(theme.palette.primary.main, 0.03) },
+                    }}
+                  >
+                    <i className={fw.icon} style={{ fontSize: 18, opacity: bios === fw.val ? 1 : 0.5 }} />
+                    <Typography variant="body2" fontSize={12} fontWeight={bios === fw.val ? 700 : 400}>{fw.label}</Typography>
+                  </Box>
+                ))}
+              </Box>
+              <FormControlLabel
+                control={<Switch checked={addTpm} onChange={(e) => setAddTpm(e.target.checked)} size="small" />}
+                label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.addTpm')}</Typography>}
+              />
+              {bios === 'ovmf' && (
+                <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.5 }}>
+                  {t('inventory.createVm.uefiHint')}
+                </Typography>
+              )}
+            </Box>
+          </Stack>
+        )
+
+      case 3: // Disks
+        return (
+          <Stack spacing={1.5}>
+            {disks.map((disk, diskIdx) => {
+              const isExpanded = expandedDisks.has(diskIdx)
+              const toggleExpand = () => setExpandedDisks(s => { const n = new Set(s); n.has(diskIdx) ? n.delete(diskIdx) : n.add(diskIdx); return n })
+              const storageName = diskStoragesList.find(s => s.storage === disk.storage)
+              return (
+                <Box key={diskIdx} sx={{ border: '1px solid', borderColor: isExpanded ? 'primary.main' : 'divider', borderRadius: 2, overflow: 'hidden', transition: 'border-color 0.2s' }}>
+                  {/* Compact header line */}
+                  <Box
+                    onClick={toggleExpand}
+                    sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25, cursor: 'pointer', bgcolor: isExpanded ? alpha(theme.palette.primary.main, 0.04) : 'transparent', '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.06) } }}
+                  >
+                    <i className={isExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                    <Chip label={`${disk.bus}${disk.index}`} size="small" sx={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11, fontWeight: 700, height: 24 }} />
+                    {disk.importMode ? (
+                      <>
+                        <Chip label="Import" size="small" color="info" variant="outlined" sx={{ height: 20, fontSize: 10 }} />
+                        <Typography variant="body2" fontSize={12} sx={{ opacity: 0.6 }} noWrap>{disk.importVolume ? disk.importVolume.split('/').pop() : '—'}</Typography>
+                      </>
+                    ) : (
+                      <>
+                        <Typography variant="body2" fontSize={12} sx={{ opacity: 0.6 }}>{disk.storage || '—'}{storageName ? ` (${storageName.type})` : ''}</Typography>
+                        <Typography variant="body2" fontSize={12} fontWeight={700}>{disk.size} GiB</Typography>
+                      </>
+                    )}
+                    <Typography variant="body2" fontSize={11} sx={{ opacity: 0.4 }}>{disk.format}</Typography>
+                    <Box sx={{ flex: 1 }} />
+                    {disks.length > 1 && (
+                      <Tooltip title="Remove disk">
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); removeDisk(diskIdx) }} color="error" sx={{ p: 0.5 }}>
+                          <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                  </Box>
+
+                  {/* Expanded content */}
+                  <Collapse in={isExpanded}>
+                    <Box sx={{ px: 2, pb: 2, pt: 1 }}>
+                      {/* Mode toggle: New disk / Import existing */}
+                      <Box sx={{ display: 'flex', gap: 0.75, mb: 2 }}>
+                        {([
+                          { mode: false, label: t('inventory.createVm.newDisk'), icon: 'ri-add-circle-line' },
+                          { mode: true, label: t('inventory.createVm.importDisk'), icon: 'ri-download-2-line' },
+                        ] as const).map(opt => (
+                          <Box
+                            key={String(opt.mode)}
+                            onClick={() => updateDisk(diskIdx, { importMode: opt.mode })}
+                            sx={{
+                              flex: 1, border: '1px solid', borderColor: disk.importMode === opt.mode ? 'primary.main' : 'divider', borderRadius: 1.5,
+                              px: 1.5, py: 0.75, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 1,
+                              bgcolor: disk.importMode === opt.mode ? alpha(theme.palette.primary.main, 0.06) : 'transparent',
+                              transition: 'all 0.15s',
+                              '&:hover': { borderColor: 'primary.main' },
+                            }}
+                          >
+                            <i className={opt.icon} style={{ fontSize: 16, opacity: disk.importMode === opt.mode ? 1 : 0.5 }} />
+                            <Typography variant="body2" fontSize={12} fontWeight={disk.importMode === opt.mode ? 700 : 400}>{opt.label}</Typography>
+                          </Box>
+                        ))}
+                      </Box>
+
+                      {/* Essential fields */}
+                      {disk.importMode ? (
+                        /* ── Import mode: bus + target storage + source storage + volume picker ── */
+                        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5, mb: 2 }}>
+                          <FormControl size="small">
+                            <InputLabel>{t('inventory.createVm.busDevice')}</InputLabel>
+                            <Select value={disk.bus} onChange={(e) => updateDisk(diskIdx, { bus: e.target.value })} label={t('inventory.createVm.busDevice')}>
+                              <MenuItem value="scsi">SCSI</MenuItem>
+                              <MenuItem value="virtio">VirtIO Block</MenuItem>
+                              <MenuItem value="sata">SATA</MenuItem>
+                              <MenuItem value="ide">IDE</MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControl size="small">
+                            <InputLabel>{t('inventory.createVm.storage')} ({t('inventory.createVm.target')})</InputLabel>
+                            <Select value={disk.storage} onChange={(e) => updateDisk(diskIdx, { storage: e.target.value })} label={`${t('inventory.createVm.storage')} (${t('inventory.createVm.target')})`} renderValue={(val) => { const s = diskStoragesList.find(x => x.storage === val); return s ? `${s.storage}${!hideNodePicker && !s.shared && s.node ? ` — ${s.node}` : ''}` : String(val) }}>
+                              {diskStoragesList.map(s => {
+                                const total = s.total || 0
+                                const used = s.used || 0
+                                const avail = s.avail ?? (total - used)
+                                const usagePct = total > 0 ? Math.round((used / total) * 100) : 0
+                                const usageColor = usagePct > 90 ? 'error' : usagePct > 75 ? 'warning' : 'primary'
+                                return (
+                                  <MenuItem key={s.id || s.storage} value={s.storage}>
+                                    <Box sx={{ width: '100%' }}>
+                                      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.25 }}>
+                                        <Typography variant="body2" fontSize={13}>{s.storage}{!hideNodePicker && !s.shared && s.node ? ` — ${s.node}` : ''}</Typography>
+                                        {total > 0 && <Typography variant="caption" color="text.secondary">{formatBytes(avail)} free / {formatBytes(total)}</Typography>}
+                                      </Box>
+                                      {total > 0 && <LinearProgress variant="determinate" value={usagePct} color={usageColor as any} sx={{ height: 4, borderRadius: 1 }} />}
+                                    </Box>
+                                  </MenuItem>
+                                )
+                              })}
+                            </Select>
+                          </FormControl>
+                          <FormControl size="small">
+                            <InputLabel>{t('inventory.createVm.sourceStorage')}</InputLabel>
+                            <Select
+                              value={disk.importStorage}
+                              onChange={(e) => {
+                                updateDisk(diskIdx, { importStorage: e.target.value, importVolume: '' })
+                                // Fetch available volumes from the source storage
+                                if (e.target.value && selectedConnection && resolvedNode) {
+                                  fetch(`/api/v1/connections/${encodeURIComponent(selectedConnection)}/nodes/${encodeURIComponent(resolvedNode)}/storage/${encodeURIComponent(e.target.value)}/content?content=images,import`)
+                                    .then(r => r.json())
+                                    .then(d => {
+                                      const vols = (d.data || []).map((v: any) => ({ volid: v.volid, format: v.format, size: v.size }))
+                                      setImportVolumes(prev => ({ ...prev, [`${diskIdx}:${e.target.value}`]: vols }))
+                                    })
+                                    .catch(() => {})
+                                }
+                              }}
+                              label={t('inventory.createVm.sourceStorage')}
+                              renderValue={(val) => { const s = diskStoragesList.find(x => x.storage === val); return s ? `${s.storage}` : String(val) }}
+                            >
+                              {diskStoragesList.map(s => (
+                                <MenuItem key={s.id || s.storage} value={s.storage}>
+                                  {s.storage} ({s.type})
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                          <FormControl size="small">
+                            <InputLabel>{t('inventory.createVm.diskImage')}</InputLabel>
+                            <Select
+                              value={disk.importVolume}
+                              onChange={(e) => updateDisk(diskIdx, { importVolume: e.target.value })}
+                              label={t('inventory.createVm.diskImage')}
+                              disabled={!disk.importStorage}
+                            >
+                              {(importVolumes[`${diskIdx}:${disk.importStorage}`] || []).map((v: any) => (
+                                <MenuItem key={v.volid} value={v.volid}>
+                                  {v.volid.includes('/') ? v.volid.split('/').pop() : v.volid}
+                                  {v.size ? ` (${(v.size / 1073741824).toFixed(1)} GB)` : ''}
+                                </MenuItem>
+                              ))}
+                              {(importVolumes[`${diskIdx}:${disk.importStorage}`] || []).length === 0 && disk.importStorage && (
+                                <MenuItem disabled>{t('common.noData')}</MenuItem>
+                              )}
+                            </Select>
+                          </FormControl>
+                        </Box>
+                      ) : (
+                        /* ── New disk mode: bus + storage + size ── */
+                        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 1.5, mb: 2 }}>
+                          <FormControl size="small">
+                            <InputLabel>{t('inventory.createVm.busDevice')}</InputLabel>
+                            <Select value={disk.bus} onChange={(e) => updateDisk(diskIdx, { bus: e.target.value })} label={t('inventory.createVm.busDevice')}>
+                              <MenuItem value="scsi">SCSI</MenuItem>
+                              <MenuItem value="virtio">VirtIO Block</MenuItem>
+                              <MenuItem value="sata">SATA</MenuItem>
+                              <MenuItem value="ide">IDE</MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControl size="small" error={diskStoragesList.length === 0}>
+                            <InputLabel>{t('inventory.createVm.storage')}</InputLabel>
+                            <Select value={disk.storage} onChange={(e) => updateDisk(diskIdx, { storage: e.target.value })} label={t('inventory.createVm.storage')} disabled={diskStoragesList.length === 0} renderValue={(val) => { const s = diskStoragesList.find(x => x.storage === val); return s ? `${s.storage}${!hideNodePicker && !s.shared && s.node ? ` — ${s.node}` : ''}` : String(val) }}>
+                              {diskStoragesList.length === 0 ? (
+                                <MenuItem value="" disabled>
+                                  {storages.length === 0
+                                    ? t('inventory.createVm.emptyState.noStorage')
+                                    : t('inventory.createVm.emptyState.noImageStorage')}
+                                </MenuItem>
+                              ) : (
+                                diskStoragesList.map(s => {
+                                  const total = s.total || 0
+                                  const used = s.used || 0
+                                  const avail = s.avail ?? (total - used)
+                                  const usagePct = total > 0 ? Math.round((used / total) * 100) : 0
+                                  const usageColor = usagePct > 90 ? 'error' : usagePct > 75 ? 'warning' : 'primary'
+                                  return (
+                                    <MenuItem key={s.id || s.storage} value={s.storage}>
+                                      <Box sx={{ width: '100%' }}>
+                                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 0.25 }}>
+                                          <Typography variant="body2" fontSize={13}>{s.storage}{!hideNodePicker && !s.shared && s.node ? ` — ${s.node}` : ''}</Typography>
+                                          {total > 0 && <Typography variant="caption" color="text.secondary">{formatBytes(avail)} free / {formatBytes(total)}</Typography>}
+                                        </Box>
+                                        {total > 0 && <LinearProgress variant="determinate" value={usagePct} color={usageColor as any} sx={{ height: 4, borderRadius: 1 }} />}
+                                      </Box>
+                                    </MenuItem>
+                                  )
+                                })
+                              )}
+                            </Select>
+                            {diskStoragesList.length === 0 && storages.length > 0 && (
+                              <FormHelperText>
+                                {t('inventory.createVm.emptyState.imageStorageHint')}
+                              </FormHelperText>
+                            )}
+                          </FormControl>
+                          <NumericTextField
+                            label={t('inventory.createVm.diskSizeGib')}
+                            value={disk.size}
+                            onChange={(n) => updateDisk(diskIdx, { size: n })}
+                            fallback={0}
+                            format={(n) => (n === 0 ? '' : String(n))}
+                            size="small"
+                            type="number"
+                          />
+                        </Box>
+                      )}
+
+                      {diskIdx === 0 && (
+                        <Typography variant="caption" sx={{ display: 'block', opacity: 0.5, mb: 1.5 }}>{t('inventory.createVm.scsiControllerLabel', { controller: scsiController })} — {t('inventory.createVm.format', { format: disk.format })}</Typography>
+                      )}
+                      {diskIdx !== 0 && (
+                        <Typography variant="caption" sx={{ display: 'block', opacity: 0.5, mb: 1.5 }}>{t('inventory.createVm.format', { format: disk.format })}</Typography>
+                      )}
+
+                      {/* Advanced options */}
+                      <Typography variant="caption" fontWeight={700} sx={{ display: 'block', opacity: 0.5, mb: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                        {t('inventory.createVm.advancedOptions')}
+                      </Typography>
+                      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                        <FormControl size="small">
+                          <InputLabel>{t('inventory.createVm.cache')}</InputLabel>
+                          <Select value={disk.cache} onChange={(e) => updateDisk(diskIdx, { cache: e.target.value })} label={t('inventory.createVm.cache')}>
+                            <MenuItem value="none">{t('inventory.createVm.defaultNoCache')}</MenuItem>
+                            <MenuItem value="directsync">{t('inventory.createVm.directSync')}</MenuItem>
+                            <MenuItem value="writethrough">{t('inventory.createVm.writeThrough')}</MenuItem>
+                            <MenuItem value="writeback">{t('inventory.createVm.writeBack')}</MenuItem>
+                            <MenuItem value="unsafe">{t('inventory.createVm.writeBackUnsafe')}</MenuItem>
+                          </Select>
+                        </FormControl>
+                        <Box />
+                      </Box>
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 1.5 }}>
+                        <FormControlLabel control={<Switch checked={disk.discard} onChange={(e) => updateDisk(diskIdx, { discard: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.discard')}</Typography>} />
+                        <FormControlLabel control={<Switch checked={disk.ioThread} onChange={(e) => updateDisk(diskIdx, { ioThread: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.ioThread')}</Typography>} />
+                        <FormControlLabel control={<Switch checked={disk.ssd} onChange={(e) => updateDisk(diskIdx, { ssd: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.ssdEmulation')}</Typography>} />
+                        <FormControlLabel control={<Switch checked={disk.backup} onChange={(e) => updateDisk(diskIdx, { backup: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.backup')}</Typography>} />
+                      </Box>
+                    </Box>
+                  </Collapse>
+                </Box>
+              )
+            })}
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={<i className="ri-add-line" />}
+              onClick={addDisk}
+              sx={{ alignSelf: 'flex-start' }}
+            >
+              {t('inventory.createVm.addDisk') || 'Add Disk'}
+            </Button>
+          </Stack>
+        )
+
+      case 4: // CPU
+        {
+          const totalVcpus = cpuSockets * cpuCores
+          const cpuPresets = [1, 2, 4, 8, 16, 32]
+          // Cores slide on a power-of-two scale, like the memory slider.
+          const coreMarks = [1, 2, 4, 8, 16, 32, 64, 128]
+          const coresToSlider = (n: number) => {
+            for (let i = coreMarks.length - 1; i >= 0; i--) {
+              if (n >= coreMarks[i]) return i + (n - coreMarks[i]) / (coreMarks[Math.min(i + 1, coreMarks.length - 1)] - coreMarks[i] || 1)
+            }
+            return 0
+          }
+          const sliderToCores = (val: number) => {
+            const idx = Math.floor(val)
+            if (idx >= coreMarks.length - 1) return coreMarks[coreMarks.length - 1]
+            return Math.max(1, Math.round(coreMarks[idx] + (val - idx) * (coreMarks[idx + 1] - coreMarks[idx])))
+          }
+          const sliderSx = { '& .MuiSlider-markLabel': { fontSize: '0.65rem' } }
+          return (
+            <Stack spacing={2}>
+              {/* Label + presets on same line */}
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, whiteSpace: 'nowrap' }}>{t('inventory.createVm.totalCores', { count: totalVcpus })}</Typography>
+                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                  {cpuPresets.map(v => (
+                    <Chip
+                      key={v}
+                      label={`${v} vCPU`}
+                      size="small"
+                      variant={totalVcpus === v ? 'filled' : 'outlined'}
+                      color={totalVcpus === v ? 'primary' : 'default'}
+                      onClick={() => { setCpuSockets(1); setCpuCores(v) }}
+                      sx={{ fontWeight: totalVcpus === v ? 700 : 400, cursor: 'pointer', height: 24, fontSize: 11 }}
+                    />
+                  ))}
+                </Box>
+              </Box>
+
+              {/* Sockets × Cores sliders + fields, then Type */}
+              <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 4, rowGap: 1.5 }}>
+                <Box sx={{ px: 1 }}>
+                  <Slider
+                    aria-label={t('inventory.createVm.sockets')}
+                    value={Math.min(cpuSockets, 4)}
+                    min={1}
+                    max={4}
+                    step={1}
+                    onChange={(_, val) => setCpuSockets(val as number)}
+                    marks={[1, 2, 3, 4].map(v => ({ value: v, label: String(v) }))}
+                    valueLabelDisplay="auto"
+                    sx={sliderSx}
+                  />
+                </Box>
+                <Box sx={{ px: 1 }}>
+                  <Slider
+                    aria-label={t('inventory.createVm.cores')}
+                    value={coresToSlider(cpuCores)}
+                    min={0}
+                    max={coreMarks.length - 1}
+                    step={0.01}
+                    onChange={(_, val) => setCpuCores(sliderToCores(val as number))}
+                    marks={coreMarks.map((m, i) => ({ value: i, label: String(m) }))}
+                    valueLabelDisplay="auto"
+                    valueLabelFormat={() => String(cpuCores)}
+                    sx={sliderSx}
+                  />
+                </Box>
+                <NumericTextField
+                  label={t('inventory.createVm.sockets')}
+                  value={cpuSockets}
+                  onChange={setCpuSockets}
+                  fallback={1}
+                  size="small"
+                  type="number"
+                  inputProps={{ min: 1, max: 4 }}
+                />
+                <NumericTextField
+                  label={t('inventory.createVm.cores')}
+                  value={cpuCores}
+                  onChange={setCpuCores}
+                  fallback={1}
+                  size="small"
+                  type="number"
+                  inputProps={{ min: 1, max: 128 }}
+                />
+                <FormControl fullWidth size="small" sx={{ gridColumn: '1 / -1' }}>
+                  <InputLabel>{t('inventory.createVm.cpuType')}</InputLabel>
+                  <Select
+                    value={cpuType}
+                    onChange={(e) => { cpuTypeTouched.current = true; setCpuType(e.target.value) }}
+                    label={t('inventory.createVm.cpuType')}
+                  >
+                    {cpuOptionGroups.flatMap((g) => [
+                      <ListSubheader key={`hdr-${g.header}`} disableSticky sx={cpuGroupHeaderSx}>{g.header}</ListSubheader>,
+                      ...g.items.map((i) => (
+                        <MenuItem key={i.value} value={i.value}>{i.label}</MenuItem>
+                      )),
+                    ])}
+                  </Select>
+                </FormControl>
+              </Box>
+
+              {/* Advanced — collapsible */}
+              <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
+                <Box
+                  onClick={() => setCpuAdvancedExpanded(v => !v)}
+                  sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25, cursor: 'pointer', '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) } }}
+                >
+                  <i className={cpuAdvancedExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                  <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.advancedOptions')}</Typography>
+                </Box>
+                <Collapse in={cpuAdvancedExpanded}>
+                  <Box sx={{ px: 2, pb: 2, pt: 0.5, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                    <TextField
+                      label={t('inventory.createVm.vcpus')}
+                      value={totalVcpus}
+                      size="small"
+                      disabled
+                    />
+                    {!cpuAdvancedHidden && (
+                      <>
+                        <NumericTextField
+                          label={t('inventory.createVm.cpuUnits')}
+                          value={cpuUnits}
+                          onChange={setCpuUnits}
+                          fallback={100}
+                          size="small"
+                          type="number"
+                        />
+                        <NumericTextField
+                          label={t('inventory.createVm.cpuLimit')}
+                          value={cpuLimit}
+                          onChange={setCpuLimit}
+                          fallback={0}
+                          parse={Number.parseFloat}
+                          format={(n) => (n === 0 ? 'unlimited' : String(n))}
+                          size="small"
+                          placeholder="unlimited"
+                        />
+                        <FormControlLabel
+                          control={<Switch checked={enableNuma} onChange={(e) => setEnableNuma(e.target.checked)} size="small" />}
+                          label={t('inventory.createVm.enableNuma')}
+                        />
+                      </>
+                    )}
+                  </Box>
+                </Collapse>
+              </Box>
+
+              {/* Extra CPU flags, hidden like the other advanced controls by the vDC policy */}
+              {!cpuAdvancedHidden && (
+                <CpuFlagsSelector flags={cpuFlags} onChange={setCpuFlags} sx={{ borderRadius: 2 }} />
+              )}
+            </Stack>
+          )
+        }
+
+      case 5: // Memory
+        {
+          const memoryMarks = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+          const memoryToSlider = (mib: number) => {
+            for (let i = memoryMarks.length - 1; i >= 0; i--) {
+              if (mib >= memoryMarks[i]) return i + (mib - memoryMarks[i]) / (memoryMarks[Math.min(i + 1, memoryMarks.length - 1)] - memoryMarks[i])
+            }
+            return 0
+          }
+          const sliderToMemory = (val: number) => {
+            const idx = Math.floor(val)
+            const frac = val - idx
+            if (idx >= memoryMarks.length - 1) return memoryMarks[memoryMarks.length - 1]
+            const raw = memoryMarks[idx] + frac * (memoryMarks[idx + 1] - memoryMarks[idx])
+            return Math.round(raw / 128) * 128 || 128
+          }
+          const formatGib = (mib: number) => mib >= 1024 ? `${(mib / 1024).toFixed(mib % 1024 === 0 ? 0 : 1)} GiB` : `${mib} MiB`
+
+          return (
+            <Stack spacing={2}>
+              {/* Label + presets on same line */}
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
+                  {t('inventory.createVm.memoryMib')}: {formatGib(memorySize)}
+                </Typography>
+                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                  {[512, 1024, 2048, 4096, 8192, 16384, 32768].map(v => (
+                    <Chip
+                      key={v}
+                      label={formatGib(v)}
+                      size="small"
+                      variant={memorySize === v ? 'filled' : 'outlined'}
+                      color={memorySize === v ? 'primary' : 'default'}
+                      onClick={() => setMemorySize(v)}
+                      sx={{ fontWeight: memorySize === v ? 700 : 400, cursor: 'pointer', height: 24, fontSize: 11 }}
+                    />
+                  ))}
+                </Box>
+              </Box>
+
+              {/* Slider */}
+              <Box sx={{ px: 1 }}>
+                <Slider
+                  value={memoryToSlider(memorySize)}
+                  min={0}
+                  max={memoryMarks.length - 1}
+                  step={0.01}
+                  onChange={(_, val) => setMemorySize(sliderToMemory(val as number))}
+                  marks={memoryMarks.map((m, i) => ({ value: i, label: formatGib(m) }))}
+                  valueLabelDisplay="auto"
+                  valueLabelFormat={() => formatGib(memorySize)}
+                  sx={{ '& .MuiSlider-markLabel': { fontSize: '0.65rem' } }}
+                />
+              </Box>
+
+              <NumericTextField
+                label={t('inventory.createVm.memoryMib')}
+                value={memorySize}
+                onChange={setMemorySize}
+                fallback={512}
+                size="small"
+                type="number"
+                inputProps={{ min: 128, step: 128 }}
+                sx={{ maxWidth: 200 }}
+              />
+
+              {/* Advanced — collapsible */}
+              <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
+                <Box
+                  onClick={() => setMemAdvancedExpanded(v => !v)}
+                  sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25, cursor: 'pointer', '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.04) } }}
+                >
+                  <i className={memAdvancedExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                  <Typography variant="body2" fontWeight={600} fontSize={13}>{t('inventory.createVm.advancedOptions')}</Typography>
+                  <Box sx={{ flex: 1 }} />
+                  {ballooning && <Chip label={t('inventory.createVm.ballooningDevice')} size="small" variant="outlined" sx={{ fontSize: 10, height: 20 }} />}
+                </Box>
+                <Collapse in={memAdvancedExpanded}>
+                  <Box sx={{ px: 2, pb: 2, pt: 0.5, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5 }}>
+                    <FormControlLabel
+                      control={<Switch checked={ballooning} onChange={(e) => setBallooning(e.target.checked)} size="small" />}
+                      label={t('inventory.createVm.ballooningDevice')}
+                      sx={{ gridColumn: '1 / -1' }}
+                    />
+                    <NumericTextField
+                      label={t('inventory.createVm.minMemoryMib')}
+                      value={minMemory}
+                      onChange={setMinMemory}
+                      fallback={512}
+                      size="small"
+                      type="number"
+                      inputProps={{ min: 128, step: 128 }}
+                      disabled={!ballooning}
+                    />
+                    <Typography variant="body2" sx={{ opacity: 0.7, alignSelf: 'center' }}>{t('inventory.createVm.sharesDefault')}</Typography>
+                  </Box>
+                </Collapse>
+              </Box>
+            </Stack>
+          )
+        }
+
+      case 6: // Network
+        return (
+          <Stack spacing={1.5}>
+            <FormControlLabel
+              control={<Switch checked={noNetwork} onChange={(e) => setNoNetwork(e.target.checked)} size="small" />}
+              label={t('inventory.createVm.noNetworkDevice')}
+            />
+
+            {!noNetwork && nics.map((nic, nicIdx) => {
+              const isExpanded = expandedNics.has(nicIdx)
+              const mtuCheck = nicMtuCheck(nic)
+              let mtuHelper: string | undefined
+              if (nic.model !== 'virtio') mtuHelper = t('inventory.createVm.virtioOnly')
+              else if (mtuCheck) mtuHelper = t(`inventory.createVm.${mtuCheck.key}`, { max: mtuCheck.max ?? '' })
+              const toggleExpand = () => setExpandedNics(s => { const n = new Set(s); n.has(nicIdx) ? n.delete(nicIdx) : n.add(nicIdx); return n })
+              return (
+                <Box key={nicIdx} sx={{ border: '1px solid', borderColor: isExpanded ? 'primary.main' : 'divider', borderRadius: 2, overflow: 'hidden', transition: 'border-color 0.2s' }}>
+                  {/* Compact header */}
+                  <Box
+                    onClick={toggleExpand}
+                    sx={{ display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.25, cursor: 'pointer', bgcolor: isExpanded ? alpha(theme.palette.primary.main, 0.04) : 'transparent', '&:hover': { bgcolor: alpha(theme.palette.primary.main, 0.06) } }}
+                  >
+                    <i className={isExpanded ? 'ri-subtract-line' : 'ri-add-line'} style={{ fontSize: 18, opacity: 0.5 }} />
+                    <Chip label={`net${nicIdx}`} size="small" sx={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11, fontWeight: 700, height: 24 }} />
+                    <Typography variant="body2" fontSize={12} fontWeight={700}>{nic.bridge}</Typography>
+                    <Typography variant="body2" fontSize={12} sx={{ opacity: 0.6 }}>{nic.model === 'virtio' ? 'VirtIO' : nic.model}</Typography>
+                    {canEditVlan && nic.vlanTag && <Chip label={`VLAN ${nic.vlanTag}`} size="small" variant="outlined" sx={{ fontSize: 10, height: 20 }} />}
+                    {nic.firewall && <Chip label="FW" size="small" color="success" variant="outlined" sx={{ fontSize: 10, height: 20 }} />}
+                    <Box sx={{ flex: 1 }} />
+                    {nics.length > 1 && (
+                      <Tooltip title="Remove NIC">
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); removeNic(nicIdx) }} color="error" sx={{ p: 0.5 }}>
+                          <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                  </Box>
+
+                  {/* Expanded content */}
+                  <Collapse in={isExpanded}>
+                    <Box sx={{ px: 2, pb: 2, pt: 1 }}>
+                      {/* Essential fields */}
+                      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1.5, mb: 2 }}>
+                        <BridgePicker
+                          options={bridgeOptions}
+                          value={nic.bridge}
+                          onChange={(iface) => updateNic(nicIdx, { bridge: iface })}
+                          label={t('inventory.createVm.bridge')}
+                          noOptionsText={t('inventory.createVm.emptyState.noBridge')}
+                          disabled={bridges.length === 0}
+                          error={bridges.length === 0}
+                          helperText={bridges.length === 0 ? t('inventory.createVm.emptyState.bridgeHint') : undefined}
+                        />
+                        <FormControl size="small" sx={SMALL_SELECT_SX}>
+                          <InputLabel>{t('inventory.createVm.model')}</InputLabel>
+                          <Select value={nic.model} onChange={(e) => updateNic(nicIdx, { model: e.target.value })} label={t('inventory.createVm.model')}>
+                            <MenuItem value="virtio">VirtIO (paravirtualized)</MenuItem>
+                            <MenuItem value="e1000">Intel E1000</MenuItem>
+                            <MenuItem value="rtl8139">Realtek RTL8139</MenuItem>
+                            <MenuItem value="vmxnet3">VMware vmxnet3</MenuItem>
+                          </Select>
+                        </FormControl>
+                        {(() => {
+                          const selectedBridge = bridges.find((b: any) => b.iface === nic.bridge)
+                          // VXLAN SDN VNets carry their own isolation via the
+                          // VNI — an 802.1Q tag on top would be VLAN-in-VXLAN,
+                          // almost never what the user wants. Hide the input.
+                          const isVnet = selectedBridge?.type === 'vnet'
+                          return (
+                            <TextField
+                              label={t('inventory.createVm.vlanTag')}
+                              value={isVnet || !canEditVlan ? '' : nic.vlanTag}
+                              onChange={(e) => updateNic(nicIdx, { vlanTag: e.target.value })}
+                              size="small"
+                              placeholder={isVnet ? t('inventory.createVm.vlanTagVnetPlaceholder') : 'no VLAN'}
+                              disabled={isVnet || !canEditVlan}
+                              helperText={!canEditVlan ? t('hardware.nicVlanPermissionRequired') : isVnet ? t('inventory.createVm.vlanTagVnetHint') : undefined}
+                            />
+                          )
+                        })()}
+                        <TextField
+                          label={t('inventory.createVm.macAddress')}
+                          value={canEditMac ? nic.macAddress : 'auto'}
+                          disabled={!canEditMac}
+                          helperText={!canEditMac ? t('hardware.nicMacPermissionRequired') : undefined}
+                          onChange={(e) => updateNic(nicIdx, { macAddress: e.target.value })}
+                          size="small"
+                          placeholder="auto"
+                        />
+                      </Box>
+
+                      {/* Advanced options */}
+                      <Typography variant="caption" fontWeight={700} sx={{ display: 'block', opacity: 0.5, mb: 1, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                        {t('inventory.createVm.advancedOptions')}
+                      </Typography>
+                      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 1.5 }}>
+                        <TextField
+                          label={t('inventory.createVm.rateLimitMbs')}
+                          value={nic.rateLimit}
+                          onChange={(e) => updateNic(nicIdx, { rateLimit: e.target.value })}
+                          size="small"
+                          placeholder="unlimited"
+                          // Shrunk labels keep the defaults (unlimited, bridge MTU) visible at rest.
+                          slotProps={{ inputLabel: { shrink: true } }}
+                        />
+                        <TextField
+                          label={t('inventory.createVm.mtu')}
+                          value={nic.model === 'virtio' ? nic.mtu : ''}
+                          onChange={(e) => updateNic(nicIdx, { mtu: e.target.value })}
+                          size="small"
+                          type="number"
+                          inputProps={{ min: 1, max: 65520 }}
+                          placeholder={t('inventory.createVm.mtuBridgePlaceholder')}
+                          slotProps={{
+                            inputLabel: { shrink: true },
+                            formHelperText: mtuCheck?.level === 'warning' ? { sx: { color: 'warning.main' } } : undefined,
+                          }}
+                          disabled={nic.model !== 'virtio'}
+                          error={mtuCheck?.level === 'error'}
+                          helperText={mtuHelper}
+                        />
+                        <TextField
+                          label={t('inventory.createVm.multiqueue')}
+                          value={nic.model === 'virtio' ? nic.queues : ''}
+                          onChange={(e) => updateNic(nicIdx, { queues: e.target.value })}
+                          size="small"
+                          type="number"
+                          inputProps={{ min: 0, max: 64 }}
+                          slotProps={{ inputLabel: { shrink: true } }}
+                          disabled={nic.model !== 'virtio'}
+                          helperText={nic.model !== 'virtio' ? t('inventory.createVm.virtioOnly') : undefined}
+                        />
+                      </Box>
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 1.5 }}>
+                        <FormControlLabel control={<Switch checked={nic.firewall} onChange={(e) => updateNic(nicIdx, { firewall: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.firewall')}</Typography>} />
+                        <FormControlLabel control={<Switch checked={nic.disconnect} onChange={(e) => updateNic(nicIdx, { disconnect: e.target.checked })} size="small" />} label={<Typography variant="body2" fontSize={12}>{t('inventory.createVm.disconnect')}</Typography>} />
+                      </Box>
+                    </Box>
+                  </Collapse>
+                </Box>
+              )
+            })}
+
+            {!noNetwork && (
+              <Button
+                variant="outlined"
+                size="small"
+                startIcon={<i className="ri-add-line" />}
+                onClick={addNic}
+                sx={{ alignSelf: 'flex-start' }}
+              >
+                {t('inventory.createVm.addNic') || 'Add NIC'}
+              </Button>
+            )}
+          </Stack>
+        )
+
+      case 7: // Confirm
+        {
+          const formatGibConfirm = (mib: number) => mib >= 1024 ? `${(mib / 1024).toFixed(mib % 1024 === 0 ? 0 : 1)} GiB` : `${mib} MiB`
+          // One line per section (#1194): its title, then every label/value pair
+          // side by side. Plain text, no badges.
+          let sectionCount = 0
+          const summarySection = (icon: string, title: string, rows: Array<[React.ReactNode, React.ReactNode] | false | null | undefined>) => {
+            const sep = sectionCount++ > 0 ? { borderTop: '1px solid', borderColor: 'divider' } : {}
+            return (
+              <React.Fragment>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1, ...sep }}>
+                  <i className={icon} style={{ fontSize: 15, opacity: 0.6 }} />
+                  <Typography variant="caption" fontWeight={700} sx={{ textTransform: 'uppercase', letterSpacing: 0.5, opacity: 0.6, whiteSpace: 'nowrap' }}>{title}</Typography>
+                </Box>
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 3, rowGap: 0.5, py: 1, minWidth: 0, ...sep }}>
+                  {rows.filter((r): r is [React.ReactNode, React.ReactNode] => !!r).map(([label, value], i) => (
+                    <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+                      <Typography variant="body2" sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>{label}</Typography>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>{value}</Box>
+                    </Box>
+                  ))}
+                </Box>
+              </React.Fragment>
+            )
+          }
+          const S = (key: string, values?: Record<string, string | number>) => t(`inventory.createVm.summary.${key}`, values)
+          const join = (parts: Array<string | false | null | undefined>) => parts.filter(Boolean).join(' · ')
+          const txt = (v: React.ReactNode) => <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>{v}</Typography>
+          const flagSign = (v: '+' | '-') => (v === '-' ? '−' : '+')
+          const flagsText = cpuAdvancedHidden ? '' : Object.entries(cpuFlags).map(([flag, v]) => `${flagSign(v)}${flag}`).join(' ')
+          const nicModelLabel = (model: string) => (model === 'virtio' ? 'VirtIO' : model)
+          const nicRows = nics.map((nic, i) => [`net${i}`, txt(join([
+            S('onBridge', { model: nicModelLabel(nic.model), bridge: nic.bridge }),
+            canEditVlan && !!nic.vlanTag && `VLAN ${nic.vlanTag}`,
+            nic.firewall && t('inventory.createVm.firewall'),
+            nic.model === 'virtio' && !!nic.mtu && `MTU ${nic.mtu}`,
+            nic.model === 'virtio' && !!nic.queues && `${t('inventory.createVm.multiqueue')} ${nic.queues}`,
+            nic.disconnect && t('inventory.createVm.disconnect'),
+          ]))] as [string, React.ReactNode])
+          const proxmoxLogo = theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'
+          const osIconClass = guestOsType === 'Windows' ? 'ri-windows-fill' : 'ri-question-line'
+          const osIcon = guestOsType === 'Linux'
+            ? <img src="/images/os/linux.svg" alt="" width={16} height={16} />
+            : <i className={osIconClass} style={{ fontSize: 16, opacity: 0.8 }} />
+          const vdcName = blankVdcs.find(v => v.id === tenantVdcId)?.name
+          const blockers: string[] = []
+          if (!vmid) blockers.push(t('inventory.createVm.confirmStep.noVmid'))
+          if (vmidError) blockers.push(t('inventory.createVm.confirmStep.invalidVmid', { error: vmidError }))
+          if (!resolvedNode) blockers.push(t('inventory.createVm.confirmStep.noNode'))
+          if (quotaViolations.length > 0) {
+            for (const v of quotaViolations) {
+              blockers.push(t('inventory.createVm.confirmStep.quotaViolation', { violation: v }))
+            }
+          }
+          if (networkBlocked) {
+            const nicDetails = nics
+              .map((n, i) => !bridges.some((b: any) => b.iface === n.bridge)
+                ? t('inventory.createVm.confirmStep.nicLabel', { index: i + 1, bridge: n.bridge || '—' })
+                : null)
+              .filter(Boolean)
+              .join(', ')
+            blockers.push(
+              bridges.length === 0
+                ? t('inventory.createVm.confirmStep.noBridgeBlocker')
+                : t('inventory.createVm.confirmStep.invalidBridgeBlocker', { nicDetails })
+            )
+          }
+          for (const i of mtuBlockedNics) {
+            blockers.push(t('inventory.createVm.confirmStep.invalidMtuBlocker', { nic: `net${i}`, mtu: nics[i].mtu }))
+          }
+          const canCreate = blockers.length === 0
+          return (
+            <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+              {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+              {canCreate ? (
+                <Alert severity="success" icon={<i className="ri-check-line" />} sx={{ mb: 2 }}>
+                  {t('inventory.createVm.confirmStep.ready')}
+                </Alert>
+              ) : (
+                <Alert severity="warning" icon={<i className="ri-error-warning-line" />} sx={{ mb: 2 }}>
+                  <Typography variant="body2" fontWeight={600} sx={{ mb: 0.5 }}>
+                    {t('inventory.createVm.confirmStep.blockersTitle')}
+                  </Typography>
+                  <ul style={{ margin: 0, paddingLeft: 18 }}>
+                    {blockers.map((b, i) => (
+                      <li key={i}><Typography variant="body2">{b}</Typography></li>
+                    ))}
+                  </ul>
+                </Alert>
+              )}
+              <Box
+                data-testid="create-vm-summary"
+                sx={{ flex: 1, border: '1px solid', borderColor: 'divider', borderRadius: 2, px: 2, py: 0.5, display: 'grid', gridTemplateColumns: 'max-content 1fr', gridAutoRows: '1fr', columnGap: 3, alignItems: 'stretch' }}
+              >
+                {summarySection('ri-server-line', t('inventory.createVm.tabs.general'), [
+                  // A vDC tenant never sees the node nor the VMID (#1171): its vDC instead.
+                  hideNodePicker
+                    ? !!vdcName && ['vDC', txt(vdcName)]
+                    : [t('inventory.createVm.node'), <><img src={proxmoxLogo} alt="" width={16} height={16} style={{ opacity: 0.8 }} />{txt(resolvedNode)}</>],
+                  [S('vm'), txt(hideNodePicker ? (vmName || '—') : join([vmid, vmName]))],
+                ])}
+
+                {summarySection('ri-disc-line', t('inventory.createVm.tabs.os'), [
+                  [S('guestOs'), <>{osIcon}{txt(guestOsSummaryLabel(guestOsType, guestOsVersion, selectedOsPreset))}</>],
+                  osMediaType === 'iso' && !!isoImage && [t('inventory.createVm.isoImage'), txt(isoImage)],
+                ])}
+
+                {summarySection('ri-settings-3-line', t('inventory.createVm.tabs.system'), [
+                  [t('inventory.createVm.machine'), txt(join([`${machine}${pinnedMachine ? ` ${pinnedMachine.version}` : ''}`, bios === 'ovmf' ? 'OVMF (UEFI)' : 'SeaBIOS', addTpm && 'TPM']))],
+                  [t('inventory.createVm.scsiController'), txt(scsiController)],
+                  graphicCard !== 'default' && [t('inventory.createVm.graphicCard'), txt(graphicCard)],
+                  qemuAgent && [t('inventory.createVm.qemuAgent'), txt(S('enabled'))],
+                ])}
+
+                {summarySection('ri-hard-drive-3-line', t('inventory.createVm.tabs.disks'),
+                  disks.map(disk => [`${disk.bus}${disk.index}`, txt(join([disk.storage, `${disk.size} GiB`, disk.format]))] as [string, React.ReactNode]),
+                )}
+
+                {summarySection('ri-cpu-line', t('inventory.createVm.tabs.cpu'), [
+                  ['vCPU', txt(`${cpuSockets * cpuCores} (${S('cpuTopology', { sockets: cpuSockets, cores: cpuCores })})`)],
+                  [t('inventory.createVm.cpuType'), txt(join([cpuType, flagsText]))],
+                ])}
+
+                {summarySection('ri-ram-line', t('inventory.createVm.tabs.memory'), [
+                  ['RAM', txt(formatGibConfirm(memorySize))],
+                  ballooning && [t('inventory.createVm.ballooningDevice'), txt(S('balloonMin', { size: formatGibConfirm(minMemory) }))],
+                ])}
+
+                {summarySection('ri-global-line', t('inventory.createVm.tabs.network'),
+                  noNetwork
+                    ? [['—', txt(S('noNetwork'))]]
+                    : nicRows,
+                )}
+              </Box>
+            </Box>
+          )
+        }
+
+      default:
+        return null
+    }
+  }
+
+  // ── vDC quota pre-flight (client-side mirror of server enforcement) ──
+  // Format MB as GB with 1 decimal so fractional sizes (1.5 GB, 1.8 GB)
+  // render accurately in the donut instead of being rounded up to the same %.
+  const formatMbAsGb = (mb: number) => `${(mb / 1024).toFixed(1)} GB`
+  // Gives immediate feedback as the user tweaks sliders, instead of a 409
+  // after they hit Create. Violations are computed in the server's native
+  // units (MB, vcpu counts) so GB rounding in the donut labels never masks
+  // a real overshoot (e.g. 2500 MB vs 2048 MB quota).
+  const requestedVcpus = cpuSockets * cpuCores
+  const requestedRamMb = memorySize
+  const requestedStorageMb = disks.reduce((s, d) => s + (d.storage ? (d.size || 0) * 1024 : 0), 0)
+
+  const quotaViolations: string[] = []
+  if (vdcQuota) {
+    const usedVcpus = vdcUsage?.usedVcpus ?? 0
+    const usedRamMb = vdcUsage?.usedRamMb ?? 0
+    const usedStorageMb = vdcUsage?.usedStorageMb ?? 0
+    const usedVms = vdcUsage?.usedVms ?? 0
+    if (vdcQuota.maxVcpus != null && usedVcpus + requestedVcpus > vdcQuota.maxVcpus) {
+      quotaViolations.push(t('inventory.createVm.quotaBanner.violations.vcpus', { projected: usedVcpus + requestedVcpus, max: vdcQuota.maxVcpus }))
+    }
+    if (vdcQuota.maxRamMb != null && usedRamMb + requestedRamMb > vdcQuota.maxRamMb) {
+      quotaViolations.push(t('inventory.createVm.quotaBanner.violations.ramGb', { projected: Math.round((usedRamMb + requestedRamMb) / 1024), max: Math.round(vdcQuota.maxRamMb / 1024) }))
+    }
+    if (vdcQuota.maxStorageMb != null && usedStorageMb + requestedStorageMb > vdcQuota.maxStorageMb) {
+      quotaViolations.push(t('inventory.createVm.quotaBanner.violations.storageGb', { projected: Math.round((usedStorageMb + requestedStorageMb) / 1024), max: Math.round(vdcQuota.maxStorageMb / 1024) }))
+    }
+    if (vdcQuota.maxVms != null && usedVms + 1 > vdcQuota.maxVms) {
+      quotaViolations.push(t('inventory.createVm.quotaBanner.violations.vms', { projected: usedVms + 1, max: vdcQuota.maxVms }))
+    }
+  }
+  const quotaBlocked = quotaViolations.length > 0
+
+  // Structured quota state for the visual banner: one row per resource with
+  // projected usage, percent, and over-flag, so the header / donut grid /
+  // violations list all share the same source of truth.
+  type QuotaResource = 'vcpus' | 'ram' | 'storage' | 'vms'
+  interface QuotaItem {
+    resource: QuotaResource
+    label: string
+    icon: string
+    used: number
+    requested: number
+    projected: number
+    max: number | null
+    format: (v: number) => string
+    pct: number
+    over: boolean
+  }
+  const quotaItems: QuotaItem[] = vdcQuota ? (() => {
+    const fmtNum = (v: number) => String(v)
+    const raw = [
+      { resource: 'vcpus' as const, icon: 'ri-cpu-line', label: t('inventory.createVm.quotaBanner.labels.vcpus'), used: vdcUsage?.usedVcpus ?? 0, requested: requestedVcpus, max: vdcQuota.maxVcpus, format: fmtNum },
+      { resource: 'ram' as const, icon: 'ri-ram-2-line', label: t('inventory.createVm.quotaBanner.labels.ram'), used: vdcUsage?.usedRamMb ?? 0, requested: requestedRamMb, max: vdcQuota.maxRamMb, format: formatMbAsGb },
+      { resource: 'storage' as const, icon: 'ri-hard-drive-2-line', label: t('inventory.createVm.quotaBanner.labels.storage'), used: vdcUsage?.usedStorageMb ?? 0, requested: requestedStorageMb, max: vdcQuota.maxStorageMb, format: formatMbAsGb },
+      { resource: 'vms' as const, icon: 'ri-computer-line', label: t('inventory.createVm.quotaBanner.labels.vms'), used: vdcUsage?.usedVms ?? 0, requested: 1, max: vdcQuota.maxVms, format: fmtNum },
+    ]
+    return raw.map(i => {
+      const projected = i.used + i.requested
+      const pct = i.max != null && i.max > 0 ? Math.round((projected / i.max) * 100) : 0
+      const over = i.max != null && projected > i.max
+      return { ...i, projected, pct, over }
+    })
+  })() : []
+  const overItems = quotaItems.filter(i => i.over)
+  const tightItems = quotaItems.filter(i => !i.over && i.pct >= 90)
+  const quotaTight = !quotaBlocked && tightItems.length > 0
+
+  // Network gate: a NIC targeting a bridge not returned by network-choices
+  // (typically the hardcoded vmbr0 fallback) would be rejected by the server's
+  // bridge whitelist. Block navigation/submit so the user can't hit a 403.
+  const networkBlocked = !noNetwork && nics.some(n => !bridges.some((b: any) => b.iface === n.bridge))
+  const nicMtuCheck = (nic: NicConfig) =>
+    nic.model === 'virtio' ? checkNicMtu(nic.mtu, bridges.find((b: any) => b.iface === nic.bridge)?.mtu ?? null) : null
+  const mtuBlockedNics = noNetwork ? [] : nics.flatMap((n, i) => nicMtuCheck(n)?.level === 'error' ? [i] : [])
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+      <AppDialogTitle
+        onClose={onClose}
+        icon={<i className="ri-computer-line" style={{ fontSize: 20 }} />}
+        sx={{
+          bgcolor: theme.palette.mode === 'dark' ? 'rgba(0,150,200,0.15)' : 'primary.light',
+          color:
+            theme.palette.mode === 'dark' ? 'primary.light' : onPrimaryTextColor(theme.palette.primary.light),
+          py: 1.5
+        }}
+      >
+        Create: Virtual Machine
+      </AppDialogTitle>
+      
+      <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <Tabs 
+          value={activeTab} 
+          onChange={(_, v) => setActiveTab(v)}
+          variant="scrollable"
+          scrollButtons="auto"
+        >
+          {tabs.map((label, idx) => (
+            <Tab 
+              key={label} 
+              label={label} 
+              sx={{ 
+                minWidth: 80,
+                fontWeight: activeTab === idx ? 700 : 400,
+              }} 
+            />
+          ))}
+        </Tabs>
+      </Box>
+      
+      {/* On Confirm the summary stretches to the full height of the content (#1194). */}
+      <DialogContent sx={{ minHeight: 350, pt: 3, ...(activeTab === tabs.length - 1 && { display: 'flex', flexDirection: 'column' }) }}>
+        {vdcQuota && (() => {
+          // Glassmorphism accent colour follows the quota state so the banner
+          // tints success/warning/error consistently with the donuts.
+          const accent = quotaBlocked ? theme.palette.error.main
+            : quotaTight ? theme.palette.warning.main
+            : theme.palette.success.main
+          return (
+          <Box
+            sx={{
+              mb: 2,
+              p: 2,
+              borderRadius: 1,
+              border: 1,
+              borderColor: alpha(accent, 0.35),
+              position: 'relative',
+              overflow: 'hidden',
+              background: `linear-gradient(135deg, ${alpha(accent, 0.1)} 0%, ${alpha(theme.palette.background.paper, 0.97)} 50%, ${alpha(accent, 0.04)} 100%)`,
+              backdropFilter: 'blur(8px)',
+              transition: 'border-color 0.2s, box-shadow 0.2s, background 0.2s',
+              '&:hover': {
+                borderColor: alpha(accent, 0.55),
+                boxShadow: `0 8px 32px ${alpha(accent, 0.15)}`,
+              },
+            }}
+          >
+            {/* Top-right highlight blob — the "reflet" */}
+            <Box
+              aria-hidden
+              sx={{
+                position: 'absolute',
+                top: -60,
+                right: -60,
+                width: 220,
+                height: 220,
+                borderRadius: '50%',
+                background: `radial-gradient(circle, ${alpha(accent, 0.14)} 0%, transparent 70%)`,
+                pointerEvents: 'none',
+              }}
+            />
+            {/* Header: state icon + title */}
+            <Stack direction="row" alignItems="center" spacing={1} mb={1.5} sx={{ position: 'relative' }}>
+              <Box
+                component="i"
+                className={
+                  quotaBlocked ? 'ri-close-circle-fill'
+                  : quotaTight ? 'ri-error-warning-fill'
+                  : 'ri-checkbox-circle-fill'
+                }
+                sx={{
+                  fontSize: 20,
+                  color: quotaBlocked ? 'error.main' : quotaTight ? 'warning.main' : 'success.main',
+                }}
+              />
+              <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                {quotaBlocked ? t('inventory.createVm.quotaBanner.titleBlocked') : t('inventory.createVm.quotaBanner.title')}
+              </Typography>
+            </Stack>
+
+            {/* Donuts (4 across, 2 on mobile) */}
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                gridTemplateColumns: { xs: 'repeat(2, 1fr)', sm: 'repeat(4, 1fr)' },
+                justifyItems: 'center',
+                position: 'relative',
+              }}
+            >
+              {quotaItems.map(item => (
+                <QuotaDonut
+                  key={item.resource}
+                  icon={item.icon}
+                  label={item.label}
+                  used={item.used}
+                  requested={item.requested}
+                  max={item.max}
+                  formatValue={item.resource === 'ram' || item.resource === 'storage' ? formatMbAsGb : undefined}
+                  unlimitedLabel={t('inventory.createVm.quotaBanner.unlimited')}
+                  size={88}
+                />
+              ))}
+            </Box>
+
+            {/* Violations: one row per over-limit resource, with delta chip */}
+            {overItems.length > 0 && (
+              <Box
+                sx={{
+                  mt: 2,
+                  pt: 1.5,
+                  borderTop: 1,
+                  borderColor: (theme) => theme.palette.mode === 'dark' ? 'error.dark' : 'error.light',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 0.75,
+                  position: 'relative',
+                }}
+              >
+                {overItems.map(item => {
+                  const overAmount = item.max != null ? item.projected - item.max : 0
+                  return (
+                    <Stack key={item.resource} direction="row" alignItems="center" spacing={1.5}>
+                      <Box
+                        component="i"
+                        className={item.icon}
+                        sx={{ fontSize: 16, color: 'error.main', width: 16, textAlign: 'center', flexShrink: 0 }}
+                      />
+                      <Typography variant="body2" sx={{ fontWeight: 500, minWidth: 70 }}>
+                        {item.label}
+                      </Typography>
+                      <Typography variant="body2" sx={{ flex: 1, color: 'text.secondary' }} noWrap>
+                        {item.format(item.projected)} / {item.format(item.max as number)}
+                      </Typography>
+                      <Box
+                        sx={{
+                          px: 1,
+                          py: 0.25,
+                          borderRadius: 0.75,
+                          bgcolor: 'error.main',
+                          color: 'error.contrastText',
+                          fontWeight: 600,
+                          fontSize: '0.72rem',
+                          lineHeight: 1.4,
+                          flexShrink: 0,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        +{item.format(overAmount)}
+                      </Box>
+                    </Stack>
+                  )
+                })}
+              </Box>
+            )}
+          </Box>
+          )
+        })()}
+        {loadingData ? (
+          <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+            <CircularProgress />
+          </Box>
+        ) : (
+          renderTabContent()
+        )}
+      </DialogContent>
+      
+      <DialogActions sx={{ px: 3, py: 2, borderTop: 1, borderColor: 'divider' }}>
+        <Button onClick={onClose} disabled={creating}>Cancel</Button>
+        <Box sx={{ flex: 1 }} />
+        <Button 
+          onClick={() => setActiveTab(prev => Math.max(0, prev - 1))} 
+          disabled={activeTab === 0 || creating}
+        >
+          Back
+        </Button>
+        {activeTab < tabs.length - 1 ? (
+          <Button
+            onClick={() => setActiveTab(prev => prev + 1)}
+            variant="contained"
+            disabled={quotaBlocked || networkBlocked}
+          >
+            Next
+          </Button>
+        ) : (
+          <Button
+            onClick={handleCreate}
+            variant="contained"
+            color="primary"
+            disabled={creating || isoBusy || !vmid || !resolvedNode || !!vmidError || quotaBlocked || networkBlocked || mtuBlockedNics.length > 0}
+            startIcon={creating ? <CircularProgress size={16} /> : null}
+          >
+            Create
+          </Button>
+        )}
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+
+export default CreateVmDialog

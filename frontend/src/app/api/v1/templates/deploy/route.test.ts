@@ -1,0 +1,1318 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+import { URL_IMAGE_REFUSED } from '@/lib/vdc/nodeUrlFetch'
+
+// The success path schedules the deployment pipeline through after(). Most
+// tests only care about the synchronous response, so the callback is merely
+// captured (never auto-run); tests that need to exercise the pipeline itself
+// (createParams assertions) call runAfters() explicitly.
+const afterCbs: Array<() => Promise<void>> = []
+vi.mock('next/server', async (io) => {
+  const actual = await io<typeof import('next/server')>()
+  return { ...actual, after: (fn: () => Promise<void>) => { afterCbs.push(fn) } }
+})
+async function runAfters() {
+  for (const cb of afterCbs) await cb()
+}
+
+const checkPermissionMock = vi.fn<(...args: any[]) => Promise<Response | null>>()
+const getConnectionByIdMock = vi.fn<(id: string) => Promise<any>>()
+const pveFetchMock = vi.fn<(...args: any[]) => Promise<any>>()
+const customImageFindUniqueMock = vi.fn<(...args: any[]) => Promise<any>>()
+const findCustomImageForTenantMock = vi.fn<(...args: any[]) => Promise<any>>()
+const isProviderImageSlugMock = vi.fn<(...args: any[]) => Promise<boolean>>()
+const findBlueprintForTenantMock = vi.fn<(...args: any[]) => Promise<any>>()
+const getCurrentTenantIdMock = vi.fn<() => Promise<string>>()
+
+const deploymentUpdateMock = vi.fn<(...args: any[]) => Promise<any>>()
+const deploymentCreateMock = vi.fn<(...args: any[]) => Promise<any>>()
+const resolveProviderVdcTargetMock = vi.fn<(...args: any[]) => Promise<any>>()
+const requireProviderTenantMock = vi.fn<() => Promise<Response | null>>()
+
+vi.mock('next-auth', () => ({ getServerSession: vi.fn(async () => null) }))
+vi.mock('@/lib/tenant', () => ({
+  getSessionPrisma: async () => ({
+    customImage: { findUnique: customImageFindUniqueMock },
+    deployment: { create: deploymentCreateMock, update: deploymentUpdateMock },
+    blueprint: { create: vi.fn(async () => ({})) },
+  }),
+  getCurrentTenantId: () => getCurrentTenantIdMock(),
+  requireProviderTenant: () => requireProviderTenantMock(),
+  DEFAULT_TENANT_ID: 'default',
+}))
+vi.mock('@/lib/rbac', () => ({ checkPermission: checkPermissionMock, PERMISSIONS: { VM_CREATE: 'vm.create', VM_CLONE: 'vm.clone', NODE_MANAGE: 'node.manage' }, buildVmResourceId: (...parts: string[]) => parts.join(':') }))
+vi.mock('@/lib/auth/config', () => ({ authOptions: {} }))
+vi.mock('@/lib/schemas', () => ({ deploySchema: { safeParse: (b: any) => ({ success: true, data: b }) } }))
+vi.mock('@/lib/connections/getConnection', () => ({ getConnectionById: getConnectionByIdMock }))
+vi.mock('@/lib/proxmox/client', () => ({ pveFetch: pveFetchMock }))
+const getImageBySlugMock = vi.fn<(...args: any[]) => any>()
+vi.mock('@/lib/templates/cloudImages', () => ({ customImageToCloudImage: vi.fn() }))
+vi.mock('@/lib/templates/catalogStore', () => ({ resolveBuiltInImage: getImageBySlugMock }))
+vi.mock('@/lib/templates/customImageScope', () => ({
+  findCustomImageForTenant: findCustomImageForTenantMock,
+  isProviderImageSlug: (...a: any[]) => isProviderImageSlugMock(...a),
+}))
+vi.mock('@/lib/templates/catalogGrants', async (io) => {
+  // Only the DB lookup is stubbed; the error strings stay the real ones.
+  const actual = await io<typeof import('@/lib/templates/catalogGrants')>()
+  return {
+    CATALOG_NOT_GRANTED_IMAGE: actual.CATALOG_NOT_GRANTED_IMAGE,
+    CATALOG_NOT_GRANTED_BLUEPRINT: actual.CATALOG_NOT_GRANTED_BLUEPRINT,
+    findBlueprintForTenant: (...a: any[]) => findBlueprintForTenantMock(...a),
+  }
+})
+const resolveVdcForTenantMock = vi.fn<(...args: any[]) => Promise<any>>()
+const checkVdcQuotaMock = vi.fn<(...args: any[]) => Promise<any>>()
+vi.mock('@/lib/vdc/quota', () => ({ resolveVdcForTenant: resolveVdcForTenantMock, checkVdcQuota: checkVdcQuotaMock }))
+const getAllowedNetworksForTenantMock = vi.fn<(...args: any[]) => Promise<any>>()
+vi.mock('@/lib/vdc/vnets', async (io) => {
+  // The verdict logic is what this file exercises, so it runs for real; only
+  // the DB-backed allow-list lookup is stubbed.
+  const actual = await io<typeof import('@/lib/vdc/vnets')>()
+  return {
+    getAllowedNetworksForTenant: getAllowedNetworksForTenantMock,
+    validateNetAgainstScope: actual.validateNetAgainstScope,
+    resolveSubnetForBridge: vi.fn(async () => null),
+  }
+})
+vi.mock('@/lib/vdc/sdn', () => ({ generatePveMacAddress: () => 'BC:24:11:00:00:01' }))
+vi.mock('@/lib/vdc/ipam', () => ({ allocateIp: vi.fn(), allocateIpTracked: vi.fn(), releaseIp: vi.fn(), IpamExhaustedError: class extends Error {} }))
+vi.mock('@/lib/vdc/ipamScan', () => ({ scanUsedIpsForSubnet: vi.fn(), scannedToIntSet: vi.fn(() => new Set()) }))
+vi.mock('@/lib/vdc/network', () => ({ parseCidr: () => null }))
+vi.mock('@/lib/proxmox/tasks', () => ({ waitForTask: vi.fn() }))
+const getVdcScopeMock = vi.fn<(...args: any[]) => Promise<any>>()
+// Spread the real module: the route also imports the pure helpers
+// writableStoragesFor / readOnlyLibraryError (#894); only the DB-backed
+// scope loader is stubbed.
+vi.mock('@/lib/vdc/scope', async (io) => {
+  const actual = await io<typeof import('@/lib/vdc/scope')>()
+  return { ...actual, getVdcScope: getVdcScopeMock, loadTenantSlugs: async () => ({ mine: 'acme', all: ['acme', 'acme-prod'] }) }
+})
+vi.mock('@/lib/tenant/infraScope', () => ({ getTenantInfrastructureScope: async () => ({ kind: 'iaas', vdcScope: await getVdcScopeMock() }) }))
+// The real URL refusal (#69) runs on the infraScope stub above; only the
+// staging tests of a tenant's own URL image switch it off.
+const { urlFetchRefusalOff } = vi.hoisted(() => ({ urlFetchRefusalOff: { value: false } }))
+vi.mock('@/lib/vdc/nodeUrlFetch', async (io) => {
+  const actual = await io<typeof import('@/lib/vdc/nodeUrlFetch')>()
+  return { ...actual, isNodeUrlFetchRefused: vi.fn(async (tenantId: string) => !urlFetchRefusalOff.value && actual.isNodeUrlFetchRefused(tenantId)) }
+})
+vi.mock('@/lib/vdc/providerTarget', () => ({ resolveProviderVdcTarget: (...a: any[]) => resolveProviderVdcTargetMock(...a) }))
+const auditMock = vi.fn<(...args: any[]) => Promise<any>>()
+vi.mock('@/lib/audit', () => ({ audit: (...a: any[]) => auditMock(...a) }))
+
+const { checkVmidAgainstTenantRangeMock } = vi.hoisted(() => ({ checkVmidAgainstTenantRangeMock: vi.fn() }))
+vi.mock('@/lib/tenant/vmidRange', () => ({ checkVmidAgainstTenantRange: (...a: any[]) => checkVmidAgainstTenantRangeMock(...a) }))
+
+async function loadPost() {
+  const mod = await import('./route')
+  return mod.POST as Parameters<typeof callRoute>[0]
+}
+
+const baseBody = {
+  connectionId: 'conn-1',
+  node: 'pve1',
+  vmid: 190,
+  imageSlug: 'ubuntu-22.04',
+  storage: 'local-lvm',
+  hardware: { cores: 1, sockets: 1, memory: 512, ostype: 'l26', cpu: 'host', scsihw: 'virtio-scsi-pci', diskSize: '10G', networkModel: 'virtio', networkBridge: 'vmbr0' },
+}
+
+beforeEach(async () => {
+  const { resolveSubnetForBridge } = await import('@/lib/vdc/vnets')
+  afterCbs.length = 0
+  deploymentUpdateMock.mockReset().mockResolvedValue({})
+  deploymentCreateMock.mockReset().mockResolvedValue({ id: 'dep-1' })
+  resolveProviderVdcTargetMock.mockReset()
+  vi.mocked(resolveSubnetForBridge).mockReset().mockResolvedValue(null)
+  checkPermissionMock.mockReset().mockResolvedValue(null)
+  getConnectionByIdMock.mockReset().mockResolvedValue({ id: 'conn-1' })
+  pveFetchMock.mockReset()
+  customImageFindUniqueMock.mockReset().mockResolvedValue(null)
+  findCustomImageForTenantMock.mockReset().mockResolvedValue(null)
+  isProviderImageSlugMock.mockReset().mockResolvedValue(false)
+  findBlueprintForTenantMock.mockReset().mockResolvedValue(null)
+  checkVmidAgainstTenantRangeMock.mockReset().mockResolvedValue({ ok: true })
+  getAllowedNetworksForTenantMock.mockReset().mockResolvedValue(null)
+  getVdcScopeMock.mockReset().mockResolvedValue(null)
+  getImageBySlugMock.mockReset().mockReturnValue(undefined)
+  resolveVdcForTenantMock.mockReset().mockResolvedValue(null)
+  checkVdcQuotaMock.mockReset().mockResolvedValue({ allowed: true })
+  getCurrentTenantIdMock.mockReset().mockResolvedValue('tenant-1')
+  auditMock.mockReset().mockResolvedValue({})
+  requireProviderTenantMock.mockReset().mockResolvedValue(null)
+  urlFetchRefusalOff.value = false
+})
+
+/** Generic PVE stub covering both deploy pipeline branches (cloud-image
+ *  download + ISO download), so the createParams sent to the `qemu` create
+ *  call can be captured without hand-rolling every intermediate PVE hop. */
+function stubPveFetchForDeploy() {
+  pveFetchMock.mockReset()
+  pveFetchMock.mockImplementation(async (_conn: any, path: string, opts?: any) => {
+    const method = opts?.method
+    if (path.startsWith('/access/permissions?')) {
+      const key = new URLSearchParams(path.split('?')[1]).get('path')!
+      return { [key]: { 'Sys.Audit': 1, 'Sys.Modify': 1, 'Datastore.AllocateTemplate': 1 } }
+    }
+    if (path === '/nodes/pve1/storage') return [{ storage: 'local-lvm', type: 'dir', content: 'images,iso,import', active: 1, enabled: 1 }]
+    if (/^\/storage\/[^/]+$/.test(path) && !method) return { type: 'dir', content: 'images,iso,import' }
+    if (/\/content\?content=(import|iso)$/.test(path)) return []
+    if (/\/download-url$/.test(path) && method === 'POST') return 'UPID:download'
+    if (/\/qemu$/.test(path) && method === 'POST') return 'UPID:create'
+    return {}
+  })
+}
+
+/** The URLSearchParams body of the `POST /nodes/.../qemu` create call. */
+function qemuCreateParams(): URLSearchParams {
+  const call = pveFetchMock.mock.calls.find(
+    ([, path, opts]: any) => /\/qemu$/.test(path) && opts?.method === 'POST',
+  )
+  return call?.[2]?.body as URLSearchParams
+}
+
+describe('POST templates/deploy — MSP VMID range enforcement', () => {
+  it('400: rejected by range check before PVE is ever touched', async () => {
+    checkVmidAgainstTenantRangeMock.mockResolvedValue({ ok: false, status: 400, error: 'range' })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(400)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toBe('range')
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('409: already in use', async () => {
+    checkVmidAgainstTenantRangeMock.mockResolvedValue({ ok: false, status: 409, error: 'in use' })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(409)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('ok: passes the gate and reaches the next early-exit (unknown image slug)', async () => {
+    checkVmidAgainstTenantRangeMock.mockResolvedValue({ ok: true })
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: 'vdc-1', poolName: 'pool-a', quota: null })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(400)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toBe('Unknown image slug')
+    expect(checkVmidAgainstTenantRangeMock).toHaveBeenCalledWith('tenant-1', 190)
+  })
+
+  // A template the provider shared with every tenant is listed by the
+  // catalogue but used to be resolved under the caller's own tenant only, so
+  // the deploy died on "Unknown image slug" while the wizard had just offered
+  // it. The resolver is now the shared-scope one, and the slug must get past
+  // this early exit for a row the caller does not own.
+  it('resolves a template shared by the provider instead of refusing the slug', async () => {
+    checkVmidAgainstTenantRangeMock.mockResolvedValue({ ok: true })
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: 'vdc-1', poolName: 'pool-a', quota: null })
+    findCustomImageForTenantMock.mockResolvedValue({
+      tenantId: 'default',
+      slug: 'custom-fortigate',
+      isShared: true,
+      sourceType: 'volume',
+      volumeId: 'nfs-library:import/fortios.qcow2',
+    })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).not.toBe('Unknown image slug')
+    // The grants are judged against the TARGET vDC (#903), not the view context.
+    expect(findCustomImageForTenantMock).toHaveBeenCalledWith('tenant-1', baseBody.imageSlug, { vdcId: 'vdc-1' })
+  })
+})
+
+describe('POST templates/deploy: catalogue grants (#903)', () => {
+  const customBody = { ...baseBody, imageSlug: 'custom-golden' }
+  const vdc = { vdcId: 'vdc-1', poolName: 'pool-a', quota: null }
+
+  it('403: a provider image outside the grants of the target vDC is refused, not "unknown"', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(vdc)
+    isProviderImageSlugMock.mockResolvedValue(true)
+    const res = await callRoute(await loadPost(), { body: customBody })
+    expect(res.status).toBe(403)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('This image is not available to your vDC')
+    expect(isProviderImageSlugMock).toHaveBeenCalledWith('custom-golden')
+    expect(pveFetchMock).not.toHaveBeenCalled()
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('400: a slug nobody owns stays "Unknown image slug"', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(vdc)
+    const res = await callRoute(await loadPost(), { body: customBody })
+    expect(res.status).toBe(400)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('Unknown image slug')
+  })
+
+  it('the provider never gets the grant verdict (its own rows are its whole scope)', async () => {
+    getCurrentTenantIdMock.mockResolvedValue('default')
+    isProviderImageSlugMock.mockResolvedValue(true)
+    const res = await callRoute(await loadPost(), { body: customBody })
+    expect(res.status).toBe(400)
+    expect(isProviderImageSlugMock).not.toHaveBeenCalled()
+  })
+
+  it('403: deploying from a blueprint the tenant cannot see is refused before PVE', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(vdc)
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', url: 'https://img.test/u.qcow2' })
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, blueprintId: 'bp-hidden' } })
+    expect(res.status).toBe(403)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('This blueprint is not available to your vDC')
+    expect(findBlueprintForTenantMock).toHaveBeenCalledWith('tenant-1', 'bp-hidden', { vdcId: 'vdc-1' })
+    expect(pveFetchMock).not.toHaveBeenCalled()
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('a visible blueprint passes the grant check', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(vdc)
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', url: 'https://img.test/u.qcow2' })
+    getVdcScopeMock.mockResolvedValue({ storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]) })
+    findBlueprintForTenantMock.mockResolvedValue({ id: 'bp-ok', tenantId: 'default', hardware: {} })
+    stubPveFetchForDeploy()
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, blueprintId: 'bp-ok' } })
+    expect(res.status).toBe(200)
+  })
+
+  it('a revoked grant is caught again by the background recheck, with the same vDC pin', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(vdc)
+    getVdcScopeMock.mockResolvedValue({ storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]) })
+    const row = { id: 'img-1', tenantId: 'default', slug: 'custom-golden', isShared: false, visibleViaGrant: true, sourceType: 'volume', volumeId: 'local:import/golden.qcow2', sourceConnectionId: 'conn-1', sourceNode: 'pve1', format: 'qcow2', extraLocations: [] }
+    findCustomImageForTenantMock.mockResolvedValueOnce(row).mockResolvedValueOnce(null)
+    stubPveFetchForDeploy()
+    // The source listing must hold the golden volume for the first (synchronous)
+    // authorisation to pass; the grant flag then skips the vDC scope gates
+    // exactly like isShared does (the provider's volume sits outside the vDC).
+    const generic = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (conn: any, path: string, opts?: any, extra?: any) => {
+      if (/\/storage\/local\/content$/.test(path)) return [{ volid: 'local:import/golden.qcow2', content: 'import', format: 'qcow2' }]
+      return generic(conn, path, opts, extra)
+    })
+    const res = await callRoute(await loadPost(), { body: customBody })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(findCustomImageForTenantMock).toHaveBeenNthCalledWith(2, 'tenant-1', 'custom-golden', { vdcId: 'vdc-1' })
+    expect(deploymentUpdateMock).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'failed', error: expect.stringContaining('source image changed') }),
+    }))
+    expect(pveFetchMock.mock.calls.some(([, path, opts]: any) => /\/qemu$/.test(path) && opts?.method === 'POST')).toBe(false)
+  })
+})
+
+describe('POST templates/deploy: vDC network allow-list', () => {
+  /** vmbr0 is shared with a 100-199 pool; vnetacme is an SDN vnet. */
+  const scoped = () =>
+    new Map([
+      ['vmbr0', { kind: 'shared' as const, vlanRanges: [{ start: 100, end: 199 }] }],
+      ['vnetacme', { kind: 'vnet' as const, vlanRanges: [] }],
+    ])
+
+  /**
+   * The network guard sits behind image resolution, the vDC resolution and the
+   * storage allow-list. Open all three so each case reaches the guard itself.
+   */
+  function reachTheGuard() {
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', url: 'https://img.test/u.qcow2' })
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null })
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+    })
+  }
+
+  function bodyWith(hw: Record<string, unknown>) {
+    return { ...baseBody, hardware: { ...baseBody.hardware, ...hw } }
+  }
+
+  for (const hw of [{ vlanTag: 150 }, { networkModel: 'virtio=AA:BB:CC:DD:EE:01' }]) {
+    it(`requires the explicit identity grant for template NIC ${JSON.stringify(hw)}`, async () => {
+      reachTheGuard()
+      getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+      checkPermissionMock.mockImplementation(async permission => permission === 'vm.create' ? null : Response.json({ error: 'identity denied' }, { status: 403 }))
+      const res = await callRoute(await loadPost(), { body: bodyWith(hw) })
+      expect(res.status).toBe(403)
+      expect((await readJson<any>(res))?.error).toBe('identity denied')
+      expect(pveFetchMock).not.toHaveBeenCalled()
+      expect(afterCbs).toHaveLength(0)
+    })
+  }
+
+  it('requires the explicit MAC grant for a tenant-chosen ISO MAC (body.staticMac)', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    checkPermissionMock.mockImplementation(async permission => permission === 'vm.config.nic.mac' ? Response.json({ error: 'mac denied' }, { status: 403 }) : null)
+    const res = await callRoute(await loadPost(), { body: { ...bodyWith({}), staticMac: 'AA:BB:CC:DD:EE:01' } })
+    expect(res.status).toBe(403)
+    expect((await readJson<any>(res))?.error).toBe('mac denied')
+    expect(pveFetchMock).not.toHaveBeenCalled()
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('403: a VLAN tag outside the vDC pools never reaches PVE', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vmbr0', vlanTag: 250 }) })
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toContain("outside your vDC's VLAN pools")
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('400: a non-numeric vlanTag is refused before the bridge probe is built', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vmbr0', vlanTag: '10,tag=250' }) })
+    expect(res.status).toBe(400)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toBe('vlanTag must be a positive integer')
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('403: a tag on an SDN vnet is refused', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vnetacme', vlanTag: 150 }) })
+    expect(res.status).toBe(403)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('403: an unknown bridge is still refused', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vmbr42' }) })
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toContain('is not authorized')
+  })
+
+  it('403: a tag smuggled through networkModel is caught too', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, {
+      body: bodyWith({ networkModel: 'virtio,tag=250', networkBridge: 'vmbr0' }),
+    })
+    expect(res.status).toBe(403)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('403: a tag smuggled through networkBridge is caught too', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vmbr0,tag=250' }) })
+    expect(res.status).toBe(403)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('passes a tag inside the vDC pools through to the deployment', async () => {
+    reachTheGuard()
+    getAllowedNetworksForTenantMock.mockResolvedValue(scoped())
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: bodyWith({ networkBridge: 'vmbr0', vlanTag: 150 }) })
+    expect(res.status).toBe(200)
+  })
+})
+
+describe('POST templates/deploy: storage-policy QoS stamping on deployed disks', () => {
+  /** Tenant with a policy bound to body.storage on conn-1. */
+  function reachDeployPipeline() {
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null, storagePolicies: [] })
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      storagePoliciesByConnection: new Map([
+        ['conn-1', new Map([['local-lvm', { iopsRd: 5000, iopsWr: 3000, mbpsRd: 200, mbpsWr: 100 }]])],
+      ]),
+    })
+  }
+
+  beforeEach(() => { stubPveFetchForDeploy() })
+
+  it('cloud-image branch: scsi0 carries the policy QoS suffix, ide2 stays plain', async () => {
+    reachDeployPipeline()
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('scsi0')).toBe(
+      'local-lvm:0,import-from=local-lvm:import/u.qcow2,iops_rd=5000,iops_wr=3000,mbps_rd=200,mbps_wr=100',
+    )
+    expect(params.get('ide2')).toBe('local-lvm:cloudinit')
+  })
+
+  it('ISO branch: scsi0 carries the suffix, ide2 and efidisk0 stay plain', async () => {
+    reachDeployPipeline()
+    getImageBySlugMock.mockReturnValue({ slug: 'debian-12', format: 'iso', downloadUrl: 'https://img.test/d.iso' })
+    const POST = await loadPost()
+    const res = await callRoute(POST, {
+      body: { ...baseBody, isoStorage: 'local-lvm', hardware: { ...baseBody.hardware, bios: 'ovmf' } },
+    })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('scsi0')).toBe('local-lvm:10,iops_rd=5000,iops_wr=3000,mbps_rd=200,mbps_wr=100')
+    expect(params.get('ide2')).toBe('local-lvm:iso/d.iso,media=cdrom')
+    expect(params.get('efidisk0')).toBe('local-lvm:1,efitype=4m,pre-enrolled-keys=1')
+  })
+
+  it('provider deploy: scope is never fetched, so no suffix is stamped', async () => {
+    getCurrentTenantIdMock.mockResolvedValue('default')
+    resolveVdcForTenantMock.mockResolvedValue(null)
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('scsi0')).toBe('local-lvm:0,import-from=local-lvm:import/u.qcow2')
+    expect(getVdcScopeMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST templates/deploy: storage-policy tier quota', () => {
+  it('409 before any PVE call when the tier quota is exceeded', async () => {
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+    const storagePolicies = [{ policyId: 'p1', name: 'gold', storageId: 'local-lvm', quotaMb: 1024 }]
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null, storagePolicies })
+    checkVdcQuotaMock.mockResolvedValue({
+      allowed: false,
+      violations: ['gold: 1024/1024 MB, +10240 MB exceeds tier quota'],
+      currentUsage: { vcpus: 0, ramMb: 0, storageMb: 0, vms: 0, snapshots: 0, backups: 0 },
+    })
+
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+
+    expect(res.status).toBe(409)
+    const json = await readJson<{ violations: string[] }>(res)
+    expect(json?.violations).toEqual(['gold: 1024/1024 MB, +10240 MB exceeds tier quota'])
+    expect(pveFetchMock).not.toHaveBeenCalled()
+    expect(checkVdcQuotaMock).toHaveBeenCalledWith(
+      'conn-1',
+      'pool-a',
+      null,
+      expect.objectContaining({ addStorageMbByStorage: { 'local-lvm': 10240 } }),
+      storagePolicies,
+      'pve1',
+    )
+  })
+})
+
+describe('POST templates/deploy: read-only ISO library (#894)', () => {
+  function libraryScope() {
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null, storagePolicies: [] })
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm', 'isolib'])]]),
+      writableStoragesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      isoLibrariesByConnection: new Map([['conn-1', new Set(['isolib'])]]),
+      storagePoliciesByConnection: new Map([['conn-1', new Map()]]),
+    })
+  }
+
+  it('403: the data disk cannot land on a library storage', async () => {
+    libraryScope()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, storage: 'isolib' } })
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toMatch(/read-only ISO library/)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('403: an ISO downloaded from a URL cannot be written onto a library storage', async () => {
+    libraryScope()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, isoStorage: 'isolib' } })
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toMatch(/read-only ISO library/)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+  })
+
+  it('a visible-but-unwritable storage outside the library set keeps the generic refusal', async () => {
+    libraryScope()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, storage: 'elsewhere' } })
+    expect(res.status).toBe(403)
+    const json = await readJson<{ error: string }>(res)
+    expect(json?.error).toMatch(/not authorised/)
+  })
+})
+
+describe('POST templates/deploy: vDC compute policy (#893)', () => {
+  const withPolicy = (computePolicy: any) => ({ poolName: 'pool-a', quota: null, storagePolicies: [], computePolicy })
+  const SELECTED = { cpuModelMode: 'selected', cpuAllowedModels: ['x86-64-v2-AES', 'x86-64-v3'], cpuDefaultModel: 'x86-64-v3', cpuAdvancedSettings: true }
+
+  async function deploy(body: any) {
+    const POST = await loadPost()
+    return callRoute(POST, { body })
+  }
+
+  beforeEach(() => {
+    stubPveFetchForDeploy()
+    findBlueprintForTenantMock.mockReset().mockResolvedValue(null)
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      storagePoliciesByConnection: new Map(),
+    })
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+  })
+
+  it('replaces the wizard default model by the vDC default when it is outside the allowed set', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy(SELECTED))
+    const res = await deploy(baseBody)   // the wizard always sends `host`
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('x86-64-v3')
+  })
+
+  it('keeps a requested model the policy allows, and falls back to the first allowed one without a default', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy({ ...SELECTED, cpuDefaultModel: null }))
+    let res = await deploy({ ...baseBody, hardware: { ...baseBody.hardware, cpu: 'x86-64-v2-AES' } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('x86-64-v2-AES')
+
+    afterCbs.length = 0
+    stubPveFetchForDeploy()
+    res = await deploy(baseBody)
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('x86-64-v2-AES')
+  })
+
+  it('400 when the policy allows no model on this cluster', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy({ ...SELECTED, cpuAllowedModels: [], cpuDefaultModel: null }))
+    const res = await deploy(baseBody)
+    expect(res.status).toBe(400)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('The vDC compute policy allows no CPU model on this cluster.')
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('400 on CPU flags while the advanced settings are locked, even in unrestricted model mode', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy({ cpuModelMode: 'unrestricted', cpuAllowedModels: [], cpuDefaultModel: null, cpuAdvancedSettings: false }))
+    const res = await deploy({ ...baseBody, hardware: { ...baseBody.hardware, cpu: 'host,flags=+aes' } })
+    expect(res.status).toBe(400)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('CPU flags and advanced CPU options are disabled by the vDC compute policy.')
+  })
+
+  it("keeps the model of a provider blueprint outside the allowed set, but not a tenant's own", async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy(SELECTED))
+    findBlueprintForTenantMock.mockResolvedValue({ tenantId: 'default', hardware: { cpu: 'host' } })
+    let res = await deploy({ ...baseBody, blueprintId: 'bp-provider' })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('host')
+    expect(findBlueprintForTenantMock).toHaveBeenCalledWith('tenant-1', 'bp-provider', expect.anything())
+
+    afterCbs.length = 0
+    stubPveFetchForDeploy()
+    findBlueprintForTenantMock.mockResolvedValue({ tenantId: 'tenant-1', hardware: { cpu: 'host' } })
+    res = await deploy({ ...baseBody, blueprintId: 'bp-own' })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('x86-64-v3')
+  })
+
+  // Since #903 a blueprint the caller cannot see is a refusal, not a silent
+  // fallback: the recipe is authorised like the image it names.
+  it('refuses a blueprint outside the caller scope instead of applying the policy to it', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy(SELECTED))
+    findBlueprintForTenantMock.mockResolvedValue(null)
+    const res = await deploy({ ...baseBody, blueprintId: 'bp-gone' })
+    expect(res.status).toBe(403)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  /** The deploy stub plus the cluster's custom CPU models (cpu-models.conf). */
+  function stubPveFetchWithCustomModels() {
+    pveFetchMock.mockReset()
+    pveFetchMock.mockImplementation(async (_conn: any, path: string, opts?: any) => {
+      if (path === '/nodes/pve1/capabilities/qemu/cpu') return [{ name: 'gold', custom: 1 }, { name: 'silver', custom: 1 }, { name: 'host', custom: 0 }]
+      if (path.startsWith('/access/permissions?')) {
+        const key = new URLSearchParams(path.split('?')[1]).get('path')!
+        return { [key]: { 'Sys.Audit': 1, 'Sys.Modify': 1, 'Datastore.AllocateTemplate': 1 } }
+      }
+      if (path === '/nodes/pve1/storage') return [{ storage: 'local-lvm', type: 'dir', content: 'images,iso,import', active: 1, enabled: 1 }]
+      if (/^\/storage\/[^/]+$/.test(path) && !opts?.method) return { type: 'dir', content: 'images,iso,import' }
+      if (/\/content\?content=(import|iso)$/.test(path)) return []
+      if (/\/download-url$/.test(path) && opts?.method === 'POST') return 'UPID:download'
+      if (/\/qemu$/.test(path) && opts?.method === 'POST') return 'UPID:create'
+      return {}
+    })
+  }
+  const CUSTOM = { cpuModelMode: 'custom', cpuAllowedModels: [], cpuDefaultModel: 'custom-gold', cpuAdvancedSettings: true }
+
+  it('custom mode reads the cluster capabilities and keeps a custom model the cluster defines', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy(CUSTOM))
+    stubPveFetchWithCustomModels()
+    const res = await deploy({ ...baseBody, hardware: { ...baseBody.hardware, cpu: 'custom-silver' } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('custom-silver')
+  })
+
+  it('custom mode replaces a built-in model by the vDC default custom model', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy(CUSTOM))
+    stubPveFetchWithCustomModels()
+    const res = await deploy(baseBody)
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(qemuCreateParams().get('cpu')).toBe('custom-gold')
+  })
+
+  it('custom mode without readable capabilities allows no model: 400', async () => {
+    resolveVdcForTenantMock.mockResolvedValue(withPolicy({ cpuModelMode: 'custom', cpuAllowedModels: [], cpuDefaultModel: null, cpuAdvancedSettings: true }))
+    pveFetchMock.mockImplementation(async (_conn: any, path: string) => {
+      if (path.endsWith('/capabilities/qemu/cpu')) throw new Error('node down')
+      return {}
+    })
+    const res = await deploy(baseBody)
+    expect(res.status).toBe(400)
+    expect((await readJson<{ error: string }>(res))?.error).toBe('The vDC compute policy allows no CPU model on this cluster.')
+  })
+})
+
+describe('template download regressions (#967)', () => {
+  beforeEach(() => {
+    getCurrentTenantIdMock.mockResolvedValue('default')
+    getImageBySlugMock.mockReturnValue({ slug: 'debian-12', format: 'qcow2', downloadUrl: 'https://image.test/debian.qcow2' })
+    stubPveFetchForDeploy()
+  })
+
+  async function deploy(body = baseBody) {
+    const POST = await loadPost()
+    const response = await callRoute(POST, { body })
+    expect(response.status).toBe(200)
+    await runAfters()
+  }
+  const finalUpdate = () => deploymentUpdateMock.mock.calls.at(-1)?.[0].data
+  const mutations = () => pveFetchMock.mock.calls.filter(([, , options]) => options?.method)
+
+  it('records completion time and missing network rights on a failed download without writing to PVE', async () => {
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1].startsWith('/access/permissions?')) {
+        const path = new URLSearchParams(args[1].split('?')[1]).get('path')!
+        return { [path]: { 'Datastore.AllocateTemplate': 1, 'Sys.Audit': 1 } }
+      }
+      return original(...args)
+    })
+    await deploy()
+    expect(finalUpdate()).toMatchObject({ status: 'failed', completedAt: expect.any(Date), error: expect.stringContaining('Sys.AccessNetwork on /nodes/pve1') })
+    expect(mutations()).toEqual([])
+  })
+
+  it('keeps the step the deployment died on so the progress screen can show the reason', async () => {
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1].startsWith('/access/permissions?')) {
+        const path = new URLSearchParams(args[1].split('?')[1]).get('path')!
+        return { [path]: { 'Datastore.AllocateTemplate': 1, 'Sys.Audit': 1 } }
+      }
+      return original(...args)
+    })
+    await deploy()
+    // Writing currentStep: 'failed' would erase the step and leave the stepper
+    // with nothing to mark, which is how the reason went missing (#967).
+    expect(finalUpdate()).not.toHaveProperty('currentStep')
+    expect(deploymentUpdateMock.mock.calls.map(([u]) => u.data.currentStep).filter(Boolean).at(-1)).toBe('downloading')
+  })
+
+  it('does not change storage configuration when no import storage exists', async () => {
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1] === '/nodes/pve1/storage') return [{ storage: 'backup', type: 'nfs', content: 'backup', active: 1, enabled: 1 }]
+      return original(...args)
+    })
+    await deploy()
+    expect(finalUpdate()).toMatchObject({ status: 'failed', error: expect.stringContaining('Import content enabled') })
+    expect(mutations()).toEqual([])
+  })
+
+  it('reuses a cached image without needing network privileges and exposes the selected storage', async () => {
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1].endsWith('/content?content=import')) return [{ volid: 'local-lvm:import/debian.qcow2' }]
+      return original(...args)
+    })
+    await deploy()
+    expect(pveFetchMock.mock.calls.some(([, path]) => path.startsWith('/access/permissions?') || path.endsWith('/download-url'))).toBe(false)
+    expect(qemuCreateParams().get('scsi0')).toContain('import-from=local-lvm:import/debian.qcow2')
+    expect(deploymentUpdateMock).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ config: expect.objectContaining({ downloadStorage: 'local-lvm' }) }) }))
+    expect(finalUpdate()).toMatchObject({ status: 'completed', completedAt: expect.any(Date) })
+  })
+
+  it('uses the same preflight for installer ISO downloads', async () => {
+    getImageBySlugMock.mockReturnValue({ slug: 'installer', format: 'iso', downloadUrl: 'https://image.test/installer.iso' })
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1].startsWith('/access/permissions?')) return {}
+      return original(...args)
+    })
+    await deploy({ ...baseBody, isoStorage: 'iso-store' } as typeof baseBody)
+    expect(finalUpdate()).toMatchObject({ status: 'failed', error: expect.stringContaining('/storage/iso-store'), completedAt: expect.any(Date) })
+    expect(mutations()).toEqual([])
+  })
+
+  it('keeps IPAM exhaustion in Deployment.error instead of sending errorMessage to Prisma', async () => {
+    const { resolveSubnetForBridge } = await import('@/lib/vdc/vnets')
+    const { allocateIp, IpamExhaustedError } = await import('@/lib/vdc/ipam')
+    vi.mocked(resolveSubnetForBridge).mockResolvedValue({ subnetId: 'subnet-1', cidr: '10.1.0.0/30', dnsServers: [], gateway: '10.1.0.1', pveName: 'vnet1', pvePoolName: 'pool' } as any)
+    vi.mocked(allocateIp).mockRejectedValue(new IpamExhaustedError('full'))
+    await deploy()
+    expect(finalUpdate()).toMatchObject({ status: 'failed', error: expect.stringContaining('Subnet 10.1.0.0/30 is full'), completedAt: expect.any(Date) })
+    expect(deploymentUpdateMock.mock.calls.every(([update]) => !('errorMessage' in update.data))).toBe(true)
+    expect(qemuCreateParams()).toBeUndefined()
+  })
+})
+
+describe('template staging on a vDC ISO library (#1120)', () => {
+  // A Ceph-only vDC: the primary is RBD, and the only file storage carrying
+  // `import` is the CephFS ISO library the provider attached to the vDC.
+  function cephOnlyVdc(uploadLibraries: string[] = []) {
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null, storagePolicies: [] })
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['ceph-vm', 'ceph-fs'])]]),
+      writableStoragesByConnection: new Map([['conn-1', new Set(['ceph-vm'])]]),
+      isoLibrariesByConnection: new Map([['conn-1', new Set(['ceph-fs'])]]),
+      uploadLibrariesByConnection: new Map([['conn-1', new Set(uploadLibraries)]]),
+      storagePoliciesByConnection: new Map([['conn-1', new Map()]]),
+    })
+    stubPveFetchForDeploy()
+    const original = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (...args) => {
+      if (args[1] === '/nodes/pve1/storage') return [
+        { storage: 'ceph-vm', type: 'rbd', content: 'images,rootdir', active: 1, enabled: 1 },
+        { storage: 'ceph-fs', type: 'cephfs', content: 'backup,import,iso,vztmpl', active: 1, enabled: 1 },
+        { storage: 'local', type: 'dir', content: 'backup,import,iso,vztmpl', active: 1, enabled: 1 },
+      ]
+      if (args[1] === '/storage/ceph-vm' && !args[2]?.method) return { type: 'rbd', content: 'images,rootdir' }
+      return original(...args)
+    })
+  }
+
+  async function deploy(body: any = { ...baseBody, storage: 'ceph-vm' }) {
+    const res = await callRoute(await loadPost(), { body })
+    expect(res.status).toBe(200)
+    await runAfters()
+  }
+  const finalUpdate = () => deploymentUpdateMock.mock.calls.at(-1)?.[0].data
+  const downloadTargets = () => pveFetchMock.mock.calls.filter(([, path]) => String(path).endsWith('/download-url')).map(([, path]) => path)
+
+  it('stages a built-in image on the vDC ISO library, never on a storage outside the vDC', async () => {
+    getImageBySlugMock.mockReturnValue({ slug: 'debian-12', format: 'qcow2', downloadUrl: 'https://image.test/debian.qcow2' })
+    cephOnlyVdc()
+    await deploy()
+    expect(downloadTargets()).toEqual(['/nodes/pve1/storage/ceph-fs/download-url'])
+    expect(qemuCreateParams().get('scsi0')).toContain('import-from=ceph-fs:import/debian.qcow2')
+    expect(finalUpdate()).toMatchObject({ status: 'completed' })
+  })
+
+  it('stages a provider catalogue image granted to the tenant on the library', async () => {
+    const { customImageToCloudImage } = await import('@/lib/templates/cloudImages')
+    vi.mocked(customImageToCloudImage).mockImplementation((row: any) => row)
+    findCustomImageForTenantMock.mockResolvedValue({ id: 'cmgolden1', tenantId: 'default', isShared: false, visibleViaGrant: true, slug: 'custom-golden', format: 'qcow2', sourceType: 'url', downloadUrl: 'https://image.test/golden.qcow2' })
+    cephOnlyVdc()
+    await deploy({ ...baseBody, storage: 'ceph-vm', imageSlug: 'custom-golden' })
+    expect(downloadTargets()).toEqual(['/nodes/pve1/storage/ceph-fs/download-url'])
+    expect(qemuCreateParams().get('scsi0')).toContain('import-from=ceph-fs:import/custom-cmgolden1.qcow2')
+    expect(finalUpdate()).toMatchObject({ status: 'completed' })
+  })
+
+  describe("a tenant's own URL image", () => {
+    beforeEach(async () => {
+      const { customImageToCloudImage } = await import('@/lib/templates/cloudImages')
+      vi.mocked(customImageToCloudImage).mockImplementation((row: any) => row)
+      findCustomImageForTenantMock.mockResolvedValue({ id: 'cmacmeapp1', tenantId: 'tenant-1', isShared: false, slug: 'custom-acme-app', format: 'qcow2', sourceType: 'url', downloadUrl: 'https://acme.test/app.qcow2' })
+      // A vDC tenant's URL image is refused before staging now (#69, below):
+      // these cases keep the staging rule of tenant content covered.
+      urlFetchRefusalOff.value = true
+    })
+
+    it('is not written onto a read-only library', async () => {
+      cephOnlyVdc()
+      await deploy({ ...baseBody, storage: 'ceph-vm', imageSlug: 'custom-acme-app' })
+      expect(finalUpdate()).toMatchObject({ status: 'failed', error: expect.stringContaining('Import content enabled') })
+      expect(downloadTargets()).toEqual([])
+    })
+
+    it('stages on a library that accepts tenant uploads', async () => {
+      cephOnlyVdc(['ceph-fs'])
+      await deploy({ ...baseBody, storage: 'ceph-vm', imageSlug: 'custom-acme-app' })
+      expect(downloadTargets()).toEqual(['/nodes/pve1/storage/ceph-fs/download-url'])
+      expect(qemuCreateParams().get('scsi0')).toContain('import-from=ceph-fs:import/custom-cmacmeapp1.qcow2')
+      expect(finalUpdate()).toMatchObject({ status: 'completed' })
+    })
+
+    it('never reuses a staged file named after its slug, which another tenant can also own', async () => {
+      // Tenant `acme-app` + image "x" and tenant `acme` + image "app x" share
+      // the slug-derived name: a file already there may be the other one's.
+      cephOnlyVdc(['ceph-fs'])
+      const staged = pveFetchMock.getMockImplementation()!
+      pveFetchMock.mockImplementation(async (...args) =>
+        args[1] === '/nodes/pve1/storage/ceph-fs/content?content=import'
+          ? [{ volid: 'ceph-fs:import/custom-acme-app.qcow2' }]
+          : staged(...args))
+      await deploy({ ...baseBody, storage: 'ceph-vm', imageSlug: 'custom-acme-app' })
+      expect(downloadTargets()).toEqual(['/nodes/pve1/storage/ceph-fs/download-url'])
+      expect(qemuCreateParams().get('scsi0')).not.toContain('custom-acme-app.qcow2')
+    })
+  })
+})
+
+describe("POST templates/deploy: a vDC tenant's URL image (#69)", () => {
+  // The node would fetch a URL the tenant chose: refused like download-url,
+  // images created before that rule included.
+  beforeEach(async () => {
+    const { customImageToCloudImage } = await import('@/lib/templates/cloudImages')
+    vi.mocked(customImageToCloudImage).mockImplementation((row: any) => row)
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null })
+    getVdcScopeMock.mockResolvedValue({
+      connectionIds: new Set(['conn-1']),
+      nodesByConnection: new Map([['conn-1', new Set(['pve1'])]]),
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm', 'library'])]]),
+      writableStoragesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      poolsByConnection: new Map([['conn-1', new Set(['pool-a'])]]),
+      isoLibrariesByConnection: new Map([['conn-1', new Set(['library'])]]),
+    })
+    stubPveFetchForDeploy()
+    const { isNodeUrlFetchRefused } = await import('@/lib/vdc/nodeUrlFetch')
+    vi.mocked(isNodeUrlFetchRefused).mockClear()
+  })
+
+  it('refuses it before any PVE call or deployment row', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ id: 'cmacmeapp1', tenantId: 'tenant-1', isShared: false, slug: 'custom-acme-app', format: 'qcow2', sourceType: 'url', downloadUrl: 'http://10.0.0.5/app.qcow2' })
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, imageSlug: 'custom-acme-app' } })
+    expect(res.status).toBe(403)
+    expect((await readJson<{ error: string }>(res))?.error).toBe(URL_IMAGE_REFUSED)
+    expect(pveFetchMock).not.toHaveBeenCalled()
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('keeps a provider URL image granted to that tenant', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ id: 'cmgolden1', tenantId: 'default', isShared: false, visibleViaGrant: true, slug: 'custom-golden', format: 'qcow2', sourceType: 'url', downloadUrl: 'https://image.test/golden.qcow2' })
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, imageSlug: 'custom-golden' } })
+    // The provider set that URL: not judged on the tenant kind at all.
+    expect((await readJson<{ error?: string }>(res))?.error).not.toBe(URL_IMAGE_REFUSED)
+    const { isNodeUrlFetchRefused } = await import('@/lib/vdc/nodeUrlFetch')
+    expect(isNodeUrlFetchRefused).not.toHaveBeenCalledWith('default')
+  })
+})
+
+describe('POST templates/deploy: source volume authorization', () => {
+  const source = {
+    tenantId: 'tenant-1', isShared: false, sourceType: 'volume', format: 'qcow2',
+    volumeId: 'local-lvm:vm-201-disk-0', sourceConnectionId: 'conn-1', sourceNode: 'pve1',
+  }
+  beforeEach(async () => {
+    const { customImageToCloudImage } = await import('@/lib/templates/cloudImages')
+    vi.mocked(customImageToCloudImage).mockImplementation((row: any) => row)
+    findCustomImageForTenantMock.mockResolvedValue({ ...source })
+    resolveVdcForTenantMock.mockResolvedValue({ poolName: 'pool-a', quota: null })
+    getVdcScopeMock.mockResolvedValue({
+      connectionIds: new Set(['conn-1']),
+      nodesByConnection: new Map([['conn-1', new Set(['pve1'])]]),
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm', 'library'])]]),
+      writableStoragesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      poolsByConnection: new Map([['conn-1', new Set(['pool-a'])]]),
+      isoLibrariesByConnection: new Map([['conn-1', new Set(['library'])]]),
+    })
+    pveFetchMock.mockImplementation(async (_conn, path) => {
+      if (path.endsWith('/content')) return [{ volid: source.volumeId, content: 'images', vmid: 201 }]
+      if (path === '/cluster/resources?type=vm') return [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-b' }]
+      return {}
+    })
+  })
+
+  it('rejects a legacy malicious row even when its destination is writable', async () => {
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(403)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('rejects a source storage removed from the tenant scope since image creation', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ ...source, volumeId: 'foreign:vm-201-disk-0' })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(403)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('requires an origin for old unbound images instead of guessing a cluster', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ ...source, sourceConnectionId: null, sourceNode: null })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(409)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('preserves a provider shared image with an explicit source', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ ...source, tenantId: 'default', isShared: true })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    expect(afterCbs).toHaveLength(1)
+  })
+
+  it('does not let a forged isShared in the deployment body confer source access', async () => {
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, isShared: true, tenantId: 'default' } })
+    expect(res.status).toBe(403)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('rejects another tenant ISO despite a permitted isoStorage decoy', async () => {
+    findCustomImageForTenantMock.mockResolvedValue({ ...source, format: 'iso', volumeId: 'library:iso/custom-acme-prod-private.iso' })
+    pveFetchMock.mockResolvedValue([{ volid: 'library:iso/custom-acme-prod-private.iso', content: 'iso' }])
+    const res = await callRoute(await loadPost(), { body: { ...baseBody, isoStorage: 'library' } })
+    expect(res.status).toBe(403)
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('imports a tenant-owned disk through the background deployment pipeline', async () => {
+    pveFetchMock.mockImplementation(async (_conn, path, opts) => {
+      if (path.endsWith('/content')) return [{ volid: source.volumeId, content: 'images', vmid: 201 }]
+      if (path === '/cluster/resources?type=vm') return [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-a' }]
+      if (path.endsWith('/qemu') && opts?.method === 'POST') return 'UPID:create'
+      return {}
+    })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(String(qemuCreateParams().get('scsi0'))).toContain('import-from=local-lvm:vm-201-disk-0')
+    expect(deploymentUpdateMock.mock.calls.some(call => call[0].data.status === 'completed')).toBe(true)
+  })
+
+  it.each(['removed', 'changed', 'unpublished'])('fails before PVE writes when a shared source is %s after the response', async change => {
+    findCustomImageForTenantMock.mockResolvedValue({ ...source, tenantId: 'default', isShared: true })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    findCustomImageForTenantMock.mockResolvedValue(change === 'removed' ? null : {
+      ...source, tenantId: 'default', isShared: change !== 'unpublished',
+      volumeId: change === 'changed' ? 'local-lvm:vm-999-disk-0' : source.volumeId,
+    })
+    await runAfters()
+    expect(pveFetchMock.mock.calls.some(call => call[2]?.method === 'POST' || call[2]?.method === 'PUT')).toBe(false)
+    expect(deploymentUpdateMock.mock.calls.some(call => call[0].data.status === 'failed' && call[0].data.completedAt instanceof Date)).toBe(true)
+  })
+
+  it('rejects storage scope revoked between acceptance and background execution', async () => {
+    pveFetchMock.mockImplementation(async (_conn, path) => {
+      if (path.endsWith('/content')) return [{ volid: source.volumeId, content: 'images', vmid: 201 }]
+      if (path === '/cluster/resources?type=vm') return [{ vmid: 201, type: 'qemu', node: 'pve1', pool: 'pool-a' }]
+      return {}
+    })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    const changedScope = await getVdcScopeMock()
+    changedScope.storagesByConnection.get('conn-1').delete('local-lvm')
+    await runAfters()
+    expect(pveFetchMock.mock.calls.some(call => call[2]?.method === 'POST' || call[2]?.method === 'PUT')).toBe(false)
+    expect(deploymentUpdateMock.mock.calls.some(call => call[0].data.status === 'failed')).toBe(true)
+  })
+
+  describe('copies on other clusters (#44)', () => {
+    // Werner's layout: the golden image is bound to ml5-cl01 (conn-0) and the
+    // same NFS export is mounted as another storage on pac-cl01 (conn-1).
+    const golden = {
+      ...source, tenantId: 'default', isShared: true, sourceConnectionId: 'conn-0', sourceNode: 'ml5-n1',
+      volumeId: 'nfs-ml5:import/golden.qcow2',
+      extraLocations: [{ connectionId: 'conn-1', node: 'pve1', volumeId: 'nfs-pac:import/golden.qcow2' }],
+    }
+    const pveWithCopy = async (_conn: any, path: string, opts?: any) => {
+      if (path.endsWith('/content')) return [{ volid: 'nfs-pac:import/golden.qcow2', content: 'import' }]
+      if (path.endsWith('/qemu') && opts?.method === 'POST') return 'UPID:create'
+      return {}
+    }
+
+    it('deploys on the target cluster from the copy declared there', async () => {
+      findCustomImageForTenantMock.mockResolvedValue(golden)
+      pveFetchMock.mockImplementation(pveWithCopy)
+      const res = await callRoute(await loadPost(), { body: baseBody })
+      expect(res.status).toBe(200)
+      await runAfters()
+      expect(String(qemuCreateParams().get('scsi0'))).toContain('import-from=nfs-pac:import/golden.qcow2')
+    })
+
+    it('refuses, before any PVE call, a cluster holding no copy', async () => {
+      findCustomImageForTenantMock.mockResolvedValue({ ...golden, extraLocations: [] })
+      const res = await callRoute(await loadPost(), { body: baseBody })
+      expect(res.status).toBe(400)
+      expect((await readJson(res)).error).toMatch(/no copy on the selected cluster/)
+      expect(pveFetchMock).not.toHaveBeenCalled()
+      expect(afterCbs).toHaveLength(0)
+    })
+
+    it('fails before PVE writes when the copy is withdrawn after the response', async () => {
+      findCustomImageForTenantMock.mockResolvedValue(golden)
+      pveFetchMock.mockImplementation(pveWithCopy)
+      const res = await callRoute(await loadPost(), { body: baseBody })
+      expect(res.status).toBe(200)
+      findCustomImageForTenantMock.mockResolvedValue({ ...golden, extraLocations: [] })
+      await runAfters()
+      expect(pveFetchMock.mock.calls.some(call => call[2]?.method === 'POST' || call[2]?.method === 'PUT')).toBe(false)
+      expect(deploymentUpdateMock.mock.calls.some(call => call[0].data.status === 'failed')).toBe(true)
+    })
+  })
+
+  it('deploys a provider shared image whose source sits outside the tenant vDC (#971)', async () => {
+    const golden = { ...source, tenantId: 'default', isShared: true, volumeId: 'provider-store:import/golden.qcow2', sourceNode: 'pve3' }
+    findCustomImageForTenantMock.mockResolvedValue(golden)
+    pveFetchMock.mockImplementation(async (_conn, path) => {
+      if (path.endsWith('/content')) return [{ volid: golden.volumeId, content: 'import' }]
+      if (path.startsWith('/storage/')) return { shared: 1, type: 'nfs' }
+      return {}
+    })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    expect(afterCbs).toHaveLength(1)
+  })
+})
+
+describe('POST templates/deploy: provider deploying into a tenant vDC (roadmap#65)', () => {
+  const TARGET = { vdcId: 'vdc-t', vdcName: 'Gold', tenantId: 'tenant-acme', tenantName: 'Acme', connectionId: 'conn-1' }
+  const targetBody = { ...baseBody, targetVdcId: 'vdc-t' }
+
+  beforeEach(() => {
+    stubPveFetchForDeploy()
+    getCurrentTenantIdMock.mockResolvedValue('default')
+    resolveProviderVdcTargetMock.mockResolvedValue({ ok: true, target: TARGET })
+    getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: 'vdc-t', poolName: 'pool-acme', quota: null, storagePolicies: [] })
+    getVdcScopeMock.mockResolvedValue({
+      storagesByConnection: new Map([['conn-1', new Set(['local-lvm'])]]),
+      storagePoliciesByConnection: new Map(),
+    })
+  })
+
+  it('refuses a forged targetVdcId from a tenant caller and creates nothing', async () => {
+    getCurrentTenantIdMock.mockResolvedValue('tenant-1')
+    resolveProviderVdcTargetMock.mockResolvedValue({ ok: false, response: Response.json({ error: 'Only a provider administrator can target a tenant vDC.' }, { status: 403 }) })
+    const res = await callRoute(await loadPost(), { body: targetBody })
+    expect(res.status).toBe(403)
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+    expect(resolveVdcForTenantMock).not.toHaveBeenCalled()
+    expect(checkVmidAgainstTenantRangeMock).not.toHaveBeenCalled()
+    expect(afterCbs).toHaveLength(0)
+  })
+
+  it('400 when the target vDC is on another connection', async () => {
+    resolveProviderVdcTargetMock.mockResolvedValue({ ok: true, target: { ...TARGET, connectionId: 'conn-other' } })
+    const res = await callRoute(await loadPost(), { body: targetBody })
+    expect(res.status).toBe(400)
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+    expect(checkVmidAgainstTenantRangeMock).not.toHaveBeenCalled()
+  })
+
+  it('applies the placement rules of the TARGET tenant and the catalogue of the CALLER', async () => {
+    findCustomImageForTenantMock.mockResolvedValue(null)
+    getImageBySlugMock.mockReturnValue(undefined)
+    const res = await callRoute(await loadPost(), { body: { ...targetBody, imageSlug: 'custom-x' } })
+    // Unknown slug stops after the vmid, vDC resolution and the catalogue lookup.
+    expect(res.status).toBe(400)
+    expect(resolveProviderVdcTargetMock).toHaveBeenCalledWith('vdc-t')
+    expect(checkVmidAgainstTenantRangeMock).toHaveBeenCalledWith('tenant-acme', 190)
+    expect(resolveVdcForTenantMock).toHaveBeenCalledWith('tenant-acme', 'conn-1', 'pve1')
+    expect(findCustomImageForTenantMock).toHaveBeenCalledWith('default', 'custom-x', { vdcId: 'vdc-t' })
+  })
+
+  it('deploys with the target scope, records targetVdcId and audits the target', async () => {
+    const res = await callRoute(await loadPost(), { body: targetBody })
+    expect(res.status).toBe(200)
+    expect(getVdcScopeMock).toHaveBeenCalledWith('tenant-acme', { ignoreVdcContext: true })
+    const created = deploymentCreateMock.mock.calls[0]?.[0]
+    expect(created.data.config).toMatchObject({ targetVdcId: 'vdc-t' })
+    await runAfters()
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
+      details: expect.objectContaining({ targetVdcId: 'vdc-t', targetTenantId: 'tenant-acme' }),
+    }))
+  })
+
+  it('does not record a targetVdcId on a regular deployment', async () => {
+    getCurrentTenantIdMock.mockResolvedValue('tenant-1')
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: 'vdc-1', poolName: 'pool-a', quota: null, storagePolicies: [] })
+    const res = await callRoute(await loadPost(), { body: baseBody })
+    expect(res.status).toBe(200)
+    expect(deploymentCreateMock.mock.calls[0]?.[0].data.config).not.toHaveProperty('targetVdcId')
+    expect(resolveProviderVdcTargetMock).not.toHaveBeenCalled()
+  })
+
+  it('409 when the vDC resolved for the tenant is not the target', async () => {
+    resolveVdcForTenantMock.mockResolvedValue({ vdcId: 'vdc-other', poolName: 'pool-acme', quota: null })
+    const res = await callRoute(await loadPost(), { body: targetBody })
+    expect(res.status).toBe(409)
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST templates/deploy: firmware, disk bus and HA (#181)', () => {
+  const provider = () => {
+    getCurrentTenantIdMock.mockResolvedValue('default')
+    resolveVdcForTenantMock.mockResolvedValue(null)
+  }
+  const cloudImage = () => getImageBySlugMock.mockReturnValue({ slug: 'ubuntu-22.04', format: 'qcow2', downloadUrl: 'https://img.test/u.qcow2' })
+  const isoImage = () => getImageBySlugMock.mockReturnValue({ slug: 'win11', format: 'iso', downloadUrl: 'https://img.test/w.iso' })
+  /** The deploy stub, with `ceph` answering as a shared RBD storage. */
+  function stubWithSharedCeph() {
+    stubPveFetchForDeploy()
+    const base = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (conn: any, path: string, opts?: any) => {
+      if (path === '/storage/ceph' && !opts?.method) return { type: 'rbd', content: 'images' }
+      if (path === '/nodes/pve1/storage') return [{ storage: 'ceph', type: 'rbd', content: 'images', active: 1, enabled: 1, shared: 1 }, { storage: 'local-lvm', type: 'dir', content: 'images,iso,import', active: 1, enabled: 1 }]
+      return base(conn, path, opts)
+    })
+  }
+  const haCalls = () => pveFetchMock.mock.calls.filter(([, path, opts]: any) => path === '/cluster/ha/resources' && opts?.method === 'POST')
+
+  beforeEach(() => { stubPveFetchForDeploy(); provider() })
+
+  it('disk image: UEFI, q35, TPM, SATA and the display land in the create call, and the resize targets the SATA disk', async () => {
+    cloudImage()
+    const POST = await loadPost()
+    const hardware = { ...baseBody.hardware, bios: 'ovmf', machine: 'q35', tpm: true, diskBus: 'sata', vga: 'std' }
+    const res = await callRoute(POST, { body: { ...baseBody, hardware } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('sata0')).toBe('local-lvm:0,import-from=local-lvm:import/u.qcow2')
+    expect(params.get('scsi0')).toBeNull()
+    expect(params.get('boot')).toBe('order=sata0')
+    expect(params.get('bios')).toBe('ovmf')
+    expect(params.get('machine')).toBe('q35')
+    expect(params.get('efidisk0')).toBe('local-lvm:1,efitype=4m,pre-enrolled-keys=1')
+    expect(params.get('tpmstate0')).toBe('local-lvm:1,version=v2.0')
+    expect(params.get('vga')).toBe('std')
+    expect(params.get('serial0')).toBe('socket')
+    const resize = pveFetchMock.mock.calls.find(([, path]: any) => /\/resize$/.test(path))
+    expect((resize?.[2]?.body as URLSearchParams).get('disk')).toBe('sata0')
+  })
+
+  it('disk image without firmware fields: SCSI disk, SeaBIOS, and a standard display instead of the dead serial one', async () => {
+    cloudImage()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: baseBody })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('scsi0')).toBe('local-lvm:0,import-from=local-lvm:import/u.qcow2')
+    expect(params.get('boot')).toBe('order=scsi0')
+    expect(params.get('vga')).toBe('std')
+    expect(params.get('serial0')).toBe('socket')
+    expect(params.get('bios')).toBeNull()
+    expect(params.get('machine')).toBeNull()
+    expect(params.get('efidisk0')).toBeNull()
+    expect(params.get('tpmstate0')).toBeNull()
+  })
+
+  it('ISO install: TPM state and the chosen bus for the empty disk', async () => {
+    isoImage()
+    const POST = await loadPost()
+    const hardware = { ...baseBody.hardware, bios: 'ovmf', tpm: true, diskBus: 'sata' }
+    const res = await callRoute(POST, { body: { ...baseBody, isoStorage: 'local-lvm', hardware } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    const params = qemuCreateParams()
+    expect(params.get('tpmstate0')).toBe('local-lvm:1,version=v2.0')
+    expect(params.get('sata0')).toBe('local-lvm:10')
+    expect(params.get('scsi0')).toBeNull()
+    expect(params.get('boot')).toBe('order=ide2;sata0')
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ mode: 'iso', tpm: true }) }))
+  })
+
+  it('HA refused without node.manage on the connection, before anything is created', async () => {
+    cloudImage()
+    checkPermissionMock.mockImplementation(async (perm: string) => (perm === 'node.manage' ? new Response('no', { status: 403 }) : null))
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, ha: true } })
+    expect(res.status).toBe(403)
+    expect(checkPermissionMock).toHaveBeenCalledWith('node.manage', 'connection', 'conn-1')
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+  })
+
+  it('HA refused outside the provider tenant', async () => {
+    cloudImage()
+    requireProviderTenantMock.mockResolvedValue(new Response('provider only', { status: 403 }))
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, ha: true } })
+    expect(res.status).toBe(403)
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+  })
+
+  it('HA refused on local storage, before anything is created', async () => {
+    cloudImage()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, ha: true } })
+    expect(res.status).toBe(400)
+    expect((await readJson<{ error: string }>(res))?.error).toMatch(/shared storage/)
+    expect(deploymentCreateMock).not.toHaveBeenCalled()
+  })
+
+  it('HA on shared storage: the started VM is handed to the HA manager and the deployment records it', async () => {
+    stubWithSharedCeph()
+    cloudImage()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, storage: 'ceph', ha: true } })
+    expect(res.status).toBe(200)
+    expect(deploymentCreateMock.mock.calls[0][0].data.config.ha).toBe(true)
+
+    await runAfters()
+
+    expect(haCalls()).toHaveLength(1)
+    const body = new URLSearchParams(haCalls()[0][2].body)
+    expect(body.get('sid')).toBe('vm:190')
+    expect(body.get('state')).toBe('started')
+    const last = deploymentUpdateMock.mock.calls.at(-1)![0]
+    expect(last.data.status).toBe('completed')
+    expect(last.data.error).toBeUndefined()
+  })
+
+  it('a failed HA registration keeps the deployment completed and explains it', async () => {
+    stubWithSharedCeph()
+    const base = pveFetchMock.getMockImplementation()!
+    pveFetchMock.mockImplementation(async (conn: any, path: string, opts?: any) => {
+      if (path === '/cluster/ha/resources') throw new Error('resource already defined')
+      return base(conn, path, opts)
+    })
+    cloudImage()
+    const POST = await loadPost()
+    await callRoute(POST, { body: { ...baseBody, storage: 'ceph', ha: true } })
+
+    await runAfters()
+
+    const last = deploymentUpdateMock.mock.calls.at(-1)![0]
+    expect(last.data.status).toBe('completed')
+    expect(last.data.error).toMatch(/high availability could not be enabled: resource already defined/)
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ details: expect.objectContaining({ ha: false }) }))
+  })
+
+  it('HA on an ISO install keeps the VM stopped until the user starts the installer', async () => {
+    stubWithSharedCeph()
+    isoImage()
+    const POST = await loadPost()
+    const res = await callRoute(POST, { body: { ...baseBody, storage: 'ceph', isoStorage: 'local-lvm', ha: true } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+
+    expect(new URLSearchParams(haCalls()[0][2].body).get('state')).toBe('stopped')
+  })
+})

@@ -1,0 +1,1331 @@
+/**
+ * Component tests for CreateVmDialog.tsx
+ *
+ * Strategy: render the dialog with open={true}, seed every MSW endpoint the
+ * dialog calls on mount (and on connection/node resolve), await data load,
+ * then assert visible output and representative interactions. Context hooks
+ * that depend on live providers are mocked at module level.
+ *
+ * The structure here mirrors CreateLxcDialog.test.tsx closely -- same gotchas,
+ * same MSW-on-open seeding pattern, same MUI combobox/index access technique.
+ *
+ * Not covered here:
+ *   - Full multi-tab navigation end-to-end (heavy form state across 8 tabs)
+ *   - Import-disk flow (fires a separate storage/content fetch on user action)
+ *   - Recharts / canvas (SVG width unavailable under jsdom)
+ *   - vDC quota banner (requires a non-empty vdcs response with a matching
+ *     connectionId -- the banner itself is covered by QuotaDonut unit tests)
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { cleanup, within } from '@testing-library/react'
+import {
+  renderWithProviders,
+  screen,
+  waitFor,
+  fireEvent,
+  userEvent,
+} from '@/__tests__/setup/renderWithProviders'
+import { server, http, HttpResponse } from '@/__tests__/setup/msw-server'
+
+import {
+  connections,
+  nodes,
+  pools,
+  networkChoices,
+  vmStorage,
+  vdcs,
+} from '@/__tests__/fixtures/pveProvisioning'
+
+import CreateVmDialog, { checkNicMtu, guestOsSummaryLabel } from './CreateVmDialog'
+
+// ------------------------------------------------------------------ //
+// Context mocks
+// ------------------------------------------------------------------ //
+
+vi.mock('@/contexts/RBACContext', () => ({
+  useRBAC: () => ({ isAdmin: true }),
+}))
+
+const { useTenantMock } = vi.hoisted(() => ({ useTenantMock: vi.fn() }))
+vi.mock('@/contexts/TenantContext', () => ({ useTenant: () => useTenantMock() }))
+
+// ------------------------------------------------------------------ //
+// Constants
+// ------------------------------------------------------------------ //
+
+const CONN_ID = connections[0].id  // 'conn-1'
+const NODE_NAME = nodes[0].node    // 'pve1'
+const NEXT_VMID = 101
+
+// ------------------------------------------------------------------ //
+// MSW handler factory
+// Seeds ALL endpoints the dialog fires on open (and on connection/node select).
+// ------------------------------------------------------------------ //
+
+function seedAllHandlers() {
+  server.use(
+    // 1. Connections list (type=pve)
+    http.get('*/api/v1/connections', ({ request }) => {
+      const url = new URL(request.url)
+      if (url.searchParams.get('type') === 'pve') {
+        return HttpResponse.json({ data: connections })
+      }
+      return HttpResponse.json({ data: [] })
+    }),
+
+    // 2. Nodes for the connection
+    http.get(`*/api/v1/connections/${CONN_ID}/nodes`, () =>
+      HttpResponse.json({ data: nodes }),
+    ),
+
+    // 3. Next VMID from cluster API (dialog calls setVmid(String(json.data)))
+    http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () =>
+      HttpResponse.json({ data: NEXT_VMID }),
+    ),
+
+    // 4. vDC quota list (empty = no quota applied; provider tenant has no vDC)
+    http.get('*/api/v1/vdcs', () =>
+      HttpResponse.json({ data: vdcs }),
+    ),
+
+    // 5. Pools for the connection
+    http.get(`*/api/v1/connections/${CONN_ID}/pools`, () =>
+      HttpResponse.json({ data: pools }),
+    ),
+
+    // 6. Storage for the connection
+    //    vmStorage has content 'images,iso,rootdir' and shared=true so the
+    //    dialog auto-selects it for both isoStorage and disk[0].storage.
+    http.get(`*/api/v1/connections/${CONN_ID}/storage`, () =>
+      HttpResponse.json({ data: vmStorage }),
+    ),
+
+    // 7. Network choices (bridge list) for connection + node
+    //    networkChoices[0] = { name: 'vmbr0' } which matches the default NIC
+    //    bridge so networkBlocked stays false and Create is not blocked.
+    http.get(`*/api/v1/connections/${CONN_ID}/network-choices`, () =>
+      HttpResponse.json({ data: networkChoices }),
+    ),
+
+    // 8. ISO content fetch -- fires automatically when isoStorage is set.
+    //    The storage fetch sets isoStorage='local-vm', which triggers the
+    //    loadIsoImages effect. Seed an empty list so the effect completes
+    //    without an unhandled-request error.
+    http.get(`*/api/v1/connections/${CONN_ID}/nodes/${NODE_NAME}/storage/local-vm/content`, () =>
+      HttpResponse.json({ data: [] }),
+    ),
+
+    // 9. Custom CPU models (cpu-models.conf) for connection + node (#665).
+    //    Empty list = no Custom section, the static CPU type options stand.
+    http.get(`*/api/v1/connections/${CONN_ID}/nodes/${NODE_NAME}/cpu-models`, () =>
+      HttpResponse.json({ data: [] }),
+    ),
+
+    // 10. Versioned machine types of the node (#1194).
+    http.get(`*/api/v1/connections/${CONN_ID}/nodes/${NODE_NAME}/machines`, () =>
+      HttpResponse.json({ data: machineVersions }),
+    ),
+  )
+}
+
+const machineVersions = [
+  { id: 'pc-i440fx-11.0+pve2', type: 'i440fx', version: '11.0+pve2', changes: 'Enable hv_emcs for Windows.' },
+  { id: 'pc-q35-11.0+pve2', type: 'q35', version: '11.0+pve2', changes: 'Enable hv_emcs for Windows.' },
+  { id: 'pc-q35-10.1', type: 'q35', version: '10.1', changes: null },
+]
+
+// ------------------------------------------------------------------ //
+// Helpers
+// ------------------------------------------------------------------ //
+
+function makeProps(overrides: Partial<Parameters<typeof CreateVmDialog>[0]> = {}) {
+  return {
+    open: true,
+    onClose: vi.fn(),
+    allVms: [],
+    ...overrides,
+  }
+}
+
+/**
+ * Wait for the dialog to finish loading. After loadAllData() resolves the
+ * component sets selectedNodeValue='pve1' and vmid='101' (from nextid fetch).
+ * The CircularProgress disappears and the comboboxes appear.
+ *
+ * Combobox ordering on the General tab (hideNodePicker=false, isAdmin=true):
+ *   comboboxes[0] = Node select     (rendered when !hideNodePicker)
+ *   comboboxes[1] = Resource Pool select (rendered when isAdmin)
+ *
+ * MUI Select uses aria-labelledby for label association but jsdom's ARIA
+ * name computation does not resolve aria-labelledby references for combobox
+ * roles, so getByRole('combobox', {name: ...}) does not work. We use
+ * index-based access with an explicit length guard so any structural change
+ * (new combobox inserted before Node) fails loudly instead of silently
+ * asserting on the wrong element.
+ *
+ * We also wait for the Next button to become enabled, which ensures bridges
+ * have loaded (networkBlocked=false) and quota is clear (quotaBlocked=false).
+ * Without this, clicking Next immediately after the node appears may still
+ * be blocked by the in-flight network-choices fetch.
+ */
+async function waitForDataLoad() {
+  await waitFor(() => {
+    const comboboxes = screen.getAllByRole('combobox')
+    // Guard: at least Node (index 0) and Resource Pool (index 1) must exist.
+    expect(comboboxes.length).toBeGreaterThanOrEqual(2)
+    // comboboxes[0] is the Node select; after load it shows 'pve1'.
+    expect(comboboxes[0].textContent).toContain('pve1')
+  })
+  // Also wait for the Next button to be enabled so bridges and quota are resolved.
+  // Use exact name 'Next' to avoid matching other buttons.
+  // getByRole throws if the button is absent, so this waitFor only resolves
+  // once Next is both present AND enabled (non-skippable invariant).
+  await waitFor(() => {
+    expect(screen.getByRole('button', { name: 'Next' })).not.toBeDisabled()
+  })
+}
+
+beforeEach(() => {
+  useTenantMock.mockReturnValue({ currentTenant: null, loading: false, isFullClusterView: true })
+})
+
+afterEach(() => {
+  cleanup()
+})
+
+// ------------------------------------------------------------------ //
+// 1. Dialog open / closed visibility
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - open/closed state', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('renders the dialog title when open=true', () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    expect(screen.getByText('Create: Virtual Machine')).toBeInTheDocument()
+  })
+
+  it('renders Cancel and Next buttons when open=true', () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeInTheDocument()
+    // The Next button has exact text "Next" -- use exact name to avoid
+    // matching other buttons containing the word.
+    expect(screen.getByRole('button', { name: 'Next' })).toBeInTheDocument()
+  })
+
+  it('renders all tab labels', () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    expect(screen.getByRole('tab', { name: 'General' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'OS' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'System' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Disks' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'CPU' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Memory' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Network' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Confirm' })).toBeInTheDocument()
+  })
+
+  it('does not render the dialog title when open=false', () => {
+    renderWithProviders(<CreateVmDialog {...makeProps({ open: false })} />)
+    expect(screen.queryByText('Create: Virtual Machine')).not.toBeInTheDocument()
+  })
+
+  it('Back button is disabled on the first tab', () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    const backBtn = screen.getByRole('button', { name: /back/i })
+    expect(backBtn).toBeDisabled()
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 2. Data load on open -- connections, nodes, vmid load from MSW
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - data loads on open', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('auto-selects the first node after data loads and shows its name', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    // comboboxes[0] is the Node select (see waitForDataLoad comment for ordering guarantee).
+    const comboboxes = screen.getAllByRole('combobox')
+    expect(comboboxes.length).toBeGreaterThanOrEqual(2)
+    expect(comboboxes[0].textContent).toContain('pve1')
+  })
+
+  it('opens the Node Select listbox and lists the seeded node', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // comboboxes[0] is the Node select (see waitForDataLoad comment for ordering guarantee).
+    const comboboxes = screen.getAllByRole('combobox')
+    expect(comboboxes.length).toBeGreaterThanOrEqual(2)
+    fireEvent.mouseDown(comboboxes[0])
+
+    // The MenuItem for pve1 appears in the portal listbox.
+    const option = await screen.findByRole('option', { name: /pve1/ })
+    expect(option).toBeInTheDocument()
+  })
+
+  it('populates the Resource Pool selector with seeded pools', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // comboboxes[0]=Node, comboboxes[1]=Resource Pool (see waitForDataLoad comment).
+    const comboboxes = screen.getAllByRole('combobox')
+    expect(comboboxes.length).toBeGreaterThanOrEqual(2)
+    fireEvent.mouseDown(comboboxes[1])
+
+    // Pool items appear in the portal listbox.
+    const poolDev = await screen.findByRole('option', { name: /pool-dev/ })
+    expect(poolDev).toBeInTheDocument()
+    const poolProd = screen.getByRole('option', { name: /pool-prod/ })
+    expect(poolProd).toBeInTheDocument()
+  })
+
+  it('sets VM ID to the seeded nextid value from the cluster API', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // The nextid fetch returns 101; the component calls setVmid(String(json.data)).
+    // VM ID field label is "VM ID" (hardcoded in JSX, not a translation key).
+    const vmidInput = screen.getByLabelText('VM ID') as HTMLInputElement
+    expect(vmidInput).toBeInTheDocument()
+    expect(vmidInput.value).toBe(String(NEXT_VMID))
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 3. Form input interactions
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - form inputs', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('typing in the Name field updates its value', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // The VM name label key is inventory.createVm.vmName = "Name".
+    const nameInput = screen.getByLabelText('Name') as HTMLInputElement
+    expect(nameInput).toBeInTheDocument()
+    fireEvent.change(nameInput, { target: { value: 'my-vm' } })
+    expect(nameInput.value).toBe('my-vm')
+  })
+
+  it('VM ID field accepts numeric input', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    const vmidInput = screen.getByLabelText('VM ID') as HTMLInputElement
+    fireEvent.change(vmidInput, { target: { value: '200' } })
+    expect(vmidInput.value).toBe('200')
+  })
+
+  it('VM ID below 100 shows a validation error', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    const vmidInput = screen.getByLabelText('VM ID') as HTMLInputElement
+    fireEvent.change(vmidInput, { target: { value: '50' } })
+    expect(screen.getByText('VM ID must be >= 100')).toBeInTheDocument()
+  })
+
+  it('VM ID in-use shows validation error when allVms contains the id', async () => {
+    // Use vmid '200' in allVms (different from the nextid API return of 101)
+    // so the field starts at 101, then we type 200 to trigger the in-use error.
+    renderWithProviders(
+      <CreateVmDialog
+        {...makeProps({ allVms: [{ vmid: '200', connId: CONN_ID, node: NODE_NAME } as any] })}
+      />,
+    )
+    await waitForDataLoad()
+
+    const vmidInput = screen.getByLabelText('VM ID') as HTMLInputElement
+    // Type 200 (which is in allVms) to trigger the in-use error.
+    // The handleVmidChange validator checks allVms via parseInt comparison.
+    fireEvent.change(vmidInput, { target: { value: '200' } })
+    expect(screen.getByText(/VM ID 200 is already in use/i)).toBeInTheDocument()
+  })
+
+  it('VM ID used on ANOTHER connection does not block the create (#724)', async () => {
+    // Same id, but the guest lives on a second cluster. Proxmox only requires
+    // uniqueness inside a cluster, so the target connection is free to use 200.
+    renderWithProviders(
+      <CreateVmDialog
+        {...makeProps({ allVms: [{ vmid: '200', connId: 'conn-2', node: 'other-node' } as any] })}
+      />,
+    )
+    await waitForDataLoad()
+
+    const vmidInput = screen.getByLabelText('VM ID') as HTMLInputElement
+    fireEvent.change(vmidInput, { target: { value: '200' } })
+    expect(screen.queryByText(/VM ID 200 is already in use/i)).not.toBeInTheDocument()
+  })
+
+  it('expanding Boot and Shutdown section shows the Start at boot toggle', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // The boot section header text comes from inventory.createVm.bootShutdown = "Boot & Shutdown".
+    fireEvent.click(screen.getByText('Boot & Shutdown'))
+
+    await waitFor(() => {
+      expect(screen.getByText('Start at boot')).toBeInTheDocument()
+    })
+    // MUI Switch: find by label text then walk to the checkbox input.
+    const label = screen.getByText('Start at boot')
+    const formControlLabel = label.closest('.MuiFormControlLabel-root') as HTMLElement
+    expect(formControlLabel).not.toBeNull()
+    const switchInput = formControlLabel.querySelector('input[type="checkbox"]') as HTMLInputElement
+    expect(switchInput).not.toBeNull()
+    expect(switchInput.checked).toBe(false)
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 4. Cancel button
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - Cancel button', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('calls onClose when Cancel is clicked', () => {
+    const onClose = vi.fn()
+    renderWithProviders(<CreateVmDialog {...makeProps({ onClose })} />)
+
+    const cancelBtn = screen.getByRole('button', { name: /cancel/i })
+    fireEvent.click(cancelBtn)
+
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 5. Tab navigation
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - tab navigation', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('clicking Next advances from General to OS tab', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // Use exact name 'Next' to avoid matching other button text.
+    const nextBtn = screen.getByRole('button', { name: 'Next' })
+    fireEvent.click(nextBtn)
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'OS' }).getAttribute('aria-selected')).toBe('true')
+    })
+  })
+
+  it('clicking the OS tab renders the OS presets section', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OS' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'OS' }).getAttribute('aria-selected')).toBe('true')
+    })
+    // OS tab renders the quick presets label (inventory.createVm.osPresets = "Quick presets").
+    expect(screen.getByText('Quick presets')).toBeInTheDocument()
+  })
+
+  it('clicking the System tab renders the Hardware section', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'System' }).getAttribute('aria-selected')).toBe('true')
+    })
+    // System tab renders the hardware section label (inventory.createVm.hardware = "Hardware").
+    expect(screen.getByText('Hardware')).toBeInTheDocument()
+  })
+
+  it('clicking the CPU tab renders cores UI', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'CPU' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'CPU' }).getAttribute('aria-selected')).toBe('true')
+    })
+    // Cores label is rendered on the CPU tab.
+    expect(screen.getByText(/Cores: 1/i)).toBeInTheDocument()
+  })
+
+  it('clicking the Memory tab shows the memory label', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Memory' }))
+
+    await waitFor(() => {
+      // The Memory tab renders a Typography "Memory (MiB): 2 GiB" (the
+      // formatted current value). Use getAllByText since the input label
+      // and the Typography both contain the substring; asserting on the
+      // formatted value text node (the Typography paragraph) is unique.
+      const matches = screen.getAllByText(/Memory \(MiB\)/i)
+      expect(matches.length).toBeGreaterThanOrEqual(1)
+    })
+    // The Memory tab Typography paragraph shows the current value in GiB.
+    // Default memorySize=2048 MiB = 2 GiB (2048 >= 1024 branch in formatGib).
+    expect(screen.getByText(/Memory \(MiB\).*2.*GiB/i)).toBeInTheDocument()
+  })
+
+  it('clicking the Network tab activates the Network tab and renders the NIC card', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: 'Network' }).getAttribute('aria-selected')).toBe('true')
+    })
+    // Network tab shows the no-network-device toggle label.
+    expect(screen.getByText('No network device')).toBeInTheDocument()
+  })
+
+  it('clicking the Confirm tab shows the ready-to-create message', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    await waitFor(() => {
+      // The Confirm tab shows the ready alert when vmid and resolvedNode are set.
+      expect(screen.getByText(/Ready to create/i)).toBeInTheDocument()
+    })
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 6. Create button and submit flow
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - Create flow', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('shows Create button on the Confirm (last) tab', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /create/i })).toBeInTheDocument()
+    })
+  })
+
+  it('fires onCreated and onClose after a successful create from the Confirm tab', async () => {
+    const onClose = vi.fn()
+    const onCreated = vi.fn()
+
+    // Seed the qemu POST. The URL is:
+    //   /api/v1/connections/:connId/guests/qemu/:node
+    // On success, the component calls onCreated(vmid, selectedConnection, resolvedNode)
+    // then onClose().
+    server.use(
+      http.post(`*/api/v1/connections/${CONN_ID}/guests/qemu/${NODE_NAME}`, () =>
+        HttpResponse.json({ data: { upid: 'UPID:pve1:test' } }),
+      ),
+    )
+
+    renderWithProviders(
+      <CreateVmDialog
+        {...makeProps({ onClose, onCreated })}
+      />,
+    )
+
+    await waitForDataLoad()
+
+    // Navigate to Confirm tab.
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    await waitFor(() => {
+      const createBtn = screen.getByRole('button', { name: /create/i })
+      // vmid=101 (from nextid fetch), resolvedNode=pve1 -- both set, button enabled.
+      expect(createBtn).not.toBeDisabled()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /create/i }))
+
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalledTimes(1)
+    })
+    // onCreated is called with (vmid, connId, node) per handleCreate line ~911.
+    expect(onCreated).toHaveBeenCalledWith(String(NEXT_VMID), CONN_ID, NODE_NAME)
+  })
+
+  it('shows an error message when the POST returns a server error', async () => {
+    server.use(
+      http.post(`*/api/v1/connections/${CONN_ID}/guests/qemu/${NODE_NAME}`, () =>
+        HttpResponse.json({ error: 'Out of resources' }, { status: 500 }),
+      ),
+    )
+
+    const onClose = vi.fn()
+    const onCreated = vi.fn()
+
+    renderWithProviders(
+      <CreateVmDialog
+        {...makeProps({ onClose, onCreated })}
+      />,
+    )
+
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /create/i })).not.toBeDisabled()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /create/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/Out of resources/i)).toBeInTheDocument()
+    })
+    // onCreated and onClose must NOT have been called on error.
+    expect(onCreated).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 7. OS tab interactions
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - OS tab', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('clicking an OS preset updates the Guest OS type', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OS' }))
+
+    await waitFor(() => {
+      expect(screen.getByText('Windows 11')).toBeInTheDocument()
+    })
+
+    // The default Guest OS type is Linux (guestOsType='Linux'). Clicking the
+    // "Windows 11" preset card calls setGuestOsType('Windows') + setGuestOsVersion('win11').
+    // The Guest OS type Select then renders "Windows" as its visible value via
+    // renderValue -- this is a behavior-gated DOM change (absent if the click
+    // were a no-op, since the initial value is 'Linux').
+    // Before clicking: the OS type combobox shows "Linux" content.
+    // Locate the OS type combobox: on the OS tab the Guest OS section renders
+    // two comboboxes (OS Type, OS Version). The first one is the type selector.
+    const comboboxesBefore = screen.getAllByRole('combobox')
+    // The OS type combobox textContent contains "Linux" before selection.
+    const osTypeComboboxBefore = comboboxesBefore.find(cb => cb.textContent?.includes('Linux'))
+    expect(osTypeComboboxBefore).toBeTruthy()
+
+    fireEvent.click(screen.getByText('Windows 11'))
+
+    // After clicking, the Guest OS type combobox should now show "Windows".
+    // getAllByRole('combobox') re-queries the live DOM after the state update.
+    await waitFor(() => {
+      const comboboxesAfter = screen.getAllByRole('combobox')
+      const osTypeComboboxAfter = comboboxesAfter.find(cb => cb.textContent?.includes('Windows'))
+      expect(osTypeComboboxAfter).toBeTruthy()
+    })
+    // The "Linux" value must NO LONGER appear in that same OS type combobox,
+    // confirming the preset click genuinely changed state and was not a no-op.
+    const finalComboboxes = screen.getAllByRole('combobox')
+    const stillLinux = finalComboboxes.find(cb => cb.textContent === 'Linux')
+    expect(stillLinux).toBeUndefined()
+  })
+
+  it('the Confirm step names the Windows Server preset and the PVE ostype label, not the raw code', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OS' }))
+    fireEvent.click(await screen.findByText('Windows Server'))
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    expect(await screen.findByText('Windows Server · Windows 11/2022/2025')).toBeInTheDocument()
+    expect(screen.queryByText('Windows win11')).not.toBeInTheDocument()
+  })
+
+  it('changing the OS type resets the version to one of that type', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OS' }))
+    const typeCombobox = (await screen.findAllByRole('combobox')).find(cb => cb.textContent === 'Linux')!
+    await user.click(typeCombobox)
+    await user.click(await screen.findByRole('option', { name: 'Windows' }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    expect(await screen.findByText('Windows 11/2022/2025')).toBeInTheDocument()
+  })
+
+  it('toggling installation media off hides the storage/ISO selects', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'OS' }))
+
+    await waitFor(() => {
+      expect(screen.getByText('Installation media')).toBeInTheDocument()
+    })
+
+    // The Switch sits in the header row next to the "Installation media" label.
+    // Walk up from the label text to find the closest MuiFormControlLabel root
+    // (the FormControlLabel wrapping the Switch), then grab its checkbox input.
+    // This mirrors the pattern used in CreateLxcDialog.test.tsx and avoids
+    // fragile ancestor traversal through unnamed MuiBox containers.
+    const installMediaLabel = screen.getByText('Installation media')
+    // The label and the Switch share a flex row inside a Box; the Switch's
+    // FormControlLabel is the sibling rendered after the Box spacer.
+    // Walking up to the common ancestor Box (the header row div) and querying
+    // down for the checkbox is reliable under jsdom because MUI renders the
+    // FormControlLabel as a direct child of that row.
+    const headerRow = installMediaLabel.closest('div') as HTMLElement
+    const switchInput = headerRow
+      .closest('div')
+      ?.querySelector('input[type="checkbox"]') as HTMLInputElement | null
+
+    // The switch must be found -- if this fails the component structure changed.
+    expect(switchInput).not.toBeNull()
+
+    // Record current state, click, and assert the checked value flipped.
+    const wasChecked = switchInput!.checked
+    fireEvent.click(switchInput!)
+    // After toggling off, osMediaType becomes 'none' and the checked state flips.
+    expect(switchInput!.checked).toBe(!wasChecked)
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 8. System tab interactions
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - System tab', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('renders SeaBIOS and OVMF firmware options on the System tab', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/SeaBIOS/i)).toBeInTheDocument()
+    })
+    expect(screen.getByText(/OVMF/i)).toBeInTheDocument()
+  })
+
+  it('clicking OVMF (UEFI) firmware preset updates the selection', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/OVMF/i)).toBeInTheDocument()
+    })
+
+    // Click the OVMF box -- this calls setBios('ovmf') and shows the UEFI hint.
+    // The hint text (inventory.createVm.uefiHint) mentions "UEFI" and "EFI disk".
+    // It only renders when bios === 'ovmf', so it is behavior-gated.
+    fireEvent.click(screen.getByText('OVMF (UEFI)'))
+
+    await waitFor(() => {
+      expect(screen.getByText(/UEFI requires a q35 machine type/i)).toBeInTheDocument()
+    })
+  })
+
+  // #1157: the Graphic card list used to be dropped from the POST body, so
+  // every VM got PVE's default display whatever the user picked.
+  async function createAndCaptureBody(pickGraphicCard?: RegExp) {
+    let body: Record<string, unknown> | null = null
+    server.use(
+      http.post(`*/api/v1/connections/${CONN_ID}/guests/qemu/${NODE_NAME}`, async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ data: { upid: 'UPID:pve1:test' } })
+      }),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    if (pickGraphicCard) {
+      fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+      // The Select has no labelId, so its accessible name is its value: reach
+      // it through the visible label instead.
+      const label = await screen.findByText('Graphic card', { selector: 'label' })
+      fireEvent.mouseDown(within(label.closest('.MuiFormControl-root') as HTMLElement).getByRole('combobox'))
+      fireEvent.click(await screen.findByRole('option', { name: pickGraphicCard }))
+    }
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /create/i })).not.toBeDisabled()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /create/i }))
+    await waitFor(() => {
+      expect(body).not.toBeNull()
+    })
+
+    return body as unknown as Record<string, unknown>
+  }
+
+  it('sends the picked graphic card as vga', async () => {
+    const body = await createAndCaptureBody(/SPICE \(qxl\)/)
+
+    expect(body.vga).toBe('qxl')
+  })
+
+  it('leaves vga out when the graphic card stays on Default', async () => {
+    const body = await createAndCaptureBody()
+
+    expect(body).not.toHaveProperty('vga')
+  })
+})
+
+// ------------------------------------------------------------------ //
+// #1194: Multiqueue, MTU (bridge MTU by default) and machine version
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - NIC tuning and machine version (#1194)', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  async function pick(label: string, option: RegExp) {
+    const lbl = await screen.findByText(label, { selector: 'label' })
+    fireEvent.mouseDown(within(lbl.closest('.MuiFormControl-root') as HTMLElement).getByRole('combobox'))
+    fireEvent.click(await screen.findByRole('option', { name: option }))
+  }
+
+  async function create(edit: () => Promise<void> = async () => {}) {
+    let body: Record<string, unknown> | null = null
+    server.use(
+      http.post(`*/api/v1/connections/${CONN_ID}/guests/qemu/${NODE_NAME}`, async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ data: { upid: 'UPID:pve1:test' } })
+      }),
+    )
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    await edit()
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /create/i })).not.toBeDisabled()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /create/i }))
+    await waitFor(() => {
+      expect(body).not.toBeNull()
+    })
+
+    return body as unknown as Record<string, unknown>
+  }
+
+  it.each([
+    ['', null], ['1', null], ['575', 'error'], ['65521', 'error'], ['1.5', 'error'],
+    ['1500', null], ['9000', 'warning'],
+  ])('checkNicMtu(%s) on a bridge without declared MTU -> %s', (mtu, level) => {
+    expect(checkNicMtu(mtu, null)?.level ?? null).toBe(level)
+  })
+
+  it('checkNicMtu refuses an MTU above the declared bridge MTU only', () => {
+    expect(checkNicMtu('9000', 9000)).toBeNull()
+    expect(checkNicMtu('9001', 9000)).toEqual({ level: 'error', key: 'mtuAboveBridge', max: 9000 })
+  })
+
+  it('starts with an empty MTU and sends neither mtu nor queues, so the NIC follows the bridge MTU', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+      expect(await screen.findByLabelText('MTU')).toHaveValue(null)
+    })
+
+    expect(body.net0).toBe('virtio,bridge=vmbr0,firewall=1')
+    expect(body).not.toHaveProperty('machine')
+  })
+
+  it('lists bridges then VNets in natural order and sends the picked VNet id', async () => {
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/network-choices`, () =>
+        HttpResponse.json({ data: [
+          { kind: 'bridge', name: 'vmbr10', type: 'bridge' },
+          { kind: 'vnet', name: 'h2961', displayName: 'VLAN2961', vdc: 'acme' },
+          { kind: 'bridge', name: 'vmbr0', type: 'bridge' },
+          { kind: 'vnet', name: 'h2042', displayName: 'VLAN2042', vdc: 'acme' },
+        ] }),
+      ),
+    )
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+      const input = await screen.findByDisplayValue('vmbr0')
+      fireEvent.mouseDown(input)
+      expect(screen.getAllByRole('option').map(o => o.textContent))
+        .toEqual(['vmbr0', 'vmbr10', 'VLAN2042h2042VNet · acme', 'VLAN2961h2961VNet · acme'])
+      fireEvent.click(screen.getByRole('option', { name: /VLAN2961/ }))
+      expect(input).toHaveValue('VLAN2961')
+    })
+
+    expect(String(body.net0)).toContain('bridge=h2961')
+  })
+
+  it('sends the MTU and the Multiqueue value typed for a VirtIO NIC', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+      fireEvent.change(await screen.findByLabelText('MTU'), { target: { value: '1' } })
+      fireEvent.change(screen.getByLabelText('Multiqueue'), { target: { value: '4' } })
+    })
+
+    expect(body.net0).toBe('virtio,bridge=vmbr0,firewall=1,mtu=1,queues=4')
+  })
+
+  it('blocks Create when the MTU exceeds the MTU the bridge declares', async () => {
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/network-choices`, () =>
+        HttpResponse.json({ data: [{ name: 'vmbr0', mtu: 1500 }] }),
+      ),
+    )
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+    fireEvent.change(await screen.findByLabelText('MTU'), { target: { value: '2000' } })
+    expect(await screen.findByText('Above the bridge MTU (1500): the VM would not start')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+    expect(await screen.findByText('net0: MTU 2000 is not usable on its bridge')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^create$/i })).toBeDisabled()
+  })
+
+  it('only warns above 1500 when the bridge declares no MTU', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+      fireEvent.change(await screen.findByLabelText('MTU'), { target: { value: '9000' } })
+      expect(await screen.findByText(/declares no MTU/)).toBeInTheDocument()
+    })
+
+    expect(body.net0).toBe('virtio,bridge=vmbr0,firewall=1,mtu=9000')
+  })
+
+  it('disables MTU and Multiqueue on a non-VirtIO model and keeps them out of net0', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+      fireEvent.change(await screen.findByLabelText('MTU'), { target: { value: '1400' } })
+      await pick('Model', /Intel E1000/)
+      expect(screen.getByLabelText('MTU')).toBeDisabled()
+      expect(screen.getByLabelText('Multiqueue')).toBeDisabled()
+    })
+
+    expect(body.net0).toBe('e1000,bridge=vmbr0,firewall=1')
+  })
+
+  it('offers the versions of the picked family and sends the pinned machine id', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+      await pick('Machine', /^q35$/)
+      const lbl = await screen.findByText('Machine version', { selector: 'label' })
+      fireEvent.mouseDown(within(lbl.closest('.MuiFormControl-root') as HTMLElement).getByRole('combobox'))
+      const names = (await screen.findAllByRole('option')).map(o => o.textContent)
+      expect(names).toEqual(['Latest', '11.0+pve2Enable hv_emcs for Windows.', '10.1'])
+      fireEvent.click(screen.getByRole('option', { name: '10.1' }))
+    })
+
+    expect(body.machine).toBe('pc-q35-10.1')
+  })
+
+  it('lists the settings as a key/value sheet on the Confirm step', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    fireEvent.click(screen.getByRole('tab', { name: 'Network' }))
+    fireEvent.change(await screen.findByLabelText('MTU'), { target: { value: '1400' } })
+    fireEvent.click(screen.getByRole('tab', { name: 'Confirm' }))
+
+    const summary = await screen.findByTestId('create-vm-summary')
+    const row = (label: string) => within(summary).getByText(label).nextElementSibling?.textContent
+    expect(row('Node')).toBe('pve1')
+    expect(row('vCPU')).toBe('1 (1 socket × 1 core)')
+    expect(row('net0')).toBe('VirtIO on vmbr0 · Firewall · MTU 1400')
+    expect(within(summary).queryByText(/^Node: /)).not.toBeInTheDocument()
+  })
+
+  it('drives sockets and cores from their sliders', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'CPU' }))
+      fireEvent.keyDown(await screen.findByRole('slider', { name: 'Sockets' }), { key: 'ArrowRight' })
+      fireEvent.keyDown(screen.getByRole('slider', { name: 'Cores' }), { key: 'End' })
+      expect(screen.getByLabelText('Cores', { selector: 'input:not([type=range])' })).toHaveValue(128)
+    })
+
+    expect(body.sockets).toBe(2)
+    expect(body.cores).toBe(128)
+  })
+
+  it('sends the extra CPU flags with the CPU type', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'CPU' }))
+      fireEvent.click(await screen.findByText('Extra CPU Flags'))
+      fireEvent.click(within(screen.getByRole('group', { name: 'aes' })).getByRole('button', { name: '+' }))
+      fireEvent.click(within(screen.getByRole('group', { name: 'pcid' })).getByRole('button', { name: '−' }))
+    })
+
+    expect(body.cpu).toBe('x86-64-v2-AES,flags=+aes;-pcid')
+  })
+
+  it('drops the pin back to Latest when the machine family changes', async () => {
+    const body = await create(async () => {
+      fireEvent.click(screen.getByRole('tab', { name: 'System' }))
+      await pick('Machine', /^q35$/)
+      await pick('Machine version', /^10\.1$/)
+      await pick('Machine', /i440fx/)
+    })
+
+    expect(body).not.toHaveProperty('machine')
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 9. Numeric fields must be clearable (discussion #634)
+//
+// This dialog used to carry its own private copy of the buffered numeric
+// input; it now imports the shared @/components/ui/NumericTextField, and the
+// last two raw fields (disk size, CPU limit) were converted to it. These tests
+// pin the user-visible contract of that swap: the field can be emptied, and
+// what you type next replaces the old value instead of being appended to it.
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - clearable numeric fields', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  /** Switch tab and wait until it is actually the selected one. */
+  async function goToTab(name: string) {
+    fireEvent.click(screen.getByRole('tab', { name }))
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name }).getAttribute('aria-selected')).toBe('true')
+    })
+  }
+
+  it('Cores can be emptied and retyped without the old digit gluing itself in front', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    await goToTab('CPU')
+
+    const cores = screen.getByLabelText('Cores', { selector: 'input:not([type=range])' }) as HTMLInputElement
+    expect(cores.value).toBe('1')
+
+    await userEvent.clear(cores)
+    expect(cores.value).toBe('')
+
+    await userEvent.type(cores, '8')
+    expect(cores.value).toBe('8')
+    // Total cores = sockets x cores, read from the committed state: 8, not 18.
+    expect(screen.getByText(/Total cores: 8/i)).toBeInTheDocument()
+  })
+
+  it('the disk size can be emptied and retyped, and the disk header follows the committed value', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    await goToTab('Disks')
+
+    // The first disk card is expanded by default (expandedDisks = {0}).
+    const diskSize = screen.getByLabelText('Disk size (GiB)') as HTMLInputElement
+    expect(diskSize.value).toBe('32')
+
+    await userEvent.clear(diskSize)
+    expect(diskSize.value).toBe('')
+
+    await userEvent.type(diskSize, '64')
+    expect(diskSize.value).toBe('64')
+    expect(screen.getByText('64 GiB')).toBeInTheDocument()
+    expect(screen.queryByText('3264 GiB')).not.toBeInTheDocument()
+  })
+
+  it('the CPU limit keeps its "unlimited" sentinel while staying clearable', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+    await goToTab('CPU')
+
+    // The CPU limit lives behind the collapsed "Advanced Options" header.
+    fireEvent.click(screen.getByText('Advanced Options'))
+
+    const cpuLimit = screen.getByLabelText('CPU limit') as HTMLInputElement
+    // 0 is displayed as the word 'unlimited' (unchanged from before the swap).
+    expect(cpuLimit.value).toBe('unlimited')
+
+    await userEvent.clear(cpuLimit)
+    expect(cpuLimit.value).toBe('')
+
+    await userEvent.type(cpuLimit, '2')
+    expect(cpuLimit.value).toBe('2')
+
+    // Emptying it again and blurring means unlimited: back to the sentinel.
+    await userEvent.clear(cpuLimit)
+    await userEvent.tab()
+    expect(cpuLimit.value).toBe('unlimited')
+  })
+})
+
+// ------------------------------------------------------------------ //
+// 10. MSP tenant VMID range (#647)
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - MSP tenant VMID range', () => {
+  beforeEach(() => {
+    seedAllHandlers()
+  })
+
+  it('flags a VMID outside the MSP tenant range', async () => {
+    useTenantMock.mockReturnValue({
+      currentTenant: { id: 't1', slug: 'acme', name: 'Acme', operatingModel: 'msp', vmidRangeStart: 189334001, vmidRangeEnd: 189334999 },
+      loading: false,
+      isFullClusterView: true,
+    })
+    // The nextid API prefill should land inside the tenant's range.
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () =>
+        HttpResponse.json({ data: 189334001 }),
+      ),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    const vmidField = await screen.findByDisplayValue('189334001')
+    await userEvent.clear(vmidField)
+    await userEvent.type(vmidField, '150')
+    // Out-of-range message cites the range.
+    expect(await screen.findByText(/189334001/)).toBeInTheDocument()
+  })
+
+  it('flags a VMID above the MSP tenant range too', async () => {
+    useTenantMock.mockReturnValue({
+      currentTenant: { id: 't1', slug: 'acme', name: 'Acme', operatingModel: 'msp', vmidRangeStart: 200, vmidRangeEnd: 300 },
+      loading: false,
+      isFullClusterView: true,
+    })
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () =>
+        HttpResponse.json({ data: 200 }),
+      ),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    const vmidField = await screen.findByDisplayValue('200')
+    await userEvent.clear(vmidField)
+    await userEvent.type(vmidField, '999')
+    expect(await screen.findByText(/200-300/)).toBeInTheDocument()
+  })
+
+  it('falls back to the client-side range-aware id and reports exhaustion when nextid is unreachable', async () => {
+    useTenantMock.mockReturnValue({
+      currentTenant: { id: 't1', slug: 'acme', name: 'Acme', operatingModel: 'msp', vmidRangeStart: 200, vmidRangeEnd: 201 },
+      loading: false,
+      isFullClusterView: true,
+    })
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () => HttpResponse.error()),
+    )
+
+    renderWithProviders(
+      <CreateVmDialog
+        {...makeProps({
+          allVms: [
+            { vmid: '200', connId: CONN_ID, node: NODE_NAME } as any,
+            { vmid: '201', connId: CONN_ID, node: NODE_NAME } as any,
+          ],
+        })}
+      />,
+    )
+    await waitForDataLoad()
+
+    // Both ids in the [200,201] range are used, so the client-side fallback
+    // (fallbackNextVmid) reports the range as exhausted and clears the field.
+    expect(await screen.findByText(/200-201/)).toBeInTheDocument()
+    const vmidField = screen.getByLabelText('VM ID') as HTMLInputElement
+    expect(vmidField.value).toBe('')
+  })
+
+  it('surfaces the server error without falling back when nextid explicitly errors on a range tenant', async () => {
+    useTenantMock.mockReturnValue({
+      currentTenant: { id: 't1', slug: 'acme', name: 'Acme', operatingModel: 'msp', vmidRangeStart: 200, vmidRangeEnd: 300 },
+      loading: false,
+      isFullClusterView: true,
+    })
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () =>
+        HttpResponse.json({ error: 'VMID range exhausted (200-300)' }, { status: 409 }),
+      ),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+    await waitForDataLoad()
+
+    // The server's message is shown verbatim -- not the client fallback text.
+    expect(await screen.findByText('VMID range exhausted (200-300)')).toBeInTheDocument()
+    const vmidField = screen.getByLabelText('VM ID') as HTMLInputElement
+    expect(vmidField.value).toBe('')
+  })
+
+  it('regenerate button uses the client-side fallback when no connection is selected', async () => {
+    // No connections at all -- selectedConnection stays '' so generateNextVmid
+    // takes the fallbackNextVmid() branch instead of loadNextVmid().
+    server.use(
+      http.get('*/api/v1/connections', () => HttpResponse.json({ data: [] })),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps({ allVms: [{ vmid: '100' } as any] })} />)
+
+    const vmidField = await screen.findByLabelText('VM ID') as HTMLInputElement
+    const regenerateBtn = screen.getByRole('button', { name: 'Generate next available ID' })
+    fireEvent.click(regenerateBtn)
+
+    await waitFor(() => {
+      expect(vmidField.value).toBe('101')
+    })
+  })
+})
+
+// ------------------------------------------------------------------ //
+// Default node / cluster selection on open, and the Node picker
+// ------------------------------------------------------------------ //
+
+describe('CreateVmDialog - default node and cluster selection', () => {
+  // Two online nodes on conn-1: pve1 busy, pve2 almost idle.
+  const TWO_NODES = [
+    { node: 'pve1', status: 'online', cpu: 0.8, maxcpu: 4, mem: 7 * 1024 ** 3, maxmem: 8 * 1024 ** 3 },
+    { node: 'pve2', status: 'online', cpu: 0.05, maxcpu: 4, mem: 1 * 1024 ** 3, maxmem: 8 * 1024 ** 3 },
+  ]
+
+  let nextidCalls: number
+  let bridgeNodes: string[]
+
+  beforeEach(() => {
+    seedAllHandlers()
+    nextidCalls = 0
+    bridgeNodes = []
+    server.use(
+      http.get(`*/api/v1/connections/${CONN_ID}/nodes`, () => HttpResponse.json({ data: TWO_NODES })),
+      http.get(`*/api/v1/connections/${CONN_ID}/cluster/nextid`, () => {
+        nextidCalls++
+
+        return HttpResponse.json({ data: NEXT_VMID })
+      }),
+      http.get(`*/api/v1/connections/${CONN_ID}/network-choices`, ({ request }) => {
+        bridgeNodes.push(new URL(request.url).searchParams.get('node') ?? '')
+
+        return HttpResponse.json({ data: networkChoices })
+      }),
+      http.get(`*/api/v1/connections/${CONN_ID}/nodes/:node/storage/:storage/content`, () => HttpResponse.json({ data: [] })),
+      http.get(`*/api/v1/connections/${CONN_ID}/nodes/:node/cpu-models`, () => HttpResponse.json({ data: [] })),
+    )
+  })
+
+  const nodeSelect = () => screen.getAllByRole('combobox')[0]
+
+  it('places a tenant VM on the least loaded node and fetches its next VMID', async () => {
+    useTenantMock.mockReturnValue({
+      currentTenant: { id: 't1', slug: 'acme', name: 'Acme' },
+      loading: false,
+      isFullClusterView: false,
+    })
+    // The VM goes in a vDC open to blank VMs (#1171), here spanning both nodes.
+    server.use(
+      http.get('*/api/v1/vdcs', () => HttpResponse.json({ data: [{ id: 'vdc-1', name: 'Acme', connectionId: CONN_ID, enabled: true, allowBlankVms: true, nodes: [] }] })),
+      http.get(`*/api/v1/connections/${CONN_ID}/nodes/:node/storages`, () => HttpResponse.json({ data: [] })),
+    )
+
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+
+    // The tenant sees neither the Node picker nor the VM ID field: both are
+    // resolved behind the scenes (next VMID fetched, bridges of pve2 loaded).
+    await waitFor(() => expect(nextidCalls).toBe(1))
+    await waitFor(() => expect(bridgeNodes).toContain('pve2'))
+    expect(bridgeNodes).not.toContain('pve1')
+    expect(screen.queryByLabelText('VM ID')).not.toBeInTheDocument()
+  })
+
+  it('preselects the requested node of the requested connection', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps({ defaultConnId: CONN_ID, defaultNode: 'pve1' })} />)
+
+    await waitFor(() => expect(nodeSelect().textContent).toContain('pve1'))
+    expect(await screen.findByDisplayValue(String(NEXT_VMID))).toBeInTheDocument()
+    expect(nextidCalls).toBeGreaterThanOrEqual(1)
+    await waitFor(() => expect(bridgeNodes).toContain('pve1'))
+  })
+
+  it('falls back to the first node when the requested connection has no node', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps({ defaultConnId: 'conn-gone' })} />)
+
+    await waitFor(() => expect(nodeSelect().textContent).toContain('pve1'))
+    expect(await screen.findByDisplayValue(String(NEXT_VMID))).toBeInTheDocument()
+    expect(nextidCalls).toBeGreaterThanOrEqual(1)
+  })
+
+  it('selects the whole cluster when only the connection is requested, resolving to the least loaded node', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps({ defaultConnId: CONN_ID })} />)
+
+    // The cluster entry is the selected value; the VM lands on pve2.
+    await waitFor(() => expect(nodeSelect().textContent).toContain('pve-cluster-1'))
+    await waitFor(() => expect(bridgeNodes).toContain('pve2'))
+    // One nextid for the connection, one more when the cluster entry resolves.
+    await waitFor(() => expect(nextidCalls).toBe(2))
+  })
+
+  it('reloads the next VMID when the operator picks another node', async () => {
+    renderWithProviders(<CreateVmDialog {...makeProps()} />)
+
+    await waitFor(() => expect(nodeSelect().textContent).toContain('pve1'))
+    await waitFor(() => expect(nextidCalls).toBe(1))
+
+    fireEvent.mouseDown(nodeSelect())
+    fireEvent.click(await screen.findByRole('option', { name: /pve2/ }))
+
+    await waitFor(() => expect(nodeSelect().textContent).toContain('pve2'))
+    await waitFor(() => expect(nextidCalls).toBe(2))
+    await waitFor(() => expect(bridgeNodes).toContain('pve2'))
+  })
+})
+
+describe('guestOsSummaryLabel', () => {
+  it('gives the PVE label of the ostype', () => {
+    expect(guestOsSummaryLabel('Linux', 'l26', null)).toBe('Linux 6.x - 2.6 Kernel')
+    expect(guestOsSummaryLabel('Windows', 'win10', null)).toBe('Windows 10/2016/2019')
+  })
+
+  it('puts the preset name first while the preset still matches', () => {
+    expect(guestOsSummaryLabel('Windows', 'win11', 'winserver')).toBe('Windows Server · Windows 11/2022/2025')
+    expect(guestOsSummaryLabel('Windows', 'win10', 'winserver')).toBe('Windows 10/2016/2019')
+  })
+
+  it('falls back to type and code for an unknown ostype', () => {
+    expect(guestOsSummaryLabel('Windows', 'w9x', null)).toBe('Windows w9x')
+  })
+})

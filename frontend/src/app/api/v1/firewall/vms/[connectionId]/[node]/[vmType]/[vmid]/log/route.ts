@@ -1,0 +1,50 @@
+export const dynamic = "force-dynamic"
+import { NextRequest, NextResponse } from 'next/server'
+
+import { getOrchestratorClient } from '@/lib/orchestrator/client'
+import { verifyConnectionOwnership } from '@/lib/tenant'
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { orchestratorOrPve } from '@/lib/firewall/withPveFallback'
+import * as pveDirect from '@/lib/firewall/pveDirect'
+import { guardSessionGuest } from '@/lib/vdc/guestGuard'
+
+type RouteContext = {
+  params: Promise<{ connectionId: string; node: string; vmType: string; vmid: string }>
+}
+
+export async function GET(req: NextRequest, ctx: RouteContext) {
+  try {
+    const { connectionId, node, vmType, vmid } = await ctx.params
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_VIEW, "connection", connectionId)
+    if (denied) return denied
+
+    // node.view is connection-wide: the guest itself must be inside the vDC.
+    const scopeDenied = await guardSessionGuest({ connectionId, conn: () => getConnectionById(connectionId), type: vmType, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const url = new URL(req.url)
+    const limit = url.searchParams.get('limit') || '50'
+    const since = Number(url.searchParams.get('since')) || undefined
+    const until = Number(url.searchParams.get('until')) || undefined
+    const query = new URLSearchParams({ limit })
+
+    if (since) query.set('since', String(since))
+    if (until) query.set('until', String(until))
+
+    const orchestrator = getOrchestratorClient()
+    const result = await orchestratorOrPve(
+      'firewall/vms/log',
+      () => orchestrator.get(`/firewall/vms/${connectionId}/${node}/${vmType}/${vmid}/log?${query}`),
+      async () => pveDirect.getVMFirewallLog(await getConnectionById(connectionId), node, vmType, vmid, Number(limit), { since, until }),
+    )
+
+    return NextResponse.json(result)
+  } catch (e: any) {
+    console.error("[firewall/vms/log] GET error:", e)
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}

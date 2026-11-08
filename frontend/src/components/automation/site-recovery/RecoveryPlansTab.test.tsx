@@ -1,0 +1,345 @@
+/**
+ * Component tests for RecoveryPlansTab's "test failover active" indicators
+ * (issue #664, point 4).
+ *
+ * `active_test_execution_id` is set by the backend while a test failover's
+ * cleanup is still pending and survives a page reload (unlike the old
+ * React-only `activeExecution` state). The row must show a warning chip and
+ * the drawer must block a second test failover until cleanup runs.
+ */
+
+import { useState } from 'react'
+import { describe, expect, it, vi, afterEach } from 'vitest'
+import { cleanup, waitFor } from '@testing-library/react'
+
+import { renderWithProviders, screen, userEvent } from '@/__tests__/setup/renderWithProviders'
+import type { RecoveryExecution, RecoveryPlan, ReplicationJob } from '@/lib/orchestrator/site-recovery.types'
+
+import RecoveryPlansTab from './RecoveryPlansTab'
+
+afterEach(cleanup)
+
+function plan(overrides: Partial<RecoveryPlan> = {}): RecoveryPlan {
+  return {
+    id: 'plan-1',
+    name: 'Prod DR',
+    description: '',
+    status: 'ready',
+    source_cluster: 'src',
+    target_cluster: 'dst',
+    vms: [{ vm_id: 100, vm_name: 'web-01', replication_job_id: 'job-1', tier: 1, boot_order: 1 }],
+    last_test: null,
+    last_failover: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  }
+}
+
+// RecoveryPlansTab is controlled: the drawer's open/closed state lives in the
+// component, but which plan is selected is driven by the parent. This small
+// harness plays the parent's role so clicking a row actually opens the drawer.
+function Harness({
+  plans,
+  history = [],
+  onTestFailover,
+  onCleanupTest,
+  onHistoryCleared,
+  onFailback,
+  onEditPlan,
+  jobs = [],
+}: {
+  plans: RecoveryPlan[]
+  history?: RecoveryExecution[]
+  onTestFailover: (id: string) => void
+  onCleanupTest: (id: string) => void
+  onHistoryCleared?: () => void
+  onFailback?: (id: string) => void
+  onEditPlan?: (id: string) => void
+  jobs?: ReplicationJob[]
+}) {
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null)
+
+  return (
+    <RecoveryPlansTab
+      plans={plans}
+      jobs={jobs}
+      loading={false}
+      history={history}
+      historyLoading={false}
+      selectedPlanId={selectedPlanId}
+      onSelectPlan={setSelectedPlanId}
+      onTestFailover={onTestFailover}
+      onFailover={vi.fn()}
+      onFailback={onFailback || vi.fn()}
+      onEditPlan={onEditPlan || vi.fn()}
+      onDeletePlan={vi.fn()}
+      onCleanupTest={onCleanupTest}
+      onHistoryCleared={onHistoryCleared}
+      connections={[]}
+    />
+  )
+}
+
+function renderTab(plans: RecoveryPlan[], history: RecoveryExecution[] = []) {
+  const onTestFailover = vi.fn()
+  const onCleanupTest = vi.fn()
+  const onHistoryCleared = vi.fn()
+
+  renderWithProviders(
+    <Harness
+      plans={plans}
+      history={history}
+      onTestFailover={onTestFailover}
+      onCleanupTest={onCleanupTest}
+      onHistoryCleared={onHistoryCleared}
+    />,
+  )
+
+  return { onTestFailover, onCleanupTest, onHistoryCleared }
+}
+
+const openDrawer = async () => userEvent.click(screen.getByText('Prod DR'))
+
+function execution(overrides: Partial<RecoveryExecution> = {}): RecoveryExecution {
+  return {
+    id: 'exec-1',
+    plan_id: 'plan-1',
+    type: 'failover',
+    status: 'completed',
+    started_at: '2026-01-02T00:00:00Z',
+    vm_results: [],
+    ...overrides,
+  }
+}
+
+describe('RecoveryPlansTab — cleanup pending indicators', () => {
+  it('shows the "Cleanup pending" chip and a disabled Test Failover + Cleanup button when a test is active', async () => {
+    const { onCleanupTest } = renderTab([plan({ active_test_execution_id: 'exec-1' })])
+
+    expect(screen.getByText('Cleanup pending')).toBeInTheDocument()
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).toBeDisabled()
+
+    const cleanupButton = screen.getByRole('button', { name: 'Cleanup test' })
+    await userEvent.click(cleanupButton)
+    expect(onCleanupTest).toHaveBeenCalledWith('plan-1')
+  })
+
+  it('shows the "Test failover in progress" chip and no Cleanup button while the test is still executing', async () => {
+    renderTab([plan({ active_test_execution_id: 'exec-1', status: 'executing' })])
+
+    expect(screen.getByText('Test failover in progress')).toBeInTheDocument()
+    expect(screen.queryByText('Cleanup pending')).not.toBeInTheDocument()
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Cleanup test' })).not.toBeInTheDocument()
+  })
+
+  it('shows no chip, an enabled Test Failover button and no Cleanup button when no test is active', async () => {
+    renderTab([plan({ active_test_execution_id: null })])
+
+    expect(screen.queryByText('Cleanup pending')).not.toBeInTheDocument()
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).not.toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Cleanup test' })).not.toBeInTheDocument()
+  })
+})
+
+describe('RecoveryPlansTab — failed-over lockdown', () => {
+  it('disables Test Failover and Failover but keeps Failback enabled and Delete present', async () => {
+    renderTab([plan({ status: 'failed_over' })])
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Failover' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Failback' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete' })).not.toBeDisabled()
+  })
+
+  it('leaves Test Failover and Failover enabled for a ready plan', async () => {
+    renderTab([plan({ status: 'ready' })])
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Failover' })).not.toBeDisabled()
+  })
+})
+
+describe('RecoveryPlansTab — failing-back lockdown (issue #664 failback)', () => {
+  it('shows only the Open failback action (enabled) and a disabled Delete with tooltip', async () => {
+    renderTab([plan({ status: 'failing_back' })])
+
+    expect(screen.getByText('Failing back')).toBeInTheDocument()
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Open failback' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
+
+    expect(screen.queryByRole('button', { name: 'Test Failover' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Failover' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Failback' })).not.toBeInTheDocument()
+  })
+
+  it('calls onFailback with the plan id when Open failback is clicked', async () => {
+    const onFailback = vi.fn()
+
+    renderWithProviders(
+      <Harness
+        plans={[plan({ status: 'failing_back' })]}
+        onTestFailover={vi.fn()}
+        onCleanupTest={vi.fn()}
+        onFailback={onFailback}
+      />,
+    )
+
+    await openDrawer()
+    await userEvent.click(screen.getByRole('button', { name: 'Open failback' }))
+
+    expect(onFailback).toHaveBeenCalledWith('plan-1')
+  })
+})
+
+describe('RecoveryPlansTab — clear execution history', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('shows the clear-history button when history has entries', async () => {
+    renderTab([plan()], [execution()])
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Clear history' })).toBeInTheDocument()
+  })
+
+  it('hides the clear-history button when history is empty', async () => {
+    renderTab([plan()], [])
+
+    await openDrawer()
+
+    expect(screen.queryByRole('button', { name: 'Clear history' })).not.toBeInTheDocument()
+  })
+
+  it('opens a confirm dialog on click', async () => {
+    renderTab([plan()], [execution()])
+
+    await openDrawer()
+    await userEvent.click(screen.getByRole('button', { name: 'Clear history' }))
+
+    expect(screen.getByText(/Delete all past executions of this plan/)).toBeInTheDocument()
+  })
+
+  it('calls DELETE on the plan history endpoint and notifies the parent on confirm', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ deleted: 2 }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const { onHistoryCleared } = renderTab([plan()], [execution()])
+
+    await openDrawer()
+    await userEvent.click(screen.getByRole('button', { name: 'Clear history' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      '/api/v1/orchestrator/replication/plans/plan-1/history',
+      { method: 'DELETE' },
+    )
+    await waitFor(() => expect(onHistoryCleared).toHaveBeenCalled())
+  })
+})
+
+it('shows the engine glyphs of the plan jobs on both ends of the route', () => {
+  const zfsJob = { id: 'job-1', storage_engine: 'zfs' } as ReplicationJob
+  renderWithProviders(<Harness plans={[plan()]} history={[]} jobs={[zfsJob]} onTestFailover={vi.fn()} onCleanupTest={vi.fn()} />)
+  expect(screen.getAllByRole('img', { name: 'ZFS' })).toHaveLength(2)
+  expect(screen.queryByRole('img', { name: 'Ceph RBD' })).not.toBeInTheDocument()
+})
+
+it('falls back to the Ceph glyph when the plan jobs are unknown', () => {
+  renderWithProviders(<Harness plans={[plan()]} history={[]} onTestFailover={vi.fn()} onCleanupTest={vi.fn()} />)
+  expect(screen.getAllByRole('img', { name: 'Ceph RBD' })).toHaveLength(2)
+})
+
+// A plan used to be immutable once created: changing a boot order meant
+// deleting it and starting over. The drawer now reopens it in the plan dialog,
+// except while an execution is running and the guests are moving underfoot.
+describe('RecoveryPlansTab — editing a plan', () => {
+  it('reopens the selected plan for editing', async () => {
+    const onEditPlan = vi.fn()
+
+    renderWithProviders(
+      <Harness plans={[plan()]} onTestFailover={vi.fn()} onCleanupTest={vi.fn()} onEditPlan={onEditPlan} />,
+    )
+
+    await openDrawer()
+    await userEvent.click(screen.getByRole('button', { name: 'Edit plan' }))
+
+    expect(onEditPlan).toHaveBeenCalledWith('plan-1')
+  })
+
+  it('refuses to edit a plan while it is executing', async () => {
+    const onEditPlan = vi.fn()
+
+    renderWithProviders(
+      <Harness plans={[plan({ status: 'executing' })]} onTestFailover={vi.fn()} onCleanupTest={vi.fn()} onEditPlan={onEditPlan} />,
+    )
+
+    await openDrawer()
+
+    expect(screen.getByRole('button', { name: 'Edit plan' })).toBeDisabled()
+    expect(onEditPlan).not.toHaveBeenCalled()
+  })
+})
+
+// A guest may sit in several plans (roadmap#4): the details of a plan say
+// which other plans share its guests, and mark each shared guest, rather than
+// forbid a pattern that is legitimate (a broad plan plus a narrow rehearsal).
+describe('RecoveryPlansTab - guests shared with another plan', () => {
+  const guest = (vm_id: number, vm_name: string) => ({ vm_id, vm_name, replication_job_id: 'job-1', tier: 3 as const, boot_order: 1 })
+
+  it('names the other plan with the shared vmids and marks the guest in the tier list', async () => {
+    renderTab([plan(), plan({ id: 'plan-2', name: 'Rehearsal', vms: [guest(100, 'web-01'), guest(200, 'db-01')] })])
+
+    await openDrawer()
+
+    expect(screen.getByText('Shares guests with: Rehearsal (100)')).toBeInTheDocument()
+    expect(screen.getByText('also in Rehearsal')).toBeInTheDocument()
+  })
+
+  it('lists every overlapping plan, each with its own shared vmids', async () => {
+    renderTab([
+      plan({ vms: [guest(100, 'web-01'), guest(101, 'web-02')] }),
+      plan({ id: 'plan-2', name: 'Rehearsal', vms: [guest(100, 'web-01')] }),
+      plan({ id: 'plan-3', name: 'Drill', vms: [guest(100, 'web-01'), guest(101, 'web-02')] }),
+    ])
+
+    await openDrawer()
+
+    expect(screen.getByText('Shares guests with: Rehearsal (100), Drill (100, 101)')).toBeInTheDocument()
+    expect(screen.getByText('also in Rehearsal, Drill')).toBeInTheDocument()
+    expect(screen.getByText('also in Drill')).toBeInTheDocument()
+  })
+
+  it('says nothing when no other plan lists the same guest, nor for the same vmid on another source cluster', async () => {
+    renderTab([
+      plan(),
+      plan({ id: 'plan-2', name: 'Other', vms: [guest(200, 'db-01')] }),
+      plan({ id: 'plan-3', name: 'Elsewhere', source_cluster: 'src-2', vms: [guest(100, 'web-01')] }),
+    ])
+
+    await openDrawer()
+
+    expect(screen.queryByText(/Shares guests with/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/also in/)).not.toBeInTheDocument()
+  })
+})

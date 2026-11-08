@@ -1,0 +1,48 @@
+import { NextRequest, NextResponse } from "next/server"
+
+import { getOrchestratorClient } from "@/lib/orchestrator/client"
+import { replicationErrorResponse } from "@/lib/orchestrator/replicationError"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { getTenantConnectionIds } from "@/lib/tenant"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+async function handlePost(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_MANAGE, "global", "*")
+
+    if (denied) return denied
+
+    const { id } = await params
+    const client = getOrchestratorClient()
+
+    // Verify plan ownership
+    const tenantConnectionIds = await getTenantConnectionIds()
+    const planResponse = await client.getRecoveryPlan(id)
+    const plan = planResponse.data
+
+    if (
+      plan &&
+      ((plan.source_cluster && !tenantConnectionIds.has(plan.source_cluster)) ||
+      (plan.target_cluster && !tenantConnectionIds.has(plan.target_cluster)))
+    ) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 })
+    }
+
+    const response = await client.cleanupTestFailover(id)
+
+    return NextResponse.json(response.data)
+  } catch (e: any) {
+    if ((e as any)?.code !== 'ORCHESTRATOR_UNAVAILABLE') {
+      console.error("Error cleaning up test failover:", e)
+    }
+
+    // Keep the orchestrator's own status: a cleanup already running answers
+    // 409, and the dialog must not read that as a cleanup that failed to
+    // start — the one in flight is still doing the work.
+    return replicationErrorResponse(e, "Failed to cleanup test failover")
+  }
+}
+
+export const POST = withAudit({ category: "replication", resourceType: "plan", resourceParam: "id", action: "delete" }, handlePost)

@@ -1,0 +1,162 @@
+import { executeSSH, shellEscape } from "@/lib/ssh/exec"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { getNodeSshEndpointForMigration } from "../pve-tasks"
+import { prisma } from "@/lib/db/prisma"
+import { formatSshEndpoint, type SshTarget } from "@/lib/ssh/node-endpoint-core"
+import { OPENVDDK_DEFAULT_LIBDIR, OPENVDDK_KIT } from "./vddk-library"
+
+export interface VddkPreflightResult {
+  ok: boolean
+  /** Keys of the dependencies that are absent (nbdkit, nbd-client, vddk-plugin, vddk-lib). */
+  missing: string[]
+  /** Human-actionable message when not ok (install commands, VDDK symlink hint). */
+  error?: string
+  /** Debian major version reported by the node's /etc/os-release, when readable. */
+  debianMajor?: number
+  /**
+   * Real VDDK library file behind the SONAME nbdkit loads, e.g.
+   * `/usr/lib/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0`. Empty when the
+   * probe resolved nothing. The generation it carries decides which source
+   * versions this node can read (see source-version.ts, #946).
+   */
+  vddkLib?: string
+  /**
+   * True when the node cannot be prepared at all: something is missing AND the
+   * node runs Debian < 13 (Proxmox VE < 9). Debian 13 is the first release
+   * that ships nbdkit-plugin-vddk, so on an older node both the automated
+   * preparation and the manual guide dead-end on apt. A node that already has
+   * everything stays ok regardless of its version.
+   */
+  osUnsupported?: boolean
+  /** Directory the probe looked in, the one nbdkit will be given. */
+  libdir?: string
+}
+
+/** Install hint shown for each absent dependency. */
+const HINTS: Record<string, string> = {
+  "nbdkit": "apt install nbdkit",
+  "nbd-client": "apt install nbd-client",
+  // nbdkit-plugin-vddk lives in Debian non-free, which a stock PVE node doesn't
+  // enable — so it's an admin prerequisite, not something "Prepare node(s)"
+  // installs. Enable contrib/non-free in the node's apt sources, then install.
+  "vddk-plugin": "nbdkit-plugin-vddk is in Debian non-free; enable contrib/non-free in the node's apt sources, then: apt install nbdkit-plugin-vddk",
+}
+
+/**
+ * What to do about a missing library (roadmap#177). In OpenVDDK's directory,
+ * "Prepare this node" installs it; an explicit libdir from the API may point
+ * at OpenVDDK or at a Broadcom VDDK, so it gets both.
+ */
+function vddkLibHint(libdir: string): string {
+  const openvddk =
+    `install OpenVDDK ${OPENVDDK_KIT.version} under <libdir> ("Prepare this node" does it), ` +
+    `with libvixDiskLib.so.8 reachable as <libdir>/lib64/libvixDiskLib.so.8`
+  if (libdir === OPENVDDK_DEFAULT_LIBDIR) return openvddk
+  return (
+    `${openvddk}; or install the Broadcom VDDK under <libdir>/lib64 (libvixDiskLib.so*); for VDDK 9.x, symlink ` +
+    "libvixDiskLib.so.8 -> the installed .so.9 (nbdkit 1.42 dlopens the so.8 SONAME), or ship VDDK 8.0.x"
+  )
+}
+
+/**
+ * Build a single probe command that prints `key=value` lines for each warm-
+ * migration dependency on the PVE node:
+ *   - nbdkit / nbd-client: `command -v` path, or MISSING
+ *   - vddk-plugin: path to nbdkit-vddk-plugin.so, or empty
+ *   - vddk-lib: path to libvixDiskLib.so* under <libdir>/lib64, or empty
+ * Pure; parsed by parsePreflightOutput.
+ */
+export function buildPreflightCmd(libdir: string): string {
+  const lib = shellEscape(libdir)
+  return [
+    `echo "nbdkit=$(command -v nbdkit || echo MISSING)"`,
+    `echo "nbd-client=$(command -v nbd-client || echo MISSING)"`,
+    `echo "vddk-plugin=$(find /usr/lib /usr/lib64 -name 'nbdkit-vddk-plugin.so' 2>/dev/null | head -1)"`,
+    `echo "vddk-lib=$(ls ${lib}/lib64/libvixDiskLib.so* 2>/dev/null | head -1)"`,
+    // The real file behind the SONAME, which is what decides the VDDK generation:
+    // `vddk-lib` above can only answer "something is installed", because its glob
+    // lands on the unversioned `libvixDiskLib.so` symlink, and the `.so.8` we create
+    // at provisioning time points at a `.so.9` on a VDDK 9 node. Resolving `.so.8`
+    // is the honest read: it is the SONAME nbdkit 1.42 actually dlopens.
+    `echo "vddk-real=$(readlink -f ${lib}/lib64/libvixDiskLib.so.8 2>/dev/null || readlink -f ${lib}/lib64/libvixDiskLib.so 2>/dev/null)"`,
+    // Debian major version: decides whether the node can be prepared at all
+    // (nbdkit-plugin-vddk only exists from Debian 13 / PVE 9 on).
+    'echo "debian-major=$(. /etc/os-release 2>/dev/null; echo "$VERSION_ID" | cut -d. -f1)"',
+  ].join("; ")
+}
+
+/** A value is "absent" if the probe reported MISSING or printed nothing. */
+function absent(v: string | undefined): boolean {
+  return !v || v.trim() === "" || v.trim() === "MISSING"
+}
+
+/** Parse the probe output into a structured preflight result with actionable hints. */
+export function parsePreflightOutput(output: string, libdir: string): VddkPreflightResult {
+  const map = new Map<string, string>()
+  for (const line of output.split("\n")) {
+    const i = line.indexOf("=")
+    if (i > 0) map.set(line.slice(0, i).trim(), line.slice(i + 1).trim())
+  }
+  const missing = ["nbdkit", "nbd-client", "vddk-plugin", "vddk-lib"].filter(k => absent(map.get(k)))
+  const parsed = Number.parseInt(map.get("debian-major") ?? "", 10)
+  const debianMajor = Number.isFinite(parsed) ? parsed : undefined
+  const vddkLib = map.get("vddk-real")?.trim() || undefined
+  const where = { libdir }
+  if (missing.length === 0) return { ok: true, missing: [], debianMajor, vddkLib, ...where }
+  // Debian < 13 cannot be prepared: nbdkit-plugin-vddk is not packaged there,
+  // so apt dead-ends for the automated path and the manual guide alike. An
+  // unreadable version deliberately falls through to the generic hints; an
+  // unknown or newer system must not be locked out by this check.
+  if (debianMajor !== undefined && debianMajor < 13) {
+    return {
+      ok: false,
+      missing,
+      debianMajor,
+      osUnsupported: true,
+      ...where,
+      error:
+        `Warm migration needs Proxmox VE 9: this node runs Debian ${debianMajor} ` +
+        `(Proxmox VE ${debianMajor - 4}), and nbdkit-plugin-vddk is only packaged from Debian 13 on.`,
+    }
+  }
+  const error =
+    `VDDK warm-migration preflight failed on the Proxmox node (libdir ${libdir}). Missing: ${missing.join(", ")}. ` +
+    missing.map(k => `${k}: ${k === "vddk-lib" ? vddkLibHint(libdir) : HINTS[k]}`).join("; ")
+  return { ok: false, missing, error, debianMajor, ...where }
+}
+
+/**
+ * Check that the PVE node has everything the warm migration needs: nbdkit,
+ * its vddk plugin, nbd-client, and a VDDK library (OpenVDDK or Broadcom) under `libdir`.
+ * Returns a structured result rather than throwing, so the pipeline can surface
+ * the actionable message to the operator before starting a migration.
+ */
+export async function checkVddkPreflight(connectionId: string, nodeIp: SshTarget, libdir: string): Promise<VddkPreflightResult> {
+  // Only reads (command -v, find, ls, readlink): allowed on a cluster outside
+  // the license, where the migration itself is then refused (roadmap#58).
+  const res = await executeSSH(connectionId, nodeIp, buildPreflightCmd(libdir), undefined, { readOnly: true })
+  if (!res.success) {
+    return { ok: false, missing: [], error: `VDDK preflight probe could not run on ${formatSshEndpoint(nodeIp)}: ${res.error || res.output}` }
+  }
+  return parsePreflightOutput(res.output || "", libdir)
+}
+
+/**
+ * Pre-migration go/no-go for the warm path, surfaced in the migrate dialog.
+ *
+ * Resolves the target node IP exactly as runWarmMigration does
+ * (getNodeSshEndpointForMigration + the same libdir: an explicit `vddkLibdir`, else
+ * OpenVDDK's directory) and runs
+ * checkVddkPreflight, so the dialog's verdict matches the backstop the engine
+ * performs at planning time. Node preparation itself is the operator's
+ * responsibility (documented separately); this only reports readiness.
+ */
+export async function runWarmNodePreflight(
+  connectionId: string,
+  node: string,
+  vddkLibdir?: string,
+): Promise<VddkPreflightResult> {
+  const conn = await getConnectionById(connectionId)
+  const nodeIp = await getNodeSshEndpointForMigration(prisma, connectionId, node, conn.baseUrl)
+  return checkVddkPreflight(connectionId, nodeIp, vddkLibdir || OPENVDDK_DEFAULT_LIBDIR)
+}

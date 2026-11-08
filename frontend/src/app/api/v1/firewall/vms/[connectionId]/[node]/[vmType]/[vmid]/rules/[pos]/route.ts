@@ -1,0 +1,85 @@
+export const dynamic = "force-dynamic"
+// src/app/api/v1/firewall/vms/[connectionId]/[node]/[vmType]/[vmid]/rules/[pos]/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+
+import { getOrchestratorClient } from '@/lib/orchestrator/client'
+import { verifyConnectionOwnership } from '@/lib/tenant'
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { withPublicApiGuard } from '@/lib/api-tokens/routeGuard'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { orchestratorOrPve } from '@/lib/firewall/withPveFallback'
+import * as pveDirect from '@/lib/firewall/pveDirect'
+import { guardSessionGuest } from '@/lib/vdc/guestGuard'
+import { withAudit } from '@/lib/audit/withAudit'
+
+type RouteContext = {
+  params: Promise<{ connectionId: string; node: string; vmType: string; vmid: string; pos: string }>
+}
+
+// The rule position is a path segment of the orchestrator and PVE calls.
+const POS_RE = /^\d+$/
+
+// PUT - Update a VM firewall rule
+async function putHandler(req: NextRequest, ctx: RouteContext) {
+  try {
+    const { connectionId, node, vmType, vmid, pos } = await ctx.params
+    if (!POS_RE.test(pos)) return NextResponse.json({ error: 'Invalid rule position' }, { status: 400 })
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", connectionId)
+    if (denied) return denied
+
+    const scopeDenied = await guardSessionGuest({ connectionId, conn: () => getConnectionById(connectionId), type: vmType, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const body = await req.json()
+    
+    const orchestrator = getOrchestratorClient()
+
+    const result = await orchestratorOrPve(
+      'firewall/vms/rules',
+      () => orchestrator.put(`/firewall/vms/${connectionId}/${node}/${vmType}/${vmid}/rules/${pos}`, body),
+      async () => pveDirect.updateVMRule(await getConnectionById(connectionId), node, vmType, vmid, pos, body),
+    )
+
+    return NextResponse.json(result)
+  } catch (e: any) {
+    console.error("[firewall/vms/rules] PUT error:", e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// DELETE - Delete a VM firewall rule
+async function deleteHandler(req: NextRequest, ctx: RouteContext) {
+  try {
+    const { connectionId, node, vmType, vmid, pos } = await ctx.params
+    if (!POS_RE.test(pos)) return NextResponse.json({ error: 'Invalid rule position' }, { status: 400 })
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", connectionId)
+    if (denied) return denied
+
+    const scopeDenied = await guardSessionGuest({ connectionId, conn: () => getConnectionById(connectionId), type: vmType, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const orchestrator = getOrchestratorClient()
+
+    const result = await orchestratorOrPve(
+      'firewall/vms/rules',
+      () => orchestrator.delete(`/firewall/vms/${connectionId}/${node}/${vmType}/${vmid}/rules/${pos}`),
+      async () => pveDirect.deleteVMRule(await getConnectionById(connectionId), node, vmType, vmid, pos),
+    )
+
+    return NextResponse.json(result)
+  } catch (e: any) {
+    console.error("[firewall/vms/rules] DELETE error:", e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const PUT = withAudit({ category: 'firewall', resourceType: 'rule', resourceParam: 'pos' }, withPublicApiGuard("fw-vm-rule-update", putHandler))
+export const DELETE = withAudit({ category: 'firewall', resourceType: 'rule', resourceParam: 'pos' }, withPublicApiGuard("fw-vm-rule-delete", deleteHandler))

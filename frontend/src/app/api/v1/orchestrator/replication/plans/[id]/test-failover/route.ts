@@ -1,0 +1,38 @@
+import { NextRequest, NextResponse } from "next/server"
+
+import { getOrchestratorClient } from "@/lib/orchestrator/client"
+import { checkPlanTenantScope } from "@/lib/orchestrator/planTenantScope"
+import { replicationErrorResponse } from "@/lib/orchestrator/replicationError"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+async function handlePost(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const denied = await checkPermission(PERMISSIONS.AUTOMATION_MANAGE, "global", "*")
+
+    if (denied) return denied
+
+    const { id } = await params
+    const { denied: scopeDenied } = await checkPlanTenantScope(id)
+
+    if (scopeDenied) return scopeDenied
+
+    let body: { network_isolated?: boolean; restore_points?: Record<number, string>; screenshot_delay_seconds?: number } | undefined
+    try { body = await request.json() } catch { /* empty body is fine */ }
+    const response = await getOrchestratorClient().testFailover(id, body)
+
+    return NextResponse.json(response.data)
+  } catch (e: any) {
+    if ((e as any)?.code !== 'ORCHESTRATOR_UNAVAILABLE') {
+      console.error("Error executing test failover:", e)
+    }
+
+    // Keep the orchestrator's own status: its 409 (a test already active on
+    // the plan) used to be flattened to a 500 the dialog could not tell apart.
+    return replicationErrorResponse(e, "Failed to execute test failover")
+  }
+}
+
+export const POST = withAudit({ category: "replication", resourceType: "plan", resourceParam: "id", action: "failover" }, handlePost)

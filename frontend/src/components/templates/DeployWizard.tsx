@@ -1,0 +1,2341 @@
+'use client'
+
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useTheme } from '@mui/material/styles'
+import { useTranslations } from 'next-intl'
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  LinearProgress,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputAdornment,
+  InputLabel,
+  MenuItem,
+  Select,
+  Slider,
+  Stack,
+  Step,
+  StepLabel,
+  Stepper,
+  Switch,
+  TextField,
+  Tooltip,
+  Typography,
+  alpha,
+} from '@mui/material'
+
+import type { CloudImage } from '@/lib/templates/cloudImages'
+import { buildDeployIpconfig0, parseIpconfig0 } from '@/lib/templates/deployIpconfig'
+import {
+  firmwareDefaultsForOstype,
+  isUefiWindowsOstype,
+  type DeployBios,
+  type DeployDiskBus,
+  type DeployDisplay,
+  type DeployMachine,
+  type TemplateHardwareHints,
+} from '@/lib/templates/deployHardware'
+import { isSharedStorage } from '@/lib/proxmox/storage'
+import { useRBAC } from '@/contexts/RBACContext'
+import { supportsVmDisks } from '@/lib/proxmox/storage'
+import type { StoragePolicyCaps } from '@/components/hardware/utils'
+import BridgePicker from '@/components/hardware/BridgePicker'
+import { deployBridgeOption, orderDeployBridges } from '@/components/hardware/bridgeChoices'
+import NumericTextField from '@/components/ui/NumericTextField'
+import StorageTypeIcon from '@/components/storage/StorageTypeIcon'
+import DeploymentProgress from './DeploymentProgress'
+import VendorLogo from './VendorLogo'
+import IsoNetworkReservation from './IsoNetworkReservation'
+import { useTenant } from '@/contexts/TenantContext'
+import { useNicIdentityPermissions } from '@/hooks/useNicIdentityPermissions'
+import VdcQuotaBanner from '@/components/inventory/VdcQuotaBanner'
+import { readVdcContextCookie } from '@/lib/vdc/contextCookie'
+
+interface DeployWizardProps {
+  open: boolean
+  onClose: () => void
+  image: CloudImage | null
+  prefillBlueprint?: any | null
+  // When set, the wizard reopens directly at the Progress step attached
+  // to an existing deployment (resuming a job that was minimized to the
+  // taskbar). Mutually exclusive with the regular new-deploy flow — if
+  // both are present, resume wins.
+  resumeDeploymentId?: string | null
+}
+
+const STEP_LABELS = [
+  'templates.deploy.steps.image',
+  'templates.deploy.steps.target',
+  'templates.deploy.steps.hardware',
+  'templates.deploy.steps.cloudInit',
+  'templates.deploy.steps.review',
+  'templates.deploy.steps.progress',
+] as const
+
+interface Connection {
+  id: string
+  name: string
+  type: string
+}
+
+// Same palette as the dashboard node widgets (Nodes Status, Guest Map, Node
+// Guests): green online, grey unknown, red for anything else.
+const NODE_STATUS_COLORS: Record<string, string> = { online: '#4caf50', unknown: '#9e9e9e' }
+const nodeStatusColor = (status: string) => NODE_STATUS_COLORS[status] ?? '#f44336'
+
+interface NodeInfo {
+  node: string
+  status: string
+  cpu: number
+  maxcpu: number
+  mem: number
+  maxmem: number
+}
+
+interface StorageInfo {
+  storage: string
+  content: string
+  total: number
+  used: number
+  avail: number
+  type: string
+  shared?: boolean | number | string
+  /** Present when a tenant's vDC storage policy governs this storage (iaas
+   *  only): the /nodes/{node}/storages payload decorates it, and the tier
+   *  chip plus the quota banner's tier axis both read it. */
+  policy?: StoragePolicyCaps
+}
+
+// Destination picker value of the provider-owned deployment (no vDC).
+const PROVIDER_DESTINATION = '__provider__'
+
+export default function DeployWizard({ open, onClose, image, prefillBlueprint, resumeDeploymentId }: DeployWizardProps) {
+  const t = useTranslations()
+  const theme = useTheme()
+  // Tenants get cloud-style abstraction in step "Target": no connection /
+  // node / VMID picker. They choose a name and an allowed disk storage. Infrastructure is
+  // resolved in the background (first allowed connection, least-loaded
+  // node, first shared storage, /cluster/nextid).
+  const { currentTenant, loading: tenantLoading, isFullClusterView } = useTenant()
+  const { canEditVlan } = useNicIdentityPermissions()
+  const hideInfra = !tenantLoading && !!currentTenant && currentTenant.id !== 'default'
+  // Full cluster view = provider OR MSP tenant (mirrors CreateVmDialog). In
+  // that mode the bridge picker exposes the whole PVE bridge list and the
+  // VLAN Tag field is live; the SDN-VNet-only lock below is for vDC tenants.
+  // `hideInfra` (vDC tenant) and `isFullClusterView` are NOT mutually
+  // exclusive opposites in general (an MSP user is full-cluster but could
+  // still scope to a vDC connection), so we branch on the dedicated flag
+  // rather than `!hideInfra`.
+  // Provider only: deploy into a tenant vDC instead of the provider's own
+  // infrastructure (roadmap#65). '' keeps the provider-owned deployment.
+  const isProvider = !tenantLoading && currentTenant?.id === 'default'
+  const [providerVdcs, setProviderVdcs] = useState<any[]>([])
+  const [targetVdcId, setTargetVdcId] = useState('')
+  const targetVdc = targetVdcId ? providerVdcs.find((v: any) => v.id === targetVdcId) : undefined
+  // Every read below is then answered as that vDC's tenant would see it, so
+  // the pickers offer what the deploy route will accept.
+  const targetQs = targetVdcId ? `targetVdcId=${encodeURIComponent(targetVdcId)}` : ''
+  const targetNodesKey = Array.isArray(targetVdc?.nodes) ? targetVdc.nodes.join(',') : ''
+  // A target vDC brings the tenant's network rules: VNets and shared bridges
+  // only, like a vDC tenant, never the whole cluster bridge list.
+  const fullClusterNet = !tenantLoading && isFullClusterView && !targetVdcId
+  const [activeStep, setActiveStep] = useState(0)
+  const [deploying, setDeploying] = useState(false)
+  const [deploymentId, setDeploymentId] = useState<string | null>(null)
+  const [deployError, setDeployError] = useState<string | null>(null)
+
+  // Target step
+  const [connections, setConnections] = useState<Connection[]>([])
+  const [connectionId, setConnectionId] = useState('')
+  const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const [node, setNode] = useState('')
+  const [storages, setStorages] = useState<StorageInfo[]>([])
+  const [storage, setStorage] = useState('')
+  const [storagesLoading, setStoragesLoading] = useState(false)
+  const [loadedStorageContext, setLoadedStorageContext] = useState('')
+  const [storagesError, setStoragesError] = useState(false)
+  // ISO-mode only: storages on the node that have content=iso. The boot ISO
+  // is downloaded here (separate from the disk storage above).
+  const [isoStorages, setIsoStorages] = useState<StorageInfo[]>([])
+  const [isoStorage, setIsoStorage] = useState('')
+  const [vmid, setVmid] = useState<number>(100)
+  const [vmName, setVmName] = useState('')
+  // Multi-vDC tenant, aggregated view: the explicit target vDC (resolved
+  // below instead of silently pinning conns[0]).
+  const [tenantVdcs, setTenantVdcs] = useState<any[]>([])
+  const [deployVdcId, setDeployVdcId] = useState('')
+  // The storage list is per connection+node; the vDC only filters it client
+  // side (visibleStorages), so a vDC switch must not refetch against the
+  // connection the user just left. The quota, on the other hand, is per vDC.
+  const storageContext = JSON.stringify([currentTenant?.id, targetVdcId, connectionId, node])
+  const quotaContext = JSON.stringify([currentTenant?.id, deployVdcId || targetVdcId, connectionId])
+  const [loadedQuotaContext, setLoadedQuotaContext] = useState('')
+
+  // Hardware step
+  const [cores, setCores] = useState(2)
+  const [sockets, setSockets] = useState(1)
+  const [memory, setMemory] = useState(2048)
+  const [diskSize, setDiskSize] = useState('20G')
+  const [scsihw, setScsihw] = useState('virtio-scsi-single')
+  const [networkModel, setNetworkModel] = useState('virtio')
+  const [networkBridge, setNetworkBridge] = useState('vmbr0')
+  // VLAN tag. For vDC tenants the wizard restricts the bridge picker to SDN
+  // VNets, which carry their own VNI and reject per-NIC tags — so the field
+  // stays locked and the payload nulls it (legacy behaviour). In full
+  // cluster view (provider / MSP) the picker exposes raw PVE bridges, where
+  // an 802.1Q tag is valid; the field becomes editable and we send the tag.
+  // '' = no tag. Stored as a string so the controlled <TextField> stays
+  // un-glitchy; coerced to number | null at submit.
+  const [vlanTag, setVlanTag] = useState<string>('')
+  const [cpu, setCpu] = useState('host')
+  // Firmware, machine, TPM, disk bus and display (#181). ISO installs and
+  // disk images both expose them: a UEFI Windows image needs OVMF + q35 (+
+  // a TPM for Windows 11 / Server 2022+), and one without VirtIO drivers
+  // must boot from SATA. Defaults follow the image ostype; a volume image
+  // taken from a VM template is then prefilled from that template.
+  const [bios, setBios] = useState<DeployBios>('seabios')
+  const [machine, setMachine] = useState<DeployMachine>('i440fx')
+  const [tpm, setTpm] = useState(false)
+  const [diskBus, setDiskBus] = useState<DeployDiskBus>('scsi')
+  const [vga, setVga] = useState<DeployDisplay>('std')
+  // Set once the hardware hints of the source template were applied.
+  const [hintsApplied, setHintsApplied] = useState(false)
+  const hintsKeyRef = useRef('')
+  // The node of a retried deployment. Set with the other retry fields, it is
+  // wiped by the node-list effect of that same render (its connection is
+  // still the previous one), so it is applied again once the nodes load.
+  const retryNodeRef = useRef('')
+  // ISO mode only: OS type override. Cloud images keep the catalog ostype.
+  const [ostypeOverride, setOstypeOverride] = useState<string | null>(null)
+  // Register the VM with the HA manager once created (#181).
+  const [ha, setHa] = useState(false)
+
+  // vDC quota (tenant only — provider has no vDC scope so banner stays hidden)
+  const [vdcQuota, setVdcQuota] = useState<{ maxVcpus: number | null; maxRamMb: number | null; maxStorageMb: number | null; maxVms: number | null } | null>(null)
+  const [vdcUsage, setVdcUsage] = useState<{ usedVcpus: number; usedRamMb: number; usedStorageMb: number; usedVms: number } | null>(null)
+  // Per-tier (storage policy) quotas of the vDC, and the live per-storage
+  // usage the enforcement path meters against. Policies without a quota
+  // still label the storage picker, but never add a blocking tier axis.
+  const [vdcTiers, setVdcTiers] = useState<Array<{ name: string; storageId: string; quotaMb: number | null }>>([])
+  const [vdcUsedByStorage, setVdcUsedByStorage] = useState<Record<string, number>>({})
+  const [quotaBlocked, setQuotaBlocked] = useState(false)
+
+  // The picker also keeps the VNet's display name so we can render the
+  // tenant-friendly alias ("public-net") next to PVE's hashed VNet ID
+  // (e.g. "v7f83c9"). The bridge value sent to PVE stays the iface
+  // (PVE only knows about pve_name); the alias is purely cosmetic.
+  // Bridges + VNets for the network picker. Mirrors the shape used by
+  // CreateVmDialog so we hit the same `/network-choices` endpoint.
+  // type values: 'vnet' (tenant SDN), 'shared' (provider uplink), or a
+  // PVE bridge type (e.g. 'bridge', 'OVSBridge').
+  // bridges carry their VNet's subnet config (CIDR, gateway, DNS) when
+  // available, so the CloudInit step can pre-fill the IP/gateway/DNS fields
+  // straight from IPAM context — the user only types an override IP if
+  // they want a specific one, otherwise the backend auto-allocates.
+  type BridgeChoice = {
+    iface: string
+    type: string
+    label?: string | null
+    vdc?: string | null
+    /** vDC UUID (for /api/v1/vdcs/{id}/... routes). vdc above is the slug,
+     *  surfaced for legacy reasons; vdcId is the only safe identifier. */
+    vdcId?: string | null
+    displayName?: string | null
+    subnet?: { cidr: string; gateway: string; dnsServers: string[]; subnetId: string } | null
+    vlanRanges?: [number, number][]
+  }
+  const [bridges, setBridges] = useState<BridgeChoice[]>([])
+  const [agent, setAgent] = useState(true)
+
+  // Cloud-init step. The IP fields differ by bridge:
+  // - With an IPAM subnet: `ipOverride` holds an optional bare host IP (else
+  //   IPAM auto-allocates). Empty string is the canonical "auto" state.
+  // - Without a subnet: the user fills structured fields instead — a DHCP
+  //   toggle (`useDhcp`), an IP/CIDR (`manualIpCidr`) and an editable gateway
+  //   (`manualGateway`). The wizard composes `ipconfig0` at submit time.
+  const [ciuser, setCiuser] = useState('')
+  const [cipassword, setCipassword] = useState('')
+  const [sshKeys, setSshKeys] = useState('')
+  const [ipOverride, setIpOverride] = useState('')
+  const [manualIpCidr, setManualIpCidr] = useState('')
+  const [manualGateway, setManualGateway] = useState('')
+  const [useDhcp, setUseDhcp] = useState(false)
+  const [nameserver, setNameserver] = useState('')
+  const [searchdomain, setSearchdomain] = useState('')
+
+  // ISO-mode network reservation. Cloud-init can't push ipconfigN to a
+  // raw OS installer, so for IPAM-managed VNets we pre-allocate an
+  // (IP, MAC) here and tell the tenant to type the IP into the OS during
+  // install. Pinned MAC = stable IPAM key across reboots / rebuilds.
+  const [staticIp, setStaticIp] = useState('')
+  const [staticMac, setStaticMac] = useState('')
+  const [staticDns, setStaticDns] = useState<string[]>([])
+  const [staticPrefix, setStaticPrefix] = useState<number | null>(null)
+  const [nextFreeLoading, setNextFreeLoading] = useState(false)
+  const [nextFreeError, setNextFreeError] = useState<string | null>(null)
+
+  // Save as blueprint
+  const [saveAsBlueprint, setSaveAsBlueprint] = useState(false)
+  const [blueprintName, setBlueprintName] = useState('')
+
+  // True when the selected image is an install-media ISO (not a cloud
+  // image). Used to gate the ISO storage picker on Target, the BIOS/OS
+  // controls on Hardware, the cloud-init step skip, and the post-deploy
+  // console link on Progress.
+  const isIsoMode = String(image?.format || '').toLowerCase() === 'iso'
+
+  // ISO + IPAM-managed bridge → the wizard needs (IP, MAC) before submit.
+  // We compute this from the currently selected bridge so the network
+  // reservation block can render and the next-free fetcher knows which
+  // VNet to query.
+  const isoBridgeChoice = bridges.find((b) => b.iface === networkBridge)
+  // vdcId is the UUID required by /api/v1/vdcs/{id}/... routes; vdc is
+  // a slug kept around for display compatibility — never use it for
+  // route building.
+  const isoNeedsReservation = isIsoMode && !!isoBridgeChoice?.subnet && !!isoBridgeChoice.vdcId && !!isoBridgeChoice.displayName
+
+  const [reservationLoading, setReservationLoading] = useState(false)
+  const [reservationError, setReservationError] = useState<string | null>(null)
+
+  const fetchNextFree = useCallback(async (which: 'both' | 'ip' | 'mac') => {
+    if (!isoBridgeChoice?.vdcId || !isoBridgeChoice?.displayName) return
+    setReservationLoading(true)
+    setReservationError(null)
+    try {
+      const r = await fetch(
+        `/api/v1/vdcs/${encodeURIComponent(isoBridgeChoice.vdcId)}/vnets/${encodeURIComponent(isoBridgeChoice.displayName)}/ipam/next-free${targetQs ? `?${targetQs}` : ''}`,
+        { cache: 'no-store' },
+      )
+      const j = await r.json()
+      if (!r.ok) {
+        setReservationError(j?.error || `HTTP ${r.status}`)
+        return
+      }
+      const d = j?.data
+      if (!d) { setReservationError('Invalid response'); return }
+      if (which === 'both' || which === 'ip') setStaticIp(String(d.ip || ''))
+      if (which === 'both' || which === 'mac') setStaticMac(String(d.suggestedMac || ''))
+      if (which === 'both') {
+        setStaticDns(Array.isArray(d.dnsServers) ? d.dnsServers : [])
+        setStaticPrefix(typeof d.prefix === 'number' ? d.prefix : null)
+      }
+    } catch (e: any) {
+      setReservationError(e?.message || 'Failed to fetch next free IP')
+    } finally {
+      setReservationLoading(false)
+    }
+  }, [isoBridgeChoice?.vdcId, isoBridgeChoice?.displayName, targetQs])
+
+  // Auto-prefill (IP, MAC, DNS, prefix) the first time the user lands
+  // on an ISO + IPAM-managed bridge. The ref tracks the (vdcId, vnet)
+  // pair we've already prefilled for so a re-render with the same
+  // bridge never overwrites what the tenant has typed. When they switch
+  // to a non-IPAM bridge we clear the values so they don't leak into
+  // a non-IPAM submit, and reset the marker so a flip back re-fetches.
+  const prefilledForRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!open) {
+      prefilledForRef.current = null
+      return
+    }
+    if (!isoNeedsReservation || !isoBridgeChoice?.vdcId || !isoBridgeChoice?.displayName) {
+      if (prefilledForRef.current !== null) {
+        prefilledForRef.current = null
+        setStaticIp('')
+        setStaticMac('')
+        setStaticDns([])
+        setStaticPrefix(null)
+        setReservationError(null)
+      }
+      return
+    }
+    const key = `${isoBridgeChoice.vdcId}|${isoBridgeChoice.displayName}`
+    if (prefilledForRef.current === key) return
+    prefilledForRef.current = key
+    void fetchNextFree('both')
+  }, [open, isoNeedsReservation, isoBridgeChoice?.vdcId, isoBridgeChoice?.displayName, fetchNextFree])
+
+  // Best-effort guess of "this ISO is a Windows installer" — drives the
+  // OVMF/pre-enrolled-keys default. We check ostype first (most reliable
+  // if the uploader filled it in), then vendor/tags as fallbacks.
+  const windowsHint = (() => {
+    if (!image) return false
+    const ot = String(image.ostype || '').toLowerCase()
+    if (ot === 'win10' || ot === 'win11' || ot.startsWith('win')) return true
+    const vendor = String(image.vendor || '').toLowerCase()
+    if (vendor.includes('microsoft') || vendor.includes('windows')) return true
+    return image.tags?.some(tg => /windows|win-?\d+|win2k|server2025/i.test(String(tg))) || false
+  })()
+
+  // Reset state on open
+  useEffect(() => {
+    if (!open) return
+    // Resume path: jump straight to the Progress step bound to an existing
+    // deployment. Skip the form reset since none of the form fields will
+    // be shown; DeploymentProgress drives the rest from the deploymentId.
+    if (resumeDeploymentId) {
+      setActiveStep(5)
+      setDeploying(true)
+      setDeploymentId(resumeDeploymentId)
+      setDeployError(null)
+      return
+    }
+    setActiveStep(0)
+    setDeploying(false)
+    setDeploymentId(null)
+    setDeployError(null)
+    // Fresh open starts with no VLAN tag; the blueprint prefill below
+    // overrides this when a stored tag round-trips.
+    setVlanTag('')
+    // Provider-owned by default; a retry restores its vDC below.
+    setTargetVdcId('')
+
+    if (image) {
+      setCores(image.recommendedCores)
+      setMemory(image.recommendedMemory)
+      setDiskSize(image.defaultDiskSize)
+      setVmName('')
+      // ISO defaults: pre-set Windows install media to win11 + OVMF
+      // (Secure Boot enrolled), other ISOs to ostype='other' + SeaBIOS.
+      // Cloud images keep their catalog ostype (no override).
+      // ISO installs always run on q35 (forced server-side). A Windows
+      // installer gets SATA so setup sees the disk without VirtIO drivers.
+      const isoWindows = isIsoMode && windowsHint
+      const fw = firmwareDefaultsForOstype(isoWindows ? 'win11' : image.ostype)
+      if (isIsoMode) {
+        setOstypeOverride(windowsHint ? 'win11' : (image.ostype || 'other'))
+        setDiskBus(windowsHint ? 'sata' : fw.diskBus)
+      } else {
+        setOstypeOverride(null)
+        setDiskBus(fw.diskBus)
+      }
+      setBios(fw.bios)
+      setMachine(fw.machine)
+      setTpm(fw.tpm)
+      setVga(fw.vga)
+    }
+    setHa(false)
+    setHintsApplied(false)
+    hintsKeyRef.current = ''
+    retryNodeRef.current = ''
+
+    // Prefill from blueprint
+    if (prefillBlueprint) {
+      try {
+        const hw = typeof prefillBlueprint.hardware === 'string'
+          ? JSON.parse(prefillBlueprint.hardware)
+          : prefillBlueprint.hardware
+        setCores(hw.cores || 2)
+        setSockets(hw.sockets || 1)
+        setMemory(hw.memory || 2048)
+        setDiskSize(hw.diskSize || '20G')
+        setScsihw(hw.scsihw || 'virtio-scsi-single')
+        setNetworkModel(hw.networkModel || 'virtio')
+        setNetworkBridge(hw.networkBridge || 'vmbr0')
+        // Round-trip a stored VLAN tag from the blueprint (only meaningful
+        // for raw bridges in full cluster view; on a VNet the picker effect
+        // re-locks it). null / undefined / 0 → no tag.
+        setVlanTag(hw.vlanTag != null && hw.vlanTag !== 0 ? String(hw.vlanTag) : '')
+        setCpu(hw.cpu || 'host')
+        setAgent(hw.agent !== false)
+        // A blueprint saved before #181 has none of these: keep the
+        // ostype defaults set above.
+        if (hw.bios) setBios(hw.bios)
+        if (hw.machine) setMachine(hw.machine)
+        if (typeof hw.tpm === 'boolean') setTpm(hw.tpm)
+        if (hw.diskBus) setDiskBus(hw.diskBus)
+        if (hw.vga) setVga(hw.vga)
+        // The blueprint is the explicit recipe: no template hints over it.
+        hintsKeyRef.current = 'blueprint'
+      } catch { /* ignore */ }
+
+      try {
+        const ci = prefillBlueprint.cloudInit
+          ? (typeof prefillBlueprint.cloudInit === 'string'
+            ? JSON.parse(prefillBlueprint.cloudInit)
+            : prefillBlueprint.cloudInit)
+          : null
+        if (ci) {
+          setCiuser(ci.ciuser || '')
+          setCipassword(ci.cipassword || '')
+          setSshKeys(ci.sshKeys || '')
+          // Re-hydrate the IP fields from a saved blueprint's ipconfig0. The
+          // bare host part feeds the subnet (IPAM) layout; the full ip/cidr +
+          // gw and the DHCP flag feed the no-subnet layout. We don't know the
+          // target bridge yet, so populate both and let the active layout read
+          // whichever it needs.
+          const cfg = String(ci.ipconfig0 || '')
+          const parsed = parseIpconfig0(cfg)
+          setUseDhcp(parsed.useDhcp)
+          setManualIpCidr(parsed.manualIpCidr)
+          setManualGateway(parsed.manualGateway)
+          setIpOverride(parsed.host)
+          setNameserver(ci.nameserver || '')
+          setSearchdomain(ci.searchdomain || '')
+        }
+      } catch { /* ignore */ }
+
+      // Prefill target from retry
+      if (prefillBlueprint._retryFrom) {
+        const rf = prefillBlueprint._retryFrom
+        if (rf.connectionId) setConnectionId(rf.connectionId)
+        if (rf.node) { setNode(rf.node); retryNodeRef.current = rf.node }
+        if (rf.storage) setStorage(rf.storage)
+        if (rf.vmName) setVmName(rf.vmName)
+        if (rf.targetVdcId) setTargetVdcId(rf.targetVdcId)
+        if (rf.ha) setHa(true)
+      }
+    }
+  }, [open, image, prefillBlueprint, resumeDeploymentId])
+
+  // Fetch connections
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    fetch('/api/v1/connections?type=pve')
+      .then(r => r.json())
+      .then(res => {
+        if (cancelled) return
+        const conns = res.data || []
+        setConnections(conns)
+        // Tenant: auto-pick the first connection from their vDC scope so
+        // step Target requires no input. Provider keeps manual selection
+        // unless there's a single option. With a precise vDC context the
+        // connections list is narrowed server-side to that vDC's cluster,
+        // so this pin targets the context vDC by construction. In the union
+        // view a multi-vDC tenant also gets this conns[0] pin as a first
+        // pass, but the vDC-resolution effect below re-asserts the correct
+        // connection once its own fetch resolves (explicit vDC selector).
+        if (conns.length === 1 || (hideInfra && conns.length > 0)) {
+          setConnectionId(current => conns.some((c: Connection) => c.id === current) ? current : conns[0].id)
+        }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [open, hideInfra, currentTenant?.id])
+
+  // Multi-vDC tenant, aggregated view: resolve the target vDC explicitly
+  // instead of silently pinning conns[0].
+  useEffect(() => {
+    if (!open || !hideInfra) { setTenantVdcs([]); setDeployVdcId(''); return }
+    let cancelled = false
+    void (async () => {
+      try {
+        const r = await fetch('/api/v1/vdcs', { cache: 'no-store' })
+        if (cancelled || !r.ok) return
+        const j = await r.json()
+        if (cancelled) return
+        const list = (Array.isArray(j?.data) ? j.data : []).filter(
+          (v: any) => (v.connectionId ?? v.connection_id) && v.enabled !== false
+        )
+        setTenantVdcs(list)
+        if (list.length === 0) return // legacy tenant without vDCs: conns[0] pin stays
+        // Retry preference read directly from the (stable) prop, never from
+        // connectionId/its ref — that state is also driven by the
+        // concurrent, independent connections-fetch conns[0] pin, which can
+        // land first and silently overwrite the retry's original target.
+        const retryConn = prefillBlueprint?._retryFrom?.connectionId
+        const byConn = retryConn
+          ? list.find((v: any) => (v.connectionId ?? v.connection_id) === retryConn)
+          : undefined
+        const ctxVdcId = readVdcContextCookie()
+        const byContext = ctxVdcId ? list.find((v: any) => v.id === ctxVdcId) : undefined
+        const target = byConn || byContext || list[0]
+        setDeployVdcId(current => list.some((v: any) => v.id === current) ? current : target.id)
+      } catch { /* ignore — legacy pin behavior */ }
+    })()
+    return () => { cancelled = true }
+  }, [open, hideInfra, currentTenant?.id])
+
+  // Invariant: for a vDC tenant the pinned connection always follows the
+  // selected vDC — re-asserts itself if the conns[0] pin from the
+  // connections effect lands after the vDC fetch resolved.
+  useEffect(() => {
+    if (!deployVdcId) return
+    const v = tenantVdcs.find((x: any) => x.id === deployVdcId)
+    const target = v ? (v.connectionId ?? v.connection_id) : undefined
+    if (target && target !== connectionId) {
+      setConnectionId(target)
+      setNode(''); setStorage(''); setIsoStorage('')
+    }
+  }, [deployVdcId, tenantVdcs, connectionId])
+
+  // Provider: the enabled tenant vDCs it may deploy into. A caller without
+  // admin.settings gets a 403 here and simply keeps the provider target.
+  useEffect(() => {
+    if (!open || !isProvider) { setProviderVdcs([]); return }
+    let cancelled = false
+    fetch('/api/v1/admin/vdcs', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(j => {
+        if (cancelled) return
+        const list = (Array.isArray(j?.data) ? j.data : []).filter((v: any) => v.enabled === true && v.connectionId)
+        setProviderVdcs(list)
+        // A retry into a vDC since disabled or deleted falls back to the
+        // provider infrastructure instead of a destination nobody can pick.
+        setTargetVdcId(current => (current && !list.some((v: any) => v.id === current) ? '' : current))
+      })
+      .catch(() => { if (!cancelled) { setProviderVdcs([]); setTargetVdcId('') } })
+    return () => { cancelled = true }
+  }, [open, isProvider])
+
+  // A target vDC lives on one cluster: the connection follows it.
+  useEffect(() => {
+    const target = targetVdc?.connectionId
+    if (target && target !== connectionId) {
+      setConnectionId(target)
+      setNode(''); setStorage(''); setIsoStorage('')
+    }
+  }, [targetVdc, connectionId])
+
+  // Fetch nodes when connection changes
+  useEffect(() => {
+    if (!open || !connectionId) { setNodes([]); setNode(''); return }
+    let cancelled = false
+    fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/nodes`)
+      .then(r => r.json())
+      .then(res => {
+        if (cancelled) return
+        // A target vDC restricts the nodes like its tenant's own vDC does
+        // (an empty node list in the vDC means the whole cluster).
+        const vdcNodes = targetNodesKey ? new Set(targetNodesKey.split(',')) : null
+        const nodeList = (res.data || []).filter((n: any) => n.status === 'online' && (!vdcNodes || vdcNodes.has(n.node)))
+        setNodes(nodeList)
+        const retryNode = retryNodeRef.current
+        if (retryNode && nodeList.some((n: NodeInfo) => n.node === retryNode)) {
+          retryNodeRef.current = ''
+          setNode(retryNode)
+          return
+        }
+        if (vdcNodes) setNode(current => nodeList.some((n: NodeInfo) => n.node === current) ? current : '')
+        if (nodeList.length === 1) {
+          setNode(nodeList[0].node)
+        } else if (hideInfra && nodeList.length > 0) {
+          // Pick least-loaded online node (cpu + 1.5*ram, RAM weighted higher).
+          const scored = nodeList.map((n: any) => {
+            const cpuPct = n.maxcpu ? (n.cpu || 0) * 100 : 0
+            const memPct = n.maxmem ? ((n.mem || 0) / n.maxmem) * 100 : 0
+            return { n, score: cpuPct + 1.5 * memPct }
+          })
+          scored.sort((a: any, b: any) => a.score - b.score)
+          setNode(current => nodeList.some((n: NodeInfo) => n.node === current) ? current : scored[0].n.node)
+        }
+      })
+      .catch(() => { if (!cancelled) { setNodes([]); setNode('') } })
+    return () => { cancelled = true }
+  }, [open, connectionId, hideInfra, currentTenant?.id, targetNodesKey])
+
+  // Fetch storages + next VMID when node changes
+  useEffect(() => {
+    if (!open || !connectionId || !node) {
+      setStorages([]); setIsoStorages([]); setLoadedStorageContext(''); setStoragesLoading(false); setStoragesError(false)
+      return
+    }
+    let cancelled = false
+    setStoragesLoading(true)
+    setStoragesError(false)
+
+    // The unfiltered endpoint contains writable vDC storages; library-only
+    // ISO grants are intentionally resolved by the separate ISO request.
+    fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/nodes/${encodeURIComponent(node)}/storages${targetQs ? `?${targetQs}` : ''}`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json() })
+      .then(res => {
+        if (cancelled) return
+        const all = Array.isArray(res.data) ? res.data : []
+        const stList = all.filter((s: any) =>
+          supportsVmDisks(s.type)
+          && ![0, false, '0'].includes(s.enabled)
+          && ![0, false, '0'].includes(s.active)
+          && String(s.content || '').split(',').map((c: string) => c.trim()).includes('images'),
+        )
+        setStorages(stList)
+        const preferred = hideInfra || targetQs ? stList.find((s: StorageInfo) => [1, true, '1'].includes(s.shared!)) : undefined
+        setStorage(current => stList.some((s: StorageInfo) => s.storage === current)
+          ? current : (preferred || stList[0])?.storage || '')
+      })
+      // A failed request is not an empty vDC: remember it so the step says so
+      // instead of "no writable storage".
+      .catch(() => { if (!cancelled) { setStorages([]); setStorage(''); setStoragesError(true) } })
+      .finally(() => {
+        if (!cancelled) { setStoragesLoading(false); setLoadedStorageContext(storageContext) }
+      })
+
+    // ISO-capable storages: separate selector on Target step, and a SEPARATE
+    // request: an ISO library granted to a vDC read-only is only returned when
+    // the caller asks for `content=iso`, so deriving this list from the
+    // unfiltered call above hid it and told the tenant its vDC had no ISO
+    // storage at all.
+    fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/nodes/${encodeURIComponent(node)}/storages?content=iso${targetQs ? `&${targetQs}` : ''}`)
+      .then(r => r.json())
+      .then(res => {
+        if (cancelled) return
+        const isoList = ((res.data || []) as any[]).filter((s: any) => s.enabled !== 0)
+        setIsoStorages(isoList)
+        if (isoList.length > 0) {
+          if (hideInfra || targetQs) {
+            const shared = isoList.find((s: any) => s.shared)
+            setIsoStorage(current => isoList.some((s: StorageInfo) => s.storage === current) ? current : (shared || isoList[0]).storage)
+          } else {
+            setIsoStorage(current => isoList.some((s: StorageInfo) => s.storage === current) ? current : isoList[0].storage)
+          }
+        } else {
+          setIsoStorage('')
+        }
+      })
+      .catch(() => { if (!cancelled) { setIsoStorages([]); setIsoStorage('') } })
+
+    // Try to get next available VMID
+    fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/cluster/nextid${targetQs ? `?${targetQs}` : ''}`)
+      .then(r => r.json())
+      .then(res => {
+        if (!cancelled && res.data) setVmid(Number(res.data) || 100)
+      })
+      .catch(() => {})
+
+    // Network bridges + tenant vDC VNets — populates the bridge picker on
+    // the Hardware step. Mirrors the call made by CreateVmDialog so we
+    // honour the same vDC whitelist server-side: tenants get their VNets
+    // and shared bridges, providers get the full PVE bridge list.
+    fetch(`/api/v1/connections/${encodeURIComponent(connectionId)}/network-choices?node=${encodeURIComponent(node)}${targetQs ? `&${targetQs}` : ''}`)
+      .then(r => r.json())
+      .then(res => {
+        if (cancelled) return
+        const choices = Array.isArray(res?.data) ? res.data : []
+        const list: BridgeChoice[] = choices.map((c: any) => ({
+          iface: c.name,
+          type: c.kind === 'vnet' ? 'vnet' : c.kind === 'shared' ? 'shared' : (c.type || 'bridge'),
+          label: c.label ?? null,
+          vdc: c.vdc ?? null,
+          vdcId: c.vdcId ?? null,
+          displayName: c.displayName ?? null,
+          subnet: c.subnet ?? null,
+          vlanRanges: c.vlanRanges ?? undefined,
+        }))
+        setBridges(list)
+        // Auto-pick the first VNet so the displayed picker value and the
+        // deploy payload stay in sync — for vDC tenants the wizard restricts
+        // the bridge to SDN VNets only, so non-VNet pre-fills (e.g. 'vmbr0'
+        // from initial state, or a stale blueprint value) would otherwise
+        // leave networkBridge pointing at something the dropdown no longer
+        // surfaces. In full cluster view (provider / MSP) we expose the whole
+        // bridge list and must NOT force-switch — keep the user's / blueprint
+        // value if it exists, else fall back to 'vmbr0'.
+        if (fullClusterNet) {
+          if (!list.some((b: { iface: string }) => b.iface === networkBridge)) {
+            setNetworkBridge(list.some((b: { iface: string }) => b.iface === 'vmbr0') ? 'vmbr0' : (networkBridge || 'vmbr0'))
+          }
+        } else {
+          // Same order as the picker so its first row is the one picked (#195).
+          const tenantNets = orderDeployBridges(list, false)
+          if (tenantNets.length > 0 && !tenantNets.some((b: { iface: string }) => b.iface === networkBridge)) {
+            setNetworkBridge(tenantNets[0].iface)
+          }
+        }
+      })
+      .catch(() => { if (!cancelled) setBridges([]) })
+    return () => { cancelled = true }
+  }, [open, connectionId, node, hideInfra, fullClusterNet, storageContext, targetQs])
+
+  // Fetch the tenant's vDC quota+usage for the live quota banner on the
+  // Hardware step. The /api/v1/vdcs route already returns null for the
+  // provider tenant (no vDC), so the banner only shows up for tenants.
+  useEffect(() => {
+    const reset = () => {
+      setVdcQuota(null); setVdcUsage(null); setVdcTiers([]); setVdcUsedByStorage({})
+    }
+    if (!open || !connectionId) {
+      reset()
+      return
+    }
+    let cancelled = false
+    reset()
+    setQuotaBlocked(false)
+    void (async () => {
+      try {
+        const res = await fetch(`/api/v1/vdcs${targetQs ? `?${targetQs}` : ''}`)
+        if (!res.ok) { if (!cancelled) reset() ; return }
+        const json = await res.json()
+        const vdcs: any[] = Array.isArray(json?.data) ? json.data : []
+        const match = vdcs.find(v => (!deployVdcId || v.id === deployVdcId) &&
+          (v.connectionId === connectionId || v.connection_id === connectionId))
+        if (cancelled) return
+        // Keyed on the vDC, not on `match.quota`: a vDC with no VdcQuota row
+        // at all still has its per-tier quotas enforced server-side, so the
+        // banner has to render for the tier axis alone (the four global
+        // donuts then read "unlimited").
+        if (match) {
+          setVdcQuota({
+            maxVcpus: match.quota?.maxVcpus ?? null,
+            maxRamMb: match.quota?.maxRamMb ?? null,
+            maxStorageMb: match.quota?.maxStorageMb ?? null,
+            maxVms: match.quota?.maxVms ?? null,
+          })
+          setVdcUsage({
+            usedVcpus: match.usage?.usedVcpus ?? 0,
+            usedRamMb: match.usage?.usedRamMb ?? 0,
+            usedStorageMb: match.usage?.usedStorageMb ?? 0,
+            usedVms: match.usage?.usedVms ?? 0,
+          })
+          setVdcTiers(
+            (Array.isArray(match.storagePolicies) ? match.storagePolicies : [])
+              .filter((sp: any) => sp?.storageId)
+              .map((sp: any) => ({ name: String(sp.name), storageId: String(sp.storageId), quotaMb: sp.quotaMb == null ? null : Number(sp.quotaMb) })),
+          )
+          setVdcUsedByStorage(
+            match.usage?.usedStorageByStorage && typeof match.usage.usedStorageByStorage === 'object'
+              ? match.usage.usedStorageByStorage
+              : {},
+          )
+        } else {
+          reset()
+        }
+      } catch {
+        if (!cancelled) reset()
+      } finally {
+        if (!cancelled) setLoadedQuotaContext(quotaContext)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [open, connectionId, deployVdcId, quotaContext, targetQs])
+
+  // Aggregated view: the storages endpoint answers for the tenant's whole
+  // scope on that connection, i.e. the union of its vDCs. Keep only what the
+  // selected vDC grants, so another vDC's tier is never offered (nor its
+  // quota escaped). A vDC payload without storage details filters nothing.
+  const visibleStorages = useMemo(() => {
+    if (!hideInfra || !deployVdcId) return storages
+    const vdc = tenantVdcs.find((v: any) => v.id === deployVdcId)
+    if (!vdc) return storages
+    const granted = new Set<string>([
+      ...(Array.isArray(vdc.storages) ? vdc.storages.map(String) : []),
+      ...(Array.isArray(vdc.storagePolicies) ? vdc.storagePolicies.map((sp: any) => String(sp?.storageId ?? '')) : []),
+      ...(vdc.primaryStorage ? [String(vdc.primaryStorage)] : []),
+    ].filter(Boolean))
+    return granted.size ? storages.filter(s => granted.has(s.storage)) : storages
+  }, [hideInfra, deployVdcId, tenantVdcs, storages])
+
+  // HA at creation (#181): the HA tab's rights (provider, node.manage on the
+  // connection), and only on shared storage. The server checks both again.
+  const { hasPermissionOn } = useRBAC()
+  const canManageHa = isProvider && !!connectionId && hasPermissionOn('node.manage', 'connection', connectionId)
+  const selectedStorageInfo = storages.find(s => s.storage === storage)
+  const haStorageShared = !!selectedStorageInfo && isSharedStorage({
+    shared: selectedStorageInfo.shared === true || Number(selectedStorageInfo.shared) === 1,
+    type: selectedStorageInfo.type,
+  })
+
+  // A volume image taken from a VM template boots with that template's
+  // firmware and bus: read them once per image and cluster, unless a
+  // blueprint already set the recipe.
+  useEffect(() => {
+    if (!open || !image || isIsoMode || !connectionId || resumeDeploymentId) return
+    if (!String(image.slug).startsWith('custom-')) return
+    const key = `${image.slug}|${connectionId}`
+    if (hintsKeyRef.current === 'blueprint' || hintsKeyRef.current === key) return
+    hintsKeyRef.current = key
+    let cancelled = false
+    let settled = false
+    const qs = new URLSearchParams({ imageSlug: image.slug, connectionId })
+    fetch(`/api/v1/templates/hardware-hints?${qs.toString()}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(res => {
+        const hints: TemplateHardwareHints | null = res?.data ?? null
+        if (cancelled) return
+        settled = true
+        if (!hints) return
+        if (hints.bios) setBios(hints.bios)
+        if (hints.machine) setMachine(hints.machine)
+        if (typeof hints.tpm === 'boolean') setTpm(hints.tpm)
+        if (hints.diskBus) setDiskBus(hints.diskBus)
+        if (hints.vga) setVga(hints.vga)
+        if (hints.scsihw) setScsihw(hints.scsihw)
+        setHintsApplied(true)
+      })
+      .catch(() => { /* keep the ostype defaults */ })
+    return () => {
+      cancelled = true
+      // Interrupted before the answer: let the next run ask again. Once
+      // applied, the hints never come back over the user's own choices.
+      if (!settled && hintsKeyRef.current === key) hintsKeyRef.current = ''
+    }
+  }, [open, image, isIsoMode, connectionId, resumeDeploymentId])
+
+  // The default picked when the list arrived may sit outside the vDC that
+  // resolved afterwards: move it onto a granted storage, shared first.
+  useEffect(() => {
+    if (!hideInfra || visibleStorages.length === 0 || visibleStorages.some(s => s.storage === storage)) return
+    const preferred = visibleStorages.find(s => [1, true, '1'].includes(s.shared!))
+    setStorage((preferred || visibleStorages[0]).storage)
+  }, [hideInfra, visibleStorages, storage])
+
+  // Wait for the quota lookup to settle, not to succeed: the figures are
+  // advisory here and the deploy route enforces the quota itself, so a failed
+  // /api/v1/vdcs must not leave Next and Deploy dead for the session.
+  const quotaReady = !(hideInfra ? deployVdcId : targetVdcId) || loadedQuotaContext === quotaContext
+  const storageSelectionReady = !storagesLoading && loadedStorageContext === storageContext &&
+    visibleStorages.some(s => s.storage === storage) && quotaReady
+
+  const handleNext = useCallback(() => {
+    setActiveStep(s => {
+      const next = Math.min(s + 1, STEP_LABELS.length - 1)
+      // ISO mode skips the cloud-init step (index 3) — install media has
+      // no notion of cloud-init, the user runs the OS installer manually.
+      if (isIsoMode && next === 3) return 4
+      return next
+    })
+  }, [isIsoMode])
+
+  const handleBack = useCallback(() => {
+    setActiveStep(s => {
+      const prev = Math.max(s - 1, 0)
+      if (isIsoMode && prev === 3) return 2
+      return prev
+    })
+  }, [isIsoMode])
+
+  const handleDeploy = useCallback(async () => {
+    if (!image || !storageSelectionReady || quotaBlocked) return
+    setDeployError(null)
+
+    const selBridge = bridges.find(b => b.iface === networkBridge)
+    const vlanVisible = fullClusterNet || selBridge?.type === 'shared'
+    if (vlanVisible && selBridge?.type !== 'vnet' && vlanTag.trim()) {
+      // A blueprint can carry a tag this caller may not set: refuse loudly
+      // rather than deploy on the native VLAN behind their back.
+      if (!canEditVlan) {
+        setDeployError(t('hardware.nicVlanPermissionRequired'))
+        return
+      }
+      const n = Number.parseInt(vlanTag, 10)
+      if (!Number.isFinite(n) || n < 1 || n > 4094 || String(n) !== vlanTag.trim()) {
+        setDeployError(t('templates.deploy.hardware.vlanInvalid'))
+        return
+      }
+    }
+
+    setDeploying(true)
+    setActiveStep(5) // Progress step
+
+    try {
+      const body: any = {
+        connectionId,
+        node,
+        storage,
+        vmid,
+        vmName: vmName || undefined,
+        imageSlug: image.slug,
+        blueprintId: prefillBlueprint?.id || undefined,
+        hardware: {
+          cores,
+          sockets,
+          memory,
+          diskSize,
+          scsihw,
+          networkModel,
+          networkBridge,
+          // VLAN tag:
+          //  - vDC tenant: the picker only exposes SDN VNets (own VNI), PVE
+          //    rejects per-NIC tags on VXLAN VNets and the field is locked →
+          //    hard-null, dropping any stale blueprint value.
+          //  - full cluster view (provider / MSP): a raw bridge can carry an
+          //    802.1Q tag. Send the number when one was entered AND the
+          //    selected choice isn't a VNet; null otherwise (VNet selected,
+          //    or field left empty). The deploy route applies `,tag=` only
+          //    when this is truthy.
+          vlanTag: (() => {
+            const sel = bridges.find(b => b.iface === networkBridge)
+            if (sel?.type === 'vnet') return null
+            if (!fullClusterNet && sel?.type !== 'shared') return null
+            const n = Number.parseInt(vlanTag, 10)
+            return Number.isFinite(n) && n >= 1 && n <= 4094 ? n : null
+          })(),
+          // ISO mode lets the user override ostype (Windows install media
+          // pre-selects win11) — fall back to the catalog ostype otherwise.
+          ostype: isIsoMode ? (ostypeOverride || image.ostype) : image.ostype,
+          agent,
+          cpu,
+          bios,
+          // ISO installs run on q35 whatever is sent (server-side).
+          machine: isIsoMode ? 'q35' : machine,
+          tpm,
+          diskBus,
+          vga: isIsoMode ? 'std' : vga,
+        },
+        ha: canManageHa && ha && haStorageShared ? true : undefined,
+        // ISO deployments don't run cloud-init: omit the block entirely so
+        // the backend skips the configure step. Cloud-image deployments
+        // keep their existing cloud-init payload.
+        cloudInit: isIsoMode ? null : (() => {
+          // Compose ipconfig0 from the cloud-init network fields. With an IPAM
+          // subnet the field holds a bare host IP (prefix + gateway come from
+          // the subnet); without one the user fills DHCP / IP-CIDR / gateway
+          // directly. Empty → the backend's IPAM hook auto-allocates
+          // server-side. See #526 (no-subnet input was dropped entirely).
+          const selectedBridge = bridges.find(b => b.iface === networkBridge)
+          const ipconfig0 = buildDeployIpconfig0({
+            subnet: selectedBridge?.subnet ?? null,
+            ipOverride,
+            manualIpCidr,
+            manualGateway,
+            useDhcp,
+          })
+          return {
+            ciuser: ciuser || undefined,
+            cipassword: cipassword || undefined,
+            sshKeys: sshKeys || undefined,
+            ipconfig0,
+            nameserver: nameserver || undefined,
+            searchdomain: searchdomain || undefined,
+          }
+        })(),
+        saveAsBlueprint,
+        blueprintName: saveAsBlueprint ? blueprintName : undefined,
+      }
+      if (isIsoMode) body.isoStorage = isoStorage
+      if (targetVdcId) body.targetVdcId = targetVdcId
+      if (isoNeedsReservation) {
+        body.staticIp = staticIp
+        body.staticMac = staticMac
+      }
+
+      const res = await fetch('/api/v1/templates/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+
+      const text = await res.text()
+      let data: any
+      try {
+        data = JSON.parse(text)
+      } catch {
+        console.warn('[DeployWizard] Non-JSON response from /api/v1/templates/deploy →', text.slice(0, 200))
+        setDeployError('Server returned an invalid response')
+        setDeploying(false)
+        return
+      }
+      if (data.error) {
+        // Validation / permission errors from the sync part
+        setDeployError(data.error)
+        setDeploying(false)
+        return
+      }
+      if (data.data?.deploymentId) {
+        setDeploymentId(data.data.deploymentId)
+      }
+    } catch (err: any) {
+      setDeployError(err.message || 'Deploy failed')
+      setDeploying(false)
+    }
+  }, [
+    image, connectionId, node, storage, storageSelectionReady, quotaBlocked, isoStorage, vmid, vmName, cores, sockets, memory,
+    diskSize, scsihw, networkModel, networkBridge, vlanTag, fullClusterNet, canEditVlan, cpu, agent,
+    bios, machine, tpm, diskBus, vga, ha, canManageHa, haStorageShared, ostypeOverride, isIsoMode, isoNeedsReservation, staticIp, staticMac,
+    ciuser, cipassword, sshKeys, ipOverride, nameserver, searchdomain,
+    bridges,
+    saveAsBlueprint, blueprintName, prefillBlueprint, targetVdcId,
+  ])
+
+  const handleDeployComplete = useCallback((status: 'completed' | 'failed', error?: string) => {
+    setDeploying(false)
+    if (status === 'failed' && error) setDeployError(error)
+  }, [])
+
+  // A volume image only deploys on the clusters holding a copy of it (#44).
+  // URL and built-in images carry no list and go anywhere.
+  const imageConnectionIds = (image as { connectionIds?: string[] } | null)?.connectionIds
+  const imageOffCluster = !!imageConnectionIds && !!connectionId && !imageConnectionIds.includes(connectionId)
+
+  const canProceed = useMemo(() => {
+    switch (activeStep) {
+      case 0: return !!image
+      case 1: {
+        const baseOk = !!connectionId && !!node && storageSelectionReady && vmid >= 100 && !!vmName.trim() && !imageOffCluster
+        // ISO mode also requires an ISO-capable storage on the node — if
+        // the tenant's vDC has none we surface a blocking message instead
+        // of the picker, and the wizard can't advance.
+        if (isIsoMode) return baseOk && !!isoStorage
+        return baseOk
+      }
+      // Hardware step: also block while the vDC quota would be exceeded.
+      // ISO + IPAM-managed VNet requires an explicit static IP — we can't
+      // pin it via cloud-init (no agent during install), so the tenant
+      // must commit to the IP before we let them advance.
+      case 2: {
+        const baseOk = cores >= 1 && memory >= 128 && !!diskSize && !quotaBlocked
+        // Win11/Server 2025 ISO install needs ≥32 GB or the installer
+        // refuses to start — block Next instead of letting the user walk
+        // into a hard failure on the deploy step.
+        const sizeNum = Number.parseInt(String(diskSize).replace(/G$/i, ''), 10) || 0
+        const ot = ostypeOverride || image?.ostype || ''
+        if (isIsoMode && ot === 'win11' && sizeNum < 32) return false
+        if (isoNeedsReservation) {
+          const ipOk = /^\d{1,3}(\.\d{1,3}){3}$/.test(staticIp)
+          const macOk = /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/.test(staticMac)
+          return baseOk && ipOk && macOk
+        }
+        return baseOk
+      }
+      // Cloud-Init step: block advancing with a malformed IP so the deploy
+      // doesn't fail at Proxmox. With a subnet the override IP is optional but
+      // must be a bare IPv4 (and not the gateway). Without a subnet, DHCP needs
+      // nothing; a static config needs a valid IP/CIDR and an optional gateway.
+      case 3: {
+        const sel = bridges.find(b => b.iface === networkBridge)
+        const sn = sel?.subnet
+        if (sn) {
+          return !ipOverride || (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipOverride) && ipOverride !== sn.gateway)
+        }
+        if (useDhcp) return true
+        const ipOk = !manualIpCidr || /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(manualIpCidr.trim())
+        const gwOk = !manualGateway || /^\d{1,3}(\.\d{1,3}){3}$/.test(manualGateway.trim())
+        return ipOk && gwOk
+      }
+      case 4: return storageSelectionReady && !quotaBlocked
+      default: return false
+    }
+  }, [activeStep, image, imageOffCluster, connectionId, node, storage, storageSelectionReady, vmid, vmName, cores, memory, diskSize, quotaBlocked, isIsoMode, isoStorage, isoNeedsReservation, ostypeOverride, staticIp, staticMac, bridges, networkBridge, ipOverride, manualIpCidr, manualGateway, useDhcp])
+
+  // ─── Step renderers ────────────────────────────────────────────────
+
+  const renderImageStep = () => {
+    if (!image) return null
+    return (
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <Box
+            sx={{
+              width: 56, height: 56, borderRadius: 2,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              flexShrink: 0,
+            }}
+          >
+            <VendorLogo vendor={image.vendor} size={48} />
+          </Box>
+          <Box>
+            <Typography variant="h6">{image.name}</Typography>
+            <Typography variant="body2" sx={{ opacity: 0.6 }}>
+              {image.arch} &middot; {image.format} &middot; {image.ostype}
+            </Typography>
+          </Box>
+        </Box>
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+          {image.tags.map(tag => (
+            <Chip key={tag} label={tag} size="small" />
+          ))}
+        </Box>
+        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+          <Box>
+            <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('templates.catalog.recommendedSpecs')}</Typography>
+            <Typography variant="body2">
+              {image.recommendedCores} {t('templates.catalog.cores')} / {image.recommendedMemory >= 1024 ? `${image.recommendedMemory / 1024} GB` : `${image.recommendedMemory} MB`} RAM / {image.defaultDiskSize} {t('templates.deploy.hardware.disk')}
+            </Typography>
+          </Box>
+          <Box>
+            <Typography variant="caption" sx={{ opacity: 0.6 }}>{t('templates.catalog.minimumSpecs')}</Typography>
+            <Typography variant="body2">
+              {image.minCores} {t('templates.catalog.cores')} / {image.minMemory >= 1024 ? `${image.minMemory / 1024} GB` : `${image.minMemory} MB`} RAM
+            </Typography>
+          </Box>
+        </Box>
+      </Box>
+    )
+  }
+
+  const renderTargetStep = () => {
+    // Block ISO deployments when the resolved vDC has no ISO-capable
+    // storage. Tenant view doesn't expose the picker (auto-resolved), so
+    // we still need to surface this — otherwise the wizard would let the
+    // user click Next and fail in the backend.
+    const isoBlocker = isIsoMode && !!node && isoStorages.length === 0 ? (
+      <Alert severity="error" variant="outlined" icon={<i className="ri-error-warning-line" style={{ fontSize: 18 }} />}>
+        {t('templates.deploy.iso.noIsoStorage')}
+      </Alert>
+    ) : null
+
+    // Named from the caller's own connection list only: a copy on a cluster
+    // it cannot see stays unnamed.
+    const imageClusterNames = imageOffCluster
+      ? connections.filter(c => imageConnectionIds?.includes(c.id)).map(c => c.name)
+      : []
+    const imageClusterBlocker = imageOffCluster ? (
+      <Alert severity="error" variant="outlined" icon={<i className="ri-error-warning-line" style={{ fontSize: 18 }} />}>
+        {imageClusterNames.length
+          ? t('templates.deploy.target.imageNotOnClusterUse', { clusters: imageClusterNames.join(', ') })
+          : t('templates.deploy.target.imageNotOnCluster')}
+      </Alert>
+    ) : null
+
+    // Tenant-facing target: VM name and an allowed disk storage; infrastructure stays auto-resolved
+    // — except the target vDC itself, which a multi-vDC tenant in the
+    // aggregated view must pick explicitly (precise context hides this,
+    // the header switcher already governs it).
+    if (hideInfra) {
+      return (
+        <Stack spacing={2}>
+          {tenantVdcs.length > 1 && !(readVdcContextCookie() && deployVdcId === readVdcContextCookie()) && (
+            <FormControl size="small" fullWidth>
+              <InputLabel id="tenant-deploy-vdc-label">{t('myVdc.selectVdc')}</InputLabel>
+              <Select
+                labelId="tenant-deploy-vdc-label"
+                value={deployVdcId}
+                label={t('myVdc.selectVdc')}
+                onChange={(e) => setDeployVdcId(String(e.target.value))}
+              >
+                {tenantVdcs.map((v: any) => (
+                  <MenuItem key={v.id} value={v.id}>{v.name}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+          <TextField
+            size="small"
+            fullWidth
+            label={t('templates.deploy.target.vmName')}
+            value={vmName}
+            onChange={e => setVmName(e.target.value)}
+            placeholder={image ? `${image.slug}-${vmid}` : ''}
+            autoFocus
+          />
+          <FormControl size="small" fullWidth required disabled={!node || storagesLoading || loadedStorageContext !== storageContext}>
+            <InputLabel id="tenant-deploy-storage-label">{t('templates.deploy.target.storage')}</InputLabel>
+            <Select
+              labelId="tenant-deploy-storage-label"
+              value={loadedStorageContext === storageContext && visibleStorages.some(s => s.storage === storage) ? storage : ''}
+              label={t('templates.deploy.target.storage')}
+              onChange={e => setStorage(e.target.value)}
+            >
+              {(loadedStorageContext === storageContext ? visibleStorages : []).map(s => {
+                const policy = vdcTiers.find(tier => tier.storageId === s.storage)
+                const remaining: number[] = []
+                if (policy?.quotaMb != null) remaining.push(Math.max(0, policy.quotaMb - (vdcUsedByStorage[s.storage] ?? 0)))
+                if (vdcQuota?.maxStorageMb != null) remaining.push(Math.max(0, vdcQuota.maxStorageMb - (vdcUsage?.usedStorageMb ?? 0)))
+                const quotaLabel = loadedQuotaContext !== quotaContext || !vdcQuota || !vdcUsage
+                  ? t('templates.deploy.target.storageQuotaUnavailable')
+                  : remaining.length
+                    ? t('templates.deploy.target.storageQuotaRemaining', { remaining: (Math.min(...remaining) / 1024).toFixed(1) })
+                    : t('templates.deploy.target.storageQuotaUnlimited')
+                return (
+                  <MenuItem key={s.storage} value={s.storage}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%', flexWrap: 'wrap' }}>
+                      <StorageTypeIcon type={s.type} />
+                      <Typography variant="body2">{s.storage}</Typography>
+                      {(policy?.name || s.policy?.name) && <Chip size="small" label={policy?.name || s.policy?.name} />}
+                      <Typography variant="caption" sx={{ ml: 'auto', color: 'text.secondary' }}>{quotaLabel}</Typography>
+                    </Box>
+                  </MenuItem>
+                )
+              })}
+            </Select>
+          </FormControl>
+          {node && !storagesLoading && loadedStorageContext === storageContext && (storagesError || visibleStorages.length === 0) && (
+            <Alert severity={storagesError ? 'error' : 'warning'} variant="outlined">
+              {t(storagesError ? 'templates.deploy.target.storagesLoadError' : 'templates.deploy.target.noWritableStorage')}
+            </Alert>
+          )}
+          {isoBlocker}
+          {imageClusterBlocker}
+        </Stack>
+      )
+    }
+
+    return (
+    <Stack spacing={2}>
+      {isProvider && providerVdcs.length > 0 && (
+        <FormControl size="small" fullWidth>
+          <InputLabel id="provider-deploy-destination-label">{t('templates.deploy.target.destination')}</InputLabel>
+          <Select
+            labelId="provider-deploy-destination-label"
+            // A non-empty value for the provider option: with '' MUI keeps the
+            // label unshrunk and draws it over the rendered value.
+            value={targetVdc ? targetVdcId : PROVIDER_DESTINATION}
+            label={t('templates.deploy.target.destination')}
+            onChange={e => setTargetVdcId(e.target.value === PROVIDER_DESTINATION ? '' : String(e.target.value))}
+            renderValue={value => {
+              const v = providerVdcs.find((x: any) => x.id === value)
+              return v ? `${v.tenantName} / ${v.name}` : t('templates.deploy.target.destinationProvider')
+            }}
+          >
+            <MenuItem value={PROVIDER_DESTINATION}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box component="i" className="ri-building-line" sx={{ fontSize: 16, opacity: 0.8, display: 'inline-flex' }} />
+                {t('templates.deploy.target.destinationProvider')}
+              </Box>
+            </MenuItem>
+            {providerVdcs.map((v: any) => (
+              <MenuItem key={v.id} value={v.id}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                  <Box component="i" className="ri-cloud-line" sx={{ fontSize: 16, opacity: 0.8, display: 'inline-flex' }} />
+                  <Typography variant="body2">{v.tenantName} / {v.name}</Typography>
+                  <Typography variant="caption" sx={{ opacity: 0.5, ml: 'auto' }}>
+                    {connections.find(c => c.id === v.connectionId)?.name ?? ''}
+                  </Typography>
+                </Box>
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      )}
+      {targetVdc && (
+        <Alert severity="info" variant="outlined" icon={<i className="ri-cloud-line" style={{ fontSize: 18 }} />}>
+          {t('templates.deploy.target.destinationVdcHint', { tenant: targetVdc.tenantName, vdc: targetVdc.name })}
+        </Alert>
+      )}
+      <FormControl size="small" fullWidth required disabled={!!targetVdc}>
+        <InputLabel>{t('templates.deploy.target.connection')}</InputLabel>
+        <Select
+          value={connectionId}
+          onChange={e => { setConnectionId(e.target.value); setNode(''); setStorage(''); setIsoStorage('') }}
+          label={t('templates.deploy.target.connection')}
+        >
+          {connections.map(c => (
+            <MenuItem key={c.id} value={c.id}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                <Box component="i" className="ri-server-line" sx={{ fontSize: 16, opacity: 0.8, display: 'inline-flex' }} />
+                {c.name}
+              </Box>
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+
+      <FormControl size="small" fullWidth required disabled={!connectionId}>
+        <InputLabel>{t('templates.deploy.target.node')}</InputLabel>
+        <Select
+          value={node}
+          onChange={e => { setNode(e.target.value); setStorage(''); setIsoStorage('') }}
+          label={t('templates.deploy.target.node')}
+        >
+          {nodes.map(n => (
+            <MenuItem key={n.node} value={n.node}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                {/* A node is the Proxmox logo with its status dot, as in the
+                    Nodes Status and Guest Map widgets. */}
+                <Box sx={{ position: 'relative', width: 16, height: 16, flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <img
+                    src={theme.palette.mode === 'dark' ? '/images/proxmox-logo-dark.svg' : '/images/proxmox-logo.svg'}
+                    alt=""
+                    width={14}
+                    height={14}
+                    style={{ opacity: n.status === 'online' ? 0.8 : 0.4 }}
+                  />
+                  <Box
+                    sx={{
+                      position: 'absolute',
+                      bottom: -1,
+                      right: -2,
+                      width: 6,
+                      height: 6,
+                      borderRadius: '50%',
+                      bgcolor: nodeStatusColor(n.status),
+                      border: theme => `1px solid ${theme.palette.background.paper}`,
+                    }}
+                  />
+                </Box>
+                <Typography variant="body2">{n.node}</Typography>
+                <Typography variant="caption" sx={{ opacity: 0.5, ml: 'auto' }}>
+                  CPU: {(n.cpu * 100).toFixed(0)}% &middot; RAM: {((n.mem / n.maxmem) * 100).toFixed(0)}%
+                </Typography>
+              </Box>
+            </MenuItem>
+          ))}
+        </Select>
+      </FormControl>
+
+      <FormControl size="small" fullWidth required disabled={!node}>
+        <InputLabel>{t('templates.deploy.target.storage')}</InputLabel>
+        <Select
+          value={storage}
+          onChange={e => setStorage(e.target.value)}
+          label={t('templates.deploy.target.storage')}
+        >
+          {storages.map(s => {
+            // Usage bar and thresholds copied from EditDiskDialog's storage
+            // picker so a storage keeps its colour from one dialog to the next.
+            const usagePct = s.total > 0 ? Math.round(((s.used || 0) / s.total) * 100) : 0
+            const usageColor = usagePct > 90 ? 'error' : usagePct > 75 ? 'warning' : 'primary'
+
+            return (
+              <MenuItem key={s.storage} value={s.storage}>
+                <Box sx={{ width: '100%' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                    <StorageTypeIcon type={s.type} />
+                    <Typography variant="body2">{s.storage}</Typography>
+                    {/* Tier chip, same affordance as AddDiskDialog's storage
+                        picker: the /nodes/{node}/storages payload carries the
+                        governing storage policy for an iaas tenant, so the
+                        deployed disk's QoS caps are visible before the deploy. */}
+                    {s.policy && <Chip size="small" label={s.policy.name} />}
+                    <Typography variant="caption" sx={{ opacity: 0.5, ml: 'auto' }}>
+                      {s.type} &middot; {((s.avail || 0) / 1073741824).toFixed(1)} GB {t('templates.deploy.target.available')}
+                    </Typography>
+                  </Box>
+                  {s.total > 0 && (
+                    <LinearProgress
+                      variant="determinate"
+                      value={usagePct}
+                      color={usageColor}
+                      sx={{ height: 4, borderRadius: 1, mt: 0.5 }}
+                    />
+                  )}
+                </Box>
+              </MenuItem>
+            )
+          })}
+        </Select>
+      </FormControl>
+
+      {node && storages.length === 0 && (
+        <Alert severity="warning" variant="outlined">
+          {t(targetVdc ? 'templates.deploy.target.noWritableStorage' : 'templates.deploy.target.noFileStorage')}
+        </Alert>
+      )}
+
+      {isIsoMode && isoStorages.length > 0 && (
+        <FormControl size="small" fullWidth required disabled={!node}>
+          <InputLabel>{t('templates.deploy.iso.isoStorage')}</InputLabel>
+          <Select
+            value={isoStorage}
+            onChange={e => setIsoStorage(e.target.value)}
+            label={t('templates.deploy.iso.isoStorage')}
+          >
+            {isoStorages.map(s => (
+              <MenuItem key={s.storage} value={s.storage}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+                  <Box component="i" className="ri-disc-line" sx={{ fontSize: 14, opacity: 0.7 }} />
+                  <Typography variant="body2">{s.storage}</Typography>
+                  <Typography variant="caption" sx={{ opacity: 0.5, ml: 'auto' }}>
+                    {s.type} &middot; {((s.avail || 0) / 1073741824).toFixed(1)} GB {t('templates.deploy.target.available')}
+                  </Typography>
+                </Box>
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      )}
+
+      {isoBlocker}
+      {imageClusterBlocker}
+
+      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+        <NumericTextField
+          size="small"
+          label={t('templates.deploy.target.vmid')}
+          type="number"
+          value={vmid}
+          onChange={setVmid}
+          fallback={100}
+          min={100}
+          required
+          slotProps={{ htmlInput: { min: 100 } }}
+        />
+        <TextField
+          size="small"
+          label={t('templates.deploy.target.vmName')}
+          value={vmName}
+          onChange={e => setVmName(e.target.value)}
+          placeholder={image ? `${image.slug}-${vmid}` : ''}
+        />
+      </Box>
+    </Stack>
+    )
+  }
+
+  // Convert "20G" → MB for the quota banner. Falls back to 0 on parse error.
+  const parseDiskSizeMb = (s: string): number => {
+    const m = /^(\d+)\s*([GTM]?)$/i.exec(String(s).trim())
+    if (!m) return 0
+    const n = Number.parseInt(m[1], 10)
+    const unit = m[2].toUpperCase()
+    if (unit === 'T') return n * 1024 * 1024
+    if (unit === 'M') return n
+    return n * 1024
+  }
+
+  // Tier axis of the banner: only the policy governing the SELECTED storage
+  // is relevant, since that is the one the disk will be billed against.
+  // Null (no policy, no quota, no storage picked yet) keeps the tier out of
+  // the banner rather than blocking on a figure we do not have.
+  const selectedTier = (() => {
+    const match = vdcTiers.find(x => x.storageId === storage)
+    if (!match || match.quotaMb == null) return null
+
+    return {
+      name: match.name,
+      used: vdcUsedByStorage[storage] ?? 0,
+      requested: parseDiskSizeMb(diskSize),
+      max: match.quotaMb,
+    }
+  })()
+
+  const renderHardwareStep = () => (
+    <Box>
+      {vdcQuota && vdcUsage && (
+        <VdcQuotaBanner
+          quota={vdcQuota}
+          usage={vdcUsage}
+          requested={{
+            vcpus: cores * sockets,
+            ramMb: memory,
+            storageMb: parseDiskSizeMb(diskSize),
+            vms: 1,
+          }}
+          tier={selectedTier}
+          onStateChange={({ blocked }) => {
+            if (blocked !== quotaBlocked) setQuotaBlocked(blocked)
+          }}
+        />
+      )}
+      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, rowGap: 3 }}>
+      {/* Cores / Memory / Disk — exposed as sliders with log-scale marks
+          so the user picks from sensible quantities (powers of two for
+          RAM, common SKUs for disk) without having to type a free-form
+          number that could land on something PVE later refuses. The
+          sockets / SCSI controller / CPU type knobs stay defaulted (1
+          socket, virtio-scsi-single, host CPU); providers who need to
+          tweak them can still go through the bare-metal CreateVmDialog. */}
+      {(() => {
+        // Cores: linear, with marks on classic VM sizings. The slider
+        // tops out at 32 — the manual override on the right lets users
+        // go beyond when their vDC quota allows it (PVE itself caps at
+        // 128 per VM).
+        const coresMarks = [1, 2, 4, 8, 16, 32]
+        const coresSliderMax = 32
+        return (
+          <Box sx={{ gridColumn: '1 / -1', px: 1.5 }}>
+            <Stack direction="row" alignItems="baseline" spacing={1} sx={{ mb: 0.5 }}>
+              <Box component="i" className="ri-cpu-line" sx={{ fontSize: 15, opacity: 0.7, alignSelf: 'center', display: 'inline-flex' }} />
+              <Typography variant="caption" sx={{ opacity: 0.7, fontWeight: 600 }}>
+                {t('templates.deploy.hardware.cores')}
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                {cores} {cores > 1 ? 'vCPUs' : 'vCPU'}
+              </Typography>
+            </Stack>
+            <Stack direction="row" alignItems="center" spacing={5}>
+              <Box sx={{ flex: 1, pr: 2 }}>
+                <Slider
+                  size="small"
+                  value={Math.min(cores, coresSliderMax)}
+                  min={1}
+                  max={coresSliderMax}
+                  step={1}
+                  onChange={(_, v) => setCores(v as number)}
+                  marks={coresMarks.map(m => ({ value: m, label: String(m) }))}
+                  valueLabelDisplay="auto"
+                  sx={{ '& .MuiSlider-markLabel': { fontSize: '0.7rem' } }}
+                />
+              </Box>
+              <NumericTextField
+                size="small"
+                type="number"
+                value={cores}
+                onChange={setCores}
+                fallback={1}
+                min={1}
+                max={128}
+                slotProps={{ htmlInput: { min: 1, max: 128 } }}
+                sx={{ width: 120 }}
+              />
+            </Stack>
+          </Box>
+        )
+      })()}
+      {(() => {
+        // Memory: log-style picker — marks span 512 MB → 64 GB. The
+        // helpers map a continuous slider position into the canonical
+        // values so users land on round powers of two (with finer
+        // granularity in between if they really want it). Mirrors
+        // CreateVmDialog so the two flows feel consistent.
+        const memoryMarks = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+        const memoryToSlider = (mib: number) => {
+          for (let i = memoryMarks.length - 1; i >= 0; i--) {
+            if (mib >= memoryMarks[i]) {
+              return i + (mib - memoryMarks[i]) / (memoryMarks[Math.min(i + 1, memoryMarks.length - 1)] - memoryMarks[i])
+            }
+          }
+          return 0
+        }
+        const sliderToMemory = (val: number) => {
+          const idx = Math.floor(val)
+          const frac = val - idx
+          if (idx >= memoryMarks.length - 1) return memoryMarks[memoryMarks.length - 1]
+          const raw = memoryMarks[idx] + frac * (memoryMarks[idx + 1] - memoryMarks[idx])
+          return Math.round(raw / 128) * 128 || 128
+        }
+        const formatMem = (mib: number) => mib >= 1024 ? `${(mib / 1024).toFixed(mib % 1024 === 0 ? 0 : 1)} GB` : `${mib} MB`
+        // The slider caps at 64 GiB; the manual override accepts anything
+        // ≥128 MiB so users can go higher if their vDC quota allows.
+        const memorySliderMax = memoryMarks[memoryMarks.length - 1]
+        return (
+          <Box sx={{ gridColumn: '1 / -1', px: 1.5 }}>
+            <Stack direction="row" alignItems="baseline" spacing={1} sx={{ mb: 0.5 }}>
+              <Box component="i" className="ri-ram-line" sx={{ fontSize: 15, opacity: 0.7, alignSelf: 'center', display: 'inline-flex' }} />
+              <Typography variant="caption" sx={{ opacity: 0.7, fontWeight: 600 }}>
+                {t('templates.deploy.hardware.memory')}
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                {formatMem(memory)}
+              </Typography>
+            </Stack>
+            <Stack direction="row" alignItems="center" spacing={5}>
+              <Box sx={{ flex: 1, pr: 2 }}>
+                <Slider
+                  size="small"
+                  value={memoryToSlider(Math.min(memory, memorySliderMax))}
+                  min={0}
+                  max={memoryMarks.length - 1}
+                  step={0.01}
+                  onChange={(_, v) => setMemory(sliderToMemory(v as number))}
+                  marks={memoryMarks.map((m, i) => ({ value: i, label: formatMem(m) }))}
+                  valueLabelDisplay="auto"
+                  valueLabelFormat={() => formatMem(memory)}
+                  sx={{ '& .MuiSlider-markLabel': { fontSize: '0.65rem' } }}
+                />
+              </Box>
+              <NumericTextField
+                size="small"
+                type="number"
+                value={memory}
+                onChange={setMemory}
+                fallback={128}
+                min={128}
+                slotProps={{
+                  htmlInput: { min: 128, step: 128 },
+                  input: { endAdornment: <InputAdornment position="end" sx={{ '& p': { fontSize: 11, opacity: 0.6 } }}>MB</InputAdornment> },
+                }}
+                sx={{ width: 120 }}
+              />
+            </Stack>
+          </Box>
+        )
+      })()}
+      {(() => {
+        // Disk: state stays as the PVE-flavoured string ('20G') so the
+        // existing payload + parseDiskSizeMb keeps working unchanged.
+        // Slider operates in GiB ints; conversions are trivial.
+        const diskMarks = [10, 20, 50, 100, 250, 500, 1000]
+        const parsedDiskGiB = Number.parseInt(String(diskSize).replace(/G$/i, ''), 10)
+        const diskGiB = Math.max(diskMarks[0], parsedDiskGiB || diskMarks[0])
+        // The manual input binds to the parsed size, not to the slider-floored
+        // value and not through a `||` fallback: every number the field can
+        // commit — 0 included — has to survive the round-trip, or the sync
+        // effect rewrites the buffer mid-keystroke ('5' → 10 → '10', or
+        // '0' → 1 → '18' on the next keypress). Only an unparseable size
+        // falls back, and to the same 1 the field commits on blur.
+        const diskGiBTyped = Number.isNaN(parsedDiskGiB) ? 1 : parsedDiskGiB
+        const diskGiBToSlider = (gib: number) => {
+          for (let i = diskMarks.length - 1; i >= 0; i--) {
+            if (gib >= diskMarks[i]) {
+              return i + (gib - diskMarks[i]) / (diskMarks[Math.min(i + 1, diskMarks.length - 1)] - diskMarks[i])
+            }
+          }
+          return 0
+        }
+        const sliderToDiskGiB = (val: number) => {
+          const idx = Math.floor(val)
+          const frac = val - idx
+          if (idx >= diskMarks.length - 1) return diskMarks[diskMarks.length - 1]
+          const raw = diskMarks[idx] + frac * (diskMarks[idx + 1] - diskMarks[idx])
+          // Round to 5 GiB so users land on tidy values.
+          return Math.max(diskMarks[0], Math.round(raw / 5) * 5)
+        }
+        // The slider caps at 1000 GiB; the manual override on the right
+        // accepts anything ≥1 GiB (PVE itself takes much larger volumes).
+        const diskSliderMax = diskMarks[diskMarks.length - 1]
+        return (
+          <Box sx={{ gridColumn: '1 / -1', px: 1.5 }}>
+            <Stack direction="row" alignItems="baseline" spacing={1} sx={{ mb: 0.5 }}>
+              <Box component="i" className="ri-hard-drive-3-line" sx={{ fontSize: 15, opacity: 0.7, alignSelf: 'center', display: 'inline-flex' }} />
+              <Typography variant="caption" sx={{ opacity: 0.7, fontWeight: 600 }}>
+                {t('templates.deploy.hardware.diskSize')}
+              </Typography>
+              <Typography variant="body2" sx={{ fontWeight: 700 }}>
+                {diskGiB} GB
+              </Typography>
+            </Stack>
+            <Stack direction="row" alignItems="center" spacing={5}>
+              <Box sx={{ flex: 1, pr: 2 }}>
+                <Slider
+                  size="small"
+                  value={diskGiBToSlider(Math.min(diskGiB, diskSliderMax))}
+                  min={0}
+                  max={diskMarks.length - 1}
+                  step={0.01}
+                  onChange={(_, v) => setDiskSize(`${sliderToDiskGiB(v as number)}G`)}
+                  marks={diskMarks.map((m, i) => ({ value: i, label: `${m} GB` }))}
+                  valueLabelDisplay="auto"
+                  valueLabelFormat={() => `${diskGiB} GB`}
+                  sx={{ '& .MuiSlider-markLabel': { fontSize: '0.65rem' } }}
+                />
+              </Box>
+              <NumericTextField
+                size="small"
+                type="number"
+                value={diskGiBTyped}
+                onChange={n => setDiskSize(`${n}G`)}
+                fallback={1}
+                min={1}
+                slotProps={{
+                  htmlInput: { min: 1, step: 1 },
+                  input: { endAdornment: <InputAdornment position="end" sx={{ '& p': { fontSize: 11, opacity: 0.6 } }}>GB</InputAdornment> },
+                }}
+                sx={{ width: 120 }}
+              />
+            </Stack>
+          </Box>
+        )
+      })()}
+      {/* Bridge picker.
+          - vDC tenant: restricted to SDN VNets. Shared bridges and raw PVE
+            bridges are hidden — deployments land on a tenant VNet so traffic
+            stays inside the vDC's L2 domain (VXLAN VNI). Each option surfaces
+            the VNet's subnet (CIDR + gateway) when configured. The picker
+            spans full-width and the VLAN Tag field is dropped (tenant) or
+            shown disabled (super-admin parity case below).
+          - full cluster view (provider / MSP): lists the whole `bridges`
+            list — VNets first (keeping their shield icon + subnet chips),
+            then raw bridges / shared uplinks rendered the CreateVmDialog way
+            (iface name + a type tag). On a raw bridge the VLAN field is
+            editable; on a VNet it stays disabled like before. */}
+      {(() => {
+        // VNets float to the top so the friendly tenant-scoped entries stay
+        // discoverable; raw bridges follow. Natural order within each group
+        // on the shown name (#195).
+        const tenantChoices = orderDeployBridges(bridges, false)
+        const ordered = fullClusterNet ? orderDeployBridges(bridges, true) : tenantChoices
+        const selectValue = fullClusterNet
+          ? (bridges.some(b => b.iface === networkBridge) ? networkBridge : '')
+          : (tenantChoices.some(b => b.iface === networkBridge) ? networkBridge : (tenantChoices[0]?.iface || ''))
+        return (
+          <BridgePicker
+            options={ordered.map(deployBridgeOption)}
+            value={selectValue}
+            onChange={setNetworkBridge}
+            label={t('templates.deploy.hardware.bridge')}
+            noOptionsText={t(fullClusterNet ? 'templates.deploy.hardware.bridgeNoneAvailable' : 'templates.deploy.hardware.bridgeNoVnet')}
+            sx={hideInfra && bridges.find(b => b.iface === networkBridge)?.type !== 'shared' ? { gridColumn: '1 / -1' } : undefined}
+          />
+        )
+      })()}
+      {/* VLAN Tag field.
+          - vDC tenant on a VNet: hidden (picker spans full-width).
+          - vDC tenant on a shared bridge: editable, server validates
+            against the vDC VLAN pools.
+          - super-admin on a vDC connection (!hideInfra, !fullClusterNet):
+            disabled field for parity with CreateVmDialog (VNet-only here).
+          - full cluster view: editable when a raw bridge is selected,
+            disabled (with the same VNet tooltip) when a VNet is selected. */}
+      {(() => {
+        const sel = bridges.find(b => b.iface === networkBridge)
+        const isSharedBridge = sel?.type === 'shared'
+        if (hideInfra && !isSharedBridge) return null
+        const vlanDisabled = !canEditVlan || (!fullClusterNet && !isSharedBridge) || sel?.type === 'vnet'
+        const ranges = isSharedBridge && sel?.vlanRanges?.length ? sel.vlanRanges : null
+        const rangeLabel = ranges ? ranges.map(([s, e]) => s === e ? String(s) : `${s}-${e}`).join(', ') : null
+        return (
+          <Tooltip
+            arrow
+            placement="top"
+            title={!canEditVlan ? t('hardware.nicVlanPermissionRequired') : vlanDisabled ? t('templates.deploy.hardware.vlanDisabledOnVnetTooltip') : ''}
+          >
+            <span>
+              <TextField
+                size="small"
+                label={t('templates.deploy.hardware.vlan')}
+                type="number"
+                value={vlanDisabled ? '' : vlanTag}
+                onChange={e => setVlanTag(e.target.value)}
+                placeholder={vlanDisabled ? t('templates.deploy.hardware.vlanDisabledOnVnet') : rangeLabel ? rangeLabel : t('templates.deploy.hardware.vlanPlaceholder')}
+                slotProps={{ htmlInput: { min: 1, max: 4094 } }}
+                disabled={vlanDisabled}
+                helperText={!canEditVlan ? t('hardware.nicVlanPermissionRequired') : vlanDisabled ? t('templates.deploy.hardware.vlanDisabledOnVnetHelp') : rangeLabel ? t('templates.deploy.hardware.vlanPoolHint', { ranges: rangeLabel }) : isSharedBridge ? t('templates.deploy.hardware.vlanNoPool') : undefined}
+                fullWidth
+              />
+            </span>
+          </Tooltip>
+        )
+      })()}
+      <FormControlLabel
+        control={<Switch checked={agent} onChange={(_, v) => setAgent(v)} size="small" />}
+        label={t('templates.deploy.hardware.qemuAgent')}
+        sx={{ gridColumn: 'span 2' }}
+      />
+      </Box>
+
+      {/* Firmware and display (#181). ISO installs keep their OS type
+          override and the Windows disk-size check; machine stays q35 there
+          (server-side). Disk images expose machine and display too, since
+          a template-derived image must boot with its template's settings. */}
+      <Box sx={{ mt: 2 }}>
+        {/* mb + the grid's pt: the floating label of the first select sits 9px above it. */}
+        <Typography variant="overline" sx={{ opacity: 0.6, display: 'block', mb: 1 }}>
+          {isIsoMode ? t('templates.deploy.iso.installOptions') : t('templates.deploy.firmware.title')}
+        </Typography>
+        {!isIsoMode && hintsApplied && (
+          <Alert severity="info" variant="outlined" sx={{ mb: 2.5 }} icon={<i className="ri-file-copy-2-line" style={{ fontSize: 18 }} />}>
+            {t('templates.deploy.firmware.fromTemplate')}
+          </Alert>
+        )}
+        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, pt: 2 }}>
+          {isIsoMode && (
+            <FormControl size="small">
+              <InputLabel id="deploy-fw-ostype-label">{t('templates.catalog.ostypeLabel')}</InputLabel>
+              <Select
+                value={ostypeOverride || image?.ostype || 'other'}
+                onChange={e => setOstypeOverride(String(e.target.value))}
+                label={t('templates.catalog.ostypeLabel')}
+                labelId="deploy-fw-ostype-label"
+              >
+                <MenuItem value="l26">Linux 2.6+</MenuItem>
+                <MenuItem value="win10">Windows 10</MenuItem>
+                <MenuItem value="win11">Windows 11 / Server 2022+</MenuItem>
+                <MenuItem value="w2k19">Windows Server 2019</MenuItem>
+                <MenuItem value="w2k16">Windows Server 2016</MenuItem>
+                <MenuItem value="other">Other</MenuItem>
+              </Select>
+            </FormControl>
+          )}
+          <FormControl size="small">
+            <InputLabel id="deploy-fw-bios-label">{t('templates.deploy.iso.bios')}</InputLabel>
+            <Select
+              value={bios}
+              onChange={e => setBios(e.target.value as DeployBios)}
+              label={t('templates.deploy.iso.bios')}
+              labelId="deploy-fw-bios-label"
+            >
+              <MenuItem value="seabios">{t('templates.deploy.iso.biosSeabios')}</MenuItem>
+              <MenuItem value="ovmf">{t('templates.deploy.iso.biosOvmf')}</MenuItem>
+            </Select>
+          </FormControl>
+          {!isIsoMode && (
+            <FormControl size="small">
+              <InputLabel id="deploy-fw-machine-label">{t('templates.deploy.firmware.machine')}</InputLabel>
+              <Select
+                value={machine}
+                onChange={e => setMachine(e.target.value as DeployMachine)}
+                label={t('templates.deploy.firmware.machine')}
+                labelId="deploy-fw-machine-label"
+              >
+                <MenuItem value="i440fx">{t('templates.deploy.firmware.machineI440fx')}</MenuItem>
+                <MenuItem value="q35">{t('templates.deploy.firmware.machineQ35')}</MenuItem>
+              </Select>
+            </FormControl>
+          )}
+          <FormControl size="small">
+            <InputLabel id="deploy-fw-bus-label">{t('templates.deploy.firmware.diskBus')}</InputLabel>
+            <Select
+              value={diskBus}
+              onChange={e => setDiskBus(e.target.value as DeployDiskBus)}
+              label={t('templates.deploy.firmware.diskBus')}
+              labelId="deploy-fw-bus-label"
+            >
+              <MenuItem value="scsi">{t('templates.deploy.firmware.busScsi')}</MenuItem>
+              <MenuItem value="sata">{t('templates.deploy.firmware.busSata')}</MenuItem>
+              <MenuItem value="virtio">{t('templates.deploy.firmware.busVirtio')}</MenuItem>
+              <MenuItem value="ide">{t('templates.deploy.firmware.busIde')}</MenuItem>
+            </Select>
+          </FormControl>
+          {!isIsoMode && (
+            <FormControl size="small">
+              <InputLabel id="deploy-fw-display-label">{t('templates.deploy.firmware.display')}</InputLabel>
+              <Select
+                value={vga}
+                onChange={e => setVga(e.target.value as DeployDisplay)}
+                label={t('templates.deploy.firmware.display')}
+                labelId="deploy-fw-display-label"
+              >
+                <MenuItem value="std">{t('templates.deploy.firmware.displayStd')}</MenuItem>
+                <MenuItem value="serial0">{t('templates.deploy.firmware.displaySerial')}</MenuItem>
+                <MenuItem value="qxl">{t('templates.deploy.firmware.displayQxl')}</MenuItem>
+                <MenuItem value="virtio">{t('templates.deploy.firmware.displayVirtio')}</MenuItem>
+                <MenuItem value="vmware">{t('templates.deploy.firmware.displayVmware')}</MenuItem>
+              </Select>
+            </FormControl>
+          )}
+          <FormControlLabel
+            control={<Switch checked={tpm} onChange={(_, v) => setTpm(v)} size="small" />}
+            label={t('templates.deploy.firmware.tpm')}
+          />
+        </Box>
+        {!isIsoMode && vga === 'serial0' && (
+          <Alert severity="warning" variant="outlined" sx={{ mt: 1.5 }} icon={<i className="ri-terminal-box-line" style={{ fontSize: 18 }} />}>
+            {t('templates.deploy.firmware.serialWarning')}
+          </Alert>
+        )}
+        {isUefiWindowsOstype(isIsoMode ? (ostypeOverride || image?.ostype) : image?.ostype) && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+            {t('templates.deploy.firmware.windowsHint')}
+          </Typography>
+        )}
+        {/* Windows Server 2025 / Win11 install footprint won't fit in
+            <32 GB — the installer refuses to start, so we block Next
+            and flag this as an error rather than a soft warning. */}
+        {isIsoMode && (() => {
+          const sizeNum = Number.parseInt(String(diskSize).replace(/G$/i, ''), 10) || 0
+          const ot = ostypeOverride || image?.ostype || ''
+          const isWin2025OrLater = ot === 'win11'
+          return (isWin2025OrLater && sizeNum > 0 && sizeNum < 32) ? (
+            <Alert severity="error" variant="outlined" sx={{ mt: 1.5 }} icon={<i className="ri-error-warning-line" style={{ fontSize: 18 }} />}>
+              {t('templates.deploy.iso.diskWarning')}
+            </Alert>
+          ) : null
+        })()}
+      </Box>
+
+      {/* High availability at creation (#181), provider with node.manage. */}
+      {canManageHa && (
+        <Box sx={{ mt: 2 }}>
+          <FormControlLabel
+            control={<Switch checked={ha && haStorageShared} onChange={(_, v) => setHa(v)} size="small" disabled={!haStorageShared} />}
+            label={
+              <Box>
+                <Typography variant="body2">{t('templates.deploy.ha.label')}</Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {!haStorageShared
+                    ? t('templates.deploy.ha.localStorage')
+                    : isIsoMode ? t('templates.deploy.ha.helpIso') : t('templates.deploy.ha.help')}
+                </Typography>
+              </Box>
+            }
+          />
+        </Box>
+      )}
+
+      {/* ISO + IPAM-managed VNet → tenant must commit to a static (IP, MAC).
+          Cloud-init can't push ipconfigN to a raw OS installer, so we
+          pre-generate a MAC, propose the next free IP, and surface a
+          banner instructing the tenant to type these into the OS at
+          install time. */}
+      {isoNeedsReservation && isoBridgeChoice?.subnet && (
+        <IsoNetworkReservation
+          ip={staticIp}
+          mac={staticMac}
+          subnet={{
+            cidr: isoBridgeChoice.subnet.cidr,
+            gateway: isoBridgeChoice.subnet.gateway,
+            dnsServers: isoBridgeChoice.subnet.dnsServers,
+          }}
+          loading={reservationLoading}
+          error={reservationError}
+          onIpChange={setStaticIp}
+          onMacChange={setStaticMac}
+          onAutoPick={(which) => fetchNextFree(which)}
+        />
+      )}
+    </Box>
+  )
+
+  const renderCloudInitStep = () => {
+    // The CloudInit step is now subnet-aware: when the chosen VNet has an
+    // IPAM-managed subnet (always the case in this wizard since we restrict
+    // the bridge picker to VNets), we surface the subnet's CIDR + gateway
+    // as read-only context and turn the "IP" field into an *override only*
+    // — empty means "let IPAM auto-allocate". Gateway is no longer typed
+    // by hand because it must match the subnet, otherwise the route would
+    // never come up.
+    const selectedBridge = bridges.find(b => b.iface === networkBridge)
+    const subnet = selectedBridge?.subnet ?? null
+    // Validate the optional override IP: must be IPv4-shaped and not equal
+    // to the gateway. Range bounds are enforced server-side by IPAM, but
+    // this catch-22 ("user typed gateway as VM IP") is worth flagging in
+    // the UI before submit.
+    const ipOverrideValid = !ipOverride
+      || (/^\d{1,3}(\.\d{1,3}){3}$/.test(ipOverride) && ipOverride !== subnet?.gateway)
+    // No-subnet manual entry: the IP must carry a CIDR (no subnet to derive a
+    // prefix from); the gateway is optional. Both IPv4-shaped. DHCP needs none.
+    const manualIpCidrValid = !manualIpCidr
+      || /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(manualIpCidr.trim())
+    const manualGatewayValid = !manualGateway
+      || /^\d{1,3}(\.\d{1,3}){3}$/.test(manualGateway.trim())
+
+    // Pre-fill nameserver from the subnet's DNS servers the first time the
+    // user lands on this step with a subnet attached and hasn't typed
+    // anything yet. We don't overwrite an explicit value.
+    if (subnet && !nameserver && subnet.dnsServers.length > 0) {
+      // Defer the setState to avoid mutating during render.
+      queueMicrotask(() => {
+        if (!nameserver) setNameserver(subnet.dnsServers.join(' '))
+      })
+    }
+
+    return (
+    <Stack spacing={2}>
+      <TextField
+        size="small"
+        label={t('templates.deploy.cloudInit.user')}
+        value={ciuser}
+        onChange={e => setCiuser(e.target.value)}
+        placeholder="ubuntu"
+        fullWidth
+      />
+      <TextField
+        size="small"
+        label={t('templates.deploy.cloudInit.password')}
+        value={cipassword}
+        onChange={e => setCipassword(e.target.value)}
+        type="password"
+        fullWidth
+        placeholder={t('templates.deploy.cloudInit.passwordPlaceholder')}
+      />
+      <TextField
+        size="small"
+        label={t('templates.deploy.cloudInit.sshKeys')}
+        value={sshKeys}
+        onChange={e => setSshKeys(e.target.value)}
+        multiline
+        rows={3}
+        fullWidth
+        placeholder="ssh-ed25519 AAAA... user@host"
+      />
+      {/* Subnet context + IP override. Gateway is read-only (must match
+          the subnet). Empty IP = "auto-allocate from IPAM" — the most
+          common case. */}
+      {subnet && (
+        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+          <TextField
+            size="small"
+            label={t('templates.deploy.cloudInit.ipAddress')}
+            value={ipOverride}
+            onChange={e => setIpOverride(e.target.value.trim())}
+            placeholder={t('templates.deploy.cloudInit.ipAutoFromCidr', { cidr: subnet.cidr })}
+            error={!!ipOverride && !ipOverrideValid}
+            helperText={
+              !!ipOverride && !ipOverrideValid
+                ? t('templates.deploy.cloudInit.ipInvalid')
+                : t('templates.deploy.cloudInit.ipAutoHelp')
+            }
+            fullWidth
+          />
+          <TextField
+            size="small"
+            label={t('templates.deploy.cloudInit.gateway')}
+            value={subnet.gateway}
+            InputProps={{ readOnly: true }}
+            helperText={t('templates.deploy.cloudInit.gatewayFromSubnet')}
+            fullWidth
+          />
+        </Box>
+      )}
+      {/* No IPAM subnet on the bridge: the user configures the address by
+          hand. DHCP toggle, else a static IP/CIDR + an editable gateway. */}
+      {!subnet && (
+        <Stack spacing={2}>
+          <FormControlLabel
+            control={<Switch checked={useDhcp} onChange={(_, v) => setUseDhcp(v)} size="small" />}
+            label={t('templates.deploy.cloudInit.useDhcp')}
+          />
+          {!useDhcp && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+              <TextField
+                size="small"
+                label={t('templates.deploy.cloudInit.ipCidr')}
+                value={manualIpCidr}
+                onChange={e => setManualIpCidr(e.target.value.trim())}
+                placeholder="10.0.1.4/25"
+                error={!manualIpCidrValid}
+                helperText={!manualIpCidrValid
+                  ? t('templates.deploy.cloudInit.ipCidrInvalid')
+                  : t('templates.deploy.cloudInit.ipCidrHelp')}
+                fullWidth
+              />
+              <TextField
+                size="small"
+                label={t('templates.deploy.cloudInit.gateway')}
+                value={manualGateway}
+                onChange={e => setManualGateway(e.target.value.trim())}
+                placeholder="10.0.1.253"
+                error={!manualGatewayValid}
+                helperText={!manualGatewayValid
+                  ? t('templates.deploy.cloudInit.gatewayInvalid')
+                  : t('templates.deploy.cloudInit.gatewayManualHelp')}
+                fullWidth
+              />
+            </Box>
+          )}
+        </Stack>
+      )}
+      <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+        <TextField
+          size="small"
+          label={t('templates.deploy.cloudInit.nameserver')}
+          value={nameserver}
+          onChange={e => setNameserver(e.target.value)}
+          placeholder="1.1.1.1"
+        />
+        <TextField
+          size="small"
+          label={t('templates.deploy.cloudInit.searchdomain')}
+          value={searchdomain}
+          onChange={e => setSearchdomain(e.target.value)}
+          placeholder="local.lan"
+        />
+      </Box>
+    </Stack>
+    )
+  }
+
+  const renderReviewStep = () => {
+    if (!image) return null
+
+    const selectedConn = connections.find(c => c.id === connectionId)
+    // Tenant: show the vDC name, not the raw connection name it maps to.
+    const selectedVdc = hideInfra ? tenantVdcs.find((v: any) => v.id === deployVdcId) : undefined
+
+    return (
+      <Stack spacing={2}>
+        {isIsoMode && (
+          <Alert severity="info" icon={<i className="ri-disc-line" style={{ fontSize: 18 }} />}>
+            {t('templates.deploy.iso.reviewAlert')}
+          </Alert>
+        )}
+
+        {/* Image */}
+        <Box>
+          <Typography variant="overline" sx={{ opacity: 0.6 }}>{t('templates.deploy.steps.image')}</Typography>
+          <Typography variant="body2">{image.name}</Typography>
+        </Box>
+        <Divider />
+
+        {/* Target */}
+        <Box>
+          <Typography variant="overline" sx={{ opacity: 0.6 }}>{t('templates.deploy.steps.target')}</Typography>
+          {isProvider && providerVdcs.length > 0 && (
+            <Typography variant="body2">
+              {t('templates.deploy.target.destination')}: {targetVdc ? `${targetVdc.tenantName} / ${targetVdc.name}` : t('templates.deploy.target.destinationProvider')}
+            </Typography>
+          )}
+          <Typography variant="body2">
+            {selectedVdc ? selectedVdc.name : selectedConn?.name} &rarr; {node} &rarr; {storage}
+            {isIsoMode && isoStorage && <> &middot; ISO: {isoStorage}</>}
+          </Typography>
+          <Typography variant="body2">
+            VMID: {vmid} {vmName && `(${vmName})`}
+          </Typography>
+        </Box>
+        <Divider />
+
+        {/* Hardware */}
+        <Box>
+          <Typography variant="overline" sx={{ opacity: 0.6 }}>{t('templates.deploy.steps.hardware')}</Typography>
+          <Typography variant="body2">
+            {cores}C &times; {sockets}S / {memory >= 1024 ? `${memory / 1024} GB` : `${memory} MB`} RAM / {diskSize} / {bridges.find(b => b.iface === networkBridge)?.displayName || networkBridge}
+            {' '}&middot; {bios === 'ovmf' ? 'UEFI' : 'BIOS'} &middot; {isIsoMode ? 'q35' : machine}{tpm ? ' · TPM' : ''} &middot; {diskBus.toUpperCase()}
+            {isIsoMode && <> &middot; {ostypeOverride || image.ostype}</>}
+            {canManageHa && ha && haStorageShared && <> &middot; HA</>}
+          </Typography>
+        </Box>
+        <Divider />
+
+        {/* Cloud-Init — only relevant for cloud-image deployments. ISO
+            installs hide this section: the field is meaningless and we
+            already alerted the user above. */}
+        {!isIsoMode && (
+          <>
+            <Box>
+              <Typography variant="overline" sx={{ opacity: 0.6 }}>{t('templates.deploy.steps.cloudInit')}</Typography>
+              <Typography variant="body2">
+                {ciuser ? `${t('templates.deploy.cloudInit.user')}: ${ciuser}` : t('templates.deploy.cloudInit.noUser')}
+                {cipassword ? ` · ${t('templates.deploy.cloudInit.password')}: ••••••` : ''}
+                {' · '}
+                {(() => {
+                  const sel = bridges.find(b => b.iface === networkBridge)
+                  if (sel?.subnet) {
+                    return ipOverride
+                      ? `${t('templates.deploy.cloudInit.ipAddress')}: ${ipOverride}`
+                      : t('templates.deploy.cloudInit.ipAutoSummary')
+                  }
+                  if (useDhcp) return t('templates.deploy.cloudInit.dhcpSummary')
+                  if (manualIpCidr) {
+                    return `${t('templates.deploy.cloudInit.ipAddress')}: ${manualIpCidr}${manualGateway ? `, gw ${manualGateway}` : ''}`
+                  }
+                  return t('templates.deploy.cloudInit.ipAutoSummary')
+                })()}
+              </Typography>
+              {sshKeys && (
+                <Typography variant="caption" sx={{ opacity: 0.6 }}>
+                  {sshKeys.split('\n').filter(Boolean).length} SSH key(s)
+                </Typography>
+              )}
+            </Box>
+            <Divider />
+          </>
+        )}
+
+        {/* Save as blueprint option */}
+        <FormControlLabel
+          control={<Switch checked={saveAsBlueprint} onChange={(_, v) => setSaveAsBlueprint(v)} size="small" />}
+          label={t('templates.deploy.review.saveBlueprint')}
+        />
+        {saveAsBlueprint && (
+          <TextField
+            size="small"
+            label={t('templates.deploy.review.blueprintName')}
+            value={blueprintName}
+            onChange={e => setBlueprintName(e.target.value)}
+            fullWidth
+            placeholder={image.name}
+          />
+        )}
+        {deployError && (
+          <Alert severity="error">{deployError}</Alert>
+        )}
+      </Stack>
+    )
+  }
+
+  const renderProgressStep = () => {
+    if (deploymentId) {
+      // Console link surfaces only for completed ISO deployments — the
+      // VM is sitting at the boot prompt waiting for the user to drive
+      // the OS installer through noVNC. Cloud-image deployments boot
+      // unattended and don't need this affordance.
+      const consoleHref = (isIsoMode && !deploying && !deployError && connectionId)
+        ? `/novnc/console.html?connId=${encodeURIComponent(connectionId)}&type=qemu&node=${encodeURIComponent(node)}&vmid=${encodeURIComponent(String(vmid))}`
+        : null
+      return (
+        <>
+          <DeploymentProgress deploymentId={deploymentId} onComplete={handleDeployComplete} />
+          {consoleHref && (
+            <Alert
+              severity="success"
+              icon={<i className="ri-disc-line" style={{ fontSize: 18 }} />}
+              sx={{ mt: 2 }}
+              action={
+                <Button
+                  size="small"
+                  variant="contained"
+                  color="success"
+                  onClick={() => window.open(consoleHref, `console-${vmid}`, 'width=1024,height=768,resizable,scrollbars')}
+                  startIcon={<i className="ri-computer-line" style={{ fontSize: 16 }} />}
+                >
+                  {t('templates.deploy.iso.openConsole')}
+                </Button>
+              }
+            >
+              {t('templates.deploy.iso.completedHint')}
+            </Alert>
+          )}
+        </>
+      )
+    }
+
+    if (deployError) {
+      return (
+        <Alert severity="error" sx={{ mt: 2 }}>
+          {deployError}
+        </Alert>
+      )
+    }
+
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+        <CircularProgress />
+      </Box>
+    )
+  }
+
+  // No useMemo here — the previous version's deps array silently went
+  // out of date every time we added a piece of step state (staticIp,
+  // staticMac, reservationLoading, …), which froze the active step's
+  // JSX on a stale closure and made controlled inputs un-typeable. The
+  // render functions are cheap (just JSX construction); React's normal
+  // reconciliation handles the per-render cost just fine.
+  let stepContent: ReactNode = null
+  switch (activeStep) {
+    case 0: stepContent = renderImageStep(); break
+    case 1: stepContent = renderTargetStep(); break
+    case 2: stepContent = renderHardwareStep(); break
+    case 3: stepContent = renderCloudInitStep(); break
+    case 4: stepContent = renderReviewStep(); break
+    case 5: stepContent = renderProgressStep(); break
+  }
+
+  const isProgressStep = activeStep === 5
+  // Minimize is only meaningful while a deploy is in flight — at that
+  // point the pipeline runs server-side independently of the dialog.
+  // Closing the wizard via the minimize button leaves the deployment
+  // visible in the navbar TasksDropdown for follow-up.
+  const canMinimize = isProgressStep && deploying && !!deploymentId
+
+  return (
+    <Dialog open={open} onClose={isProgressStep && deploying ? undefined : onClose} maxWidth="md" fullWidth>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className="ri-rocket-2-line" style={{ fontSize: 22 }} />
+        {t('templates.deploy.title')}
+        {canMinimize && (
+          <Box sx={{ ml: 'auto' }}>
+            <Tooltip title={t('templates.deploy.progress.minimize')}>
+              <IconButton size="small" onClick={onClose} aria-label="minimize">
+                <i className="ri-subtract-line" style={{ fontSize: 20 }} />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        )}
+      </DialogTitle>
+
+      <DialogContent>
+        <Stepper
+          activeStep={isIsoMode && activeStep > 3 ? activeStep - 1 : activeStep}
+          sx={{ mt: 3, mb: 3 }}
+          alternativeLabel
+        >
+          {STEP_LABELS
+            .filter(label => !isIsoMode || label !== 'templates.deploy.steps.cloudInit')
+            .map(label => (
+              <Step key={label}>
+                <StepLabel>{t(label as any)}</StepLabel>
+              </Step>
+            ))}
+        </Stepper>
+
+        <Box sx={{ minHeight: 300 }}>
+          {stepContent}
+        </Box>
+      </DialogContent>
+
+      {!isProgressStep && (
+        <DialogActions>
+          <Button onClick={onClose}>{t('common.cancel')}</Button>
+          <Box sx={{ flex: 1 }} />
+          {activeStep > 0 && (
+            <Button onClick={handleBack}>{t('common.back')}</Button>
+          )}
+          {activeStep < 4 ? (
+            <Button variant="contained" onClick={handleNext} disabled={!canProceed}>
+              {t('common.next')}
+            </Button>
+          ) : (
+            <Button
+              variant="contained"
+              color="success"
+              onClick={handleDeploy}
+              disabled={deploying || !canProceed}
+              startIcon={deploying ? <CircularProgress size={18} /> : <i className="ri-rocket-2-line" style={{ fontSize: 16 }} />}
+            >
+              {t('templates.deploy.review.deployNow')}
+            </Button>
+          )}
+        </DialogActions>
+      )}
+
+      {isProgressStep && !deploying && (
+        <DialogActions>
+          <Button variant="contained" onClick={onClose}>
+            {deployError ? t('common.close') : t('common.done')}
+          </Button>
+        </DialogActions>
+      )}
+    </Dialog>
+  )
+}

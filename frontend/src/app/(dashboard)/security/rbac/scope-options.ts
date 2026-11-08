@@ -1,0 +1,241 @@
+// Build the selectable scope targets for a given scope type from the live
+// inventory payload (/api/v1/inventory). Shared by the assignment dialogs and
+// the role default-scope editor so the extraction logic lives in one place
+// (issue #383). `t` provides the count sublabels; pass a passthrough in tests.
+
+export type ScopeOption = {
+  id: string
+  label: string
+  sublabel?: string
+  icon?: string
+  status?: string
+}
+
+/**
+ * Pool name -> number of guests it holds, over the whole inventory payload.
+ *
+ * The declared pools of every cluster are seeded at zero FIRST: a pool holding
+ * no guest is named by no guest, so deriving the list from `guest.pool` alone
+ * made empty pools impossible to grant as a scope (issue #978). `cluster.pools`
+ * is absent from an inventory payload older than that fix, and the function
+ * then degrades to the guest-derived list it used to return.
+ */
+export function collectPoolCounts(inventory: any): Map<string, number> {
+  const poolMap = new Map<string, number>()
+
+  inventory?.clusters?.forEach((c: any) => {
+    c.pools?.forEach((p: any) => {
+      if (p?.poolid) poolMap.set(p.poolid, poolMap.get(p.poolid) || 0)
+    })
+  })
+
+  inventory?.clusters?.forEach((c: any) => {
+    c.nodes?.forEach((n: any) => {
+      n.guests?.forEach((g: any) => {
+        if (g.pool) poolMap.set(g.pool, (poolMap.get(g.pool) || 0) + 1)
+      })
+    })
+  })
+
+  return poolMap
+}
+
+export function buildScopeOptions(inventory: any, scopeType: string, t: any): ScopeOption[] {
+  if (!inventory?.clusters) return []
+
+  switch (scopeType) {
+    case 'connection':
+      return inventory.clusters.map((c: any) => ({
+        id: c.id,
+        label: c.name,
+        sublabel: t('rbacPage.nodeCount', { count: c.nodes?.length || 0 }),
+        icon: 'ri-server-line',
+        status: c.status,
+      }))
+
+    case 'node': {
+      const nodes: ScopeOption[] = []
+      inventory.clusters.forEach((c: any) => {
+        c.nodes?.forEach((n: any) => {
+          nodes.push({
+            id: `${c.id}:${n.node}`,
+            label: n.node,
+            sublabel: c.name,
+            icon: 'ri-computer-line',
+            status: n.status,
+          })
+        })
+      })
+      return nodes
+    }
+
+    case 'vm': {
+      const vms: ScopeOption[] = []
+      inventory.clusters.forEach((c: any) => {
+        c.nodes?.forEach((n: any) => {
+          n.guests?.forEach((g: any) => {
+            vms.push({
+              id: `${c.id}:${n.node}:${g.type}:${g.vmid}`,
+              label: g.name || `${g.type}/${g.vmid}`,
+              sublabel: `${String(g.type).toUpperCase()} ${g.vmid} • ${n.node} • ${c.name}`,
+              icon: g.type === 'lxc' ? 'ri-box-3-line' : 'ri-instance-line',
+              status: g.status,
+            })
+          })
+        })
+      })
+      return vms
+    }
+
+    case 'tag': {
+      const tagMap = new Map<string, number>()
+      inventory.clusters.forEach((c: any) => {
+        c.nodes?.forEach((n: any) => {
+          n.guests?.forEach((g: any) => {
+            const tags = typeof g.tags === 'string'
+              ? g.tags.split(/[;,]/).map((s: string) => s.trim()).filter(Boolean)
+              : []
+            tags.forEach((tag: string) => tagMap.set(tag, (tagMap.get(tag) || 0) + 1))
+          })
+        })
+      })
+      return Array.from(tagMap.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([tag, count]) => ({
+          id: tag,
+          label: tag,
+          sublabel: t('rbacPage.tagUsedByVms', { count }),
+          icon: 'ri-price-tag-3-line',
+        }))
+    }
+
+    case 'pool': {
+      return Array.from(collectPoolCounts(inventory).entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([pool, count]) => ({
+          id: pool,
+          label: pool,
+          sublabel: t('rbacPage.poolContainsVms', { count }),
+          icon: 'ri-folder-shared-line',
+        }))
+    }
+
+    case 'storage':
+      return buildStorageScopeOptions(inventory.storages, inventory.clusters)
+
+    default:
+      return []
+  }
+}
+
+/**
+ * One option per (connection, storage) from the `/api/v1/storage` rows the
+ * dialogs attach to the inventory as `storages` (issue #921). The inventory
+ * payload itself carries no storage, so without that list the type offers
+ * nothing. The id is the scope target the server matches: `connId:storage`.
+ */
+export function buildStorageScopeOptions(
+  storages: Array<{ connId: string; connName?: string; storage: string; type?: string; shared?: boolean }> | null | undefined,
+  clusters: Array<{ id: string; name?: string }> | null | undefined,
+): ScopeOption[] {
+  if (!Array.isArray(storages)) return []
+  const connName = new Map((clusters ?? []).map(c => [c.id, c.name]))
+  const seen = new Set<string>()
+  const options: ScopeOption[] = []
+
+  for (const s of storages) {
+    if (!s?.connId || !s.storage) continue
+    const id = `${s.connId}:${s.storage}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    const cluster = connName.get(s.connId) || s.connName || s.connId
+    options.push({
+      id,
+      label: s.storage,
+      sublabel: [s.type, cluster].filter(Boolean).join(' · '),
+      icon: s.type === 'pbs' ? 'ri-shield-check-line' : 'ri-hard-drive-3-line',
+    })
+  }
+
+  return options.sort((a, b) => a.label.localeCompare(b.label) || a.sublabel!.localeCompare(b.sublabel!))
+}
+
+/**
+ * "vDC" scope options (UI sugar — design §3.8b): one option per vDC of the
+ * targeted tenant, whose id IS the vDC's pvePoolName. The dialog stores the
+ * assignment as scope_type='pool' + that pool name: enforcement, inventory
+ * visibility and deleteVdc cleanup are the existing pool path, unchanged.
+ * Unlike the inventory-derived pool options, a vDC with zero VMs is listed.
+ */
+export function buildVdcScopeOptions(
+  vdcs: Array<{ tenantId: string; pvePoolName: string; name: string; enabled?: boolean }>,
+  tenantId: string,
+): Array<{ id: string; label: string; sublabel: string; icon: string }> {
+  return vdcs
+    .filter((v) => v.tenantId === tenantId && v.enabled !== false)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((v) => ({
+      id: v.pvePoolName,
+      label: v.name,
+      sublabel: v.pvePoolName,
+      icon: 'ri-cloud-line',
+    }))
+}
+
+/** pvePoolName → vDC display name, for rendering pool targets as "vDC: <name>". */
+export function buildVdcNameByPool(
+  vdcs: Array<{ pvePoolName: string; name: string }>,
+): Map<string, string> {
+  return new Map(vdcs.map((v) => [v.pvePoolName, v.name]))
+}
+
+/**
+ * Resolve a stored scope target back to its human-readable label (issue #383).
+ * connection/node/vm targets are opaque ids, so they are looked up in the live
+ * inventory; tag/pool targets are already the display name. Falls back to the
+ * raw target when the inventory has not loaded yet or the resource is gone.
+ */
+export function resolveScopeTargetLabel(
+  inventory: any,
+  scopeType: string,
+  target: string,
+  t: any = () => '',
+): string {
+  const match = buildScopeOptions(inventory, scopeType, t).find(o => o.id === target)
+
+  return match?.label ?? target
+}
+
+/**
+ * Compact, human-readable label for a stored scope target using only a
+ * connection id -> name map (issue #383). Lighter than {@link
+ * resolveScopeTargetLabel}: it needs no full inventory, so callers that only
+ * list connections (e.g. the role cards) can still turn the opaque connection
+ * id into its name. node/vm composite ids are formatted from their own parts;
+ * tag/pool/global/inherit targets are already display-ready.
+ */
+export function formatScopeTarget(
+  connNames: Record<string, string> | Map<string, string>,
+  scopeType: string,
+  target: string,
+): string {
+  const conn = (id: string) =>
+    (connNames instanceof Map ? connNames.get(id) : connNames?.[id]) || id
+  const parts = target.split(':')
+
+  switch (scopeType) {
+    case 'connection':
+      return conn(target)
+    case 'node':
+      // "connId:node" -> "node · ConnectionName"
+      return parts.length >= 2 ? `${parts[1]} · ${conn(parts[0])}` : target
+    case 'vm':
+      // "connId:node:type:vmid" -> "type/vmid · node"
+      return parts.length >= 4 ? `${parts[2]}/${parts[3]} · ${parts[1]}` : target
+    case 'storage':
+      // "connId:storage" -> "storage · ConnectionName"
+      return parts.length >= 2 ? `${parts[1]} · ${conn(parts[0])}` : target
+    default:
+      return target
+  }
+}

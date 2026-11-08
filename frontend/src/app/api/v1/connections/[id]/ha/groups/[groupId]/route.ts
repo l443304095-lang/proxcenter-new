@@ -1,0 +1,143 @@
+import { NextResponse } from "next/server"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+import { denyIaasTenant } from "@/lib/tenant/iaasGuard"
+
+export const runtime = "nodejs"
+
+// GET /api/v1/connections/{id}/ha/groups/{groupId}
+// Récupère un groupe HA spécifique
+async function getHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; groupId: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  try {
+    const { id, groupId } = await ctx.params
+
+    // Vérifier la permission de voir la connexion
+    const permError = await checkPermission(PERMISSIONS.CONNECTION_VIEW, "connection", id)
+
+    if (permError) return permError
+
+    const conn = await getConnectionById(id)
+
+    const group = await pveFetch<any>(conn, `/cluster/ha/groups/${encodeURIComponent(groupId)}`)
+
+    return NextResponse.json({ data: group })
+  } catch (e: any) {
+    if (e?.message?.includes('404') || e?.message?.includes('does not exist')) {
+      return NextResponse.json({ error: 'HA group not found' }, { status: 404 })
+    }
+
+    console.error('Error fetching HA group:', e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// PUT /api/v1/connections/{id}/ha/groups/{groupId}
+// Met à jour un groupe HA
+async function putHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; groupId: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  try {
+    const { id, groupId } = await ctx.params
+
+    // Vérifier la permission de gérer la connexion
+    const permError = await checkPermission(PERMISSIONS.CONNECTION_MANAGE, "connection", id)
+
+    if (permError) return permError
+
+    const conn = await getConnectionById(id)
+    const body = await req.json()
+
+    // Construire les paramètres
+    const params = new URLSearchParams()
+    
+    if (body.nodes) {
+      params.append('nodes', body.nodes)
+    }
+
+    if (body.restricted !== undefined) {
+      params.append('restricted', body.restricted ? '1' : '0')
+    }
+
+    if (body.nofailback !== undefined) {
+      params.append('nofailback', body.nofailback ? '1' : '0')
+    }
+
+    if (body.comment !== undefined) {
+      params.append('comment', body.comment)
+    }
+
+
+    // Pour supprimer un champ, on utilise 'delete'
+    if (body.delete) {
+      params.append('delete', body.delete)
+    }
+
+    const result = await pveFetch<any>(conn, `/cluster/ha/groups/${encodeURIComponent(groupId)}`, {
+      method: 'PUT',
+      body: params.toString(),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    })
+
+    return NextResponse.json({ 
+      data: result,
+      message: 'HA group updated'
+    })
+  } catch (e: any) {
+    console.error('Error updating HA group:', e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+// DELETE /api/v1/connections/{id}/ha/groups/{groupId}
+// Supprime un groupe HA
+async function deleteHandler(
+  req: Request,
+  ctx: { params: Promise<{ id: string; groupId: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  try {
+    const { id, groupId } = await ctx.params
+
+    // Vérifier la permission de gérer la connexion
+    const permError = await checkPermission(PERMISSIONS.CONNECTION_MANAGE, "connection", id)
+
+    if (permError) return permError
+
+    const conn = await getConnectionById(id)
+
+    await pveFetch<any>(conn, `/cluster/ha/groups/${encodeURIComponent(groupId)}`, {
+      method: 'DELETE'
+    })
+
+    return NextResponse.json({ 
+      data: null,
+      message: 'HA group deleted'
+    })
+  } catch (e: any) {
+    console.error('Error deleting HA group:', e)
+    
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const GET = withPublicApiGuard("ha-group-get", getHandler)
+export const PUT = withAudit({ category: "ha", resourceType: "group", resourceParam: "groupId" }, withPublicApiGuard("ha-group-update", putHandler))
+export const DELETE = withAudit({ category: "ha", resourceType: "group", resourceParam: "groupId" }, withPublicApiGuard("ha-group-delete", deleteHandler))

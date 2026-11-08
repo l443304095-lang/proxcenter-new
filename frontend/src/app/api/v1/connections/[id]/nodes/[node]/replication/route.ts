@@ -1,0 +1,315 @@
+import { NextResponse } from "next/server"
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { guardSessionGuest, isVmid, replicationJobVmid, sessionGuestVisibility } from "@/lib/vdc/guestGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+import { denyIaasTenant } from "@/lib/tenant/iaasGuard"
+
+export const runtime = "nodejs"
+
+// GET - Liste les jobs de réplication avec infos complémentaires
+export async function GET(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  const { id, node } = await ctx.params
+
+  const denied = await checkPermission(PERMISSIONS.NODE_VIEW, "connection", id)
+  if (denied) return denied
+  const url = new URL(req.url)
+  const guest = url.searchParams.get('guest')
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  // A vDC session only sees the jobs, and the guest selector entries, of its own guests.
+  const scoped = await sessionGuestVisibility({ connectionId: id, conn })
+  if (!scoped.ok) return scoped.response
+  const visible = scoped.visibility
+
+  try {
+    // Récupérer tous les jobs de réplication du nœud
+    const jobs = (await pveFetch<any[]>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/replication`
+    ) || []).filter((j: any) => visible.has(null, j.guest))
+
+    // Filtrer par guest si spécifié
+    const filteredJobs = guest
+      ? jobs.filter((j: any) => String(j.guest) === String(guest))
+      : jobs
+
+    // Récupérer la liste des nodes pour le target
+    const nodes = await pveFetch<any[]>(conn, '/nodes', { method: "GET" }).catch(() => [])
+    
+    // Récupérer la liste des VMs/CTs pour le sélecteur
+    const vms = await pveFetch<any[]>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/qemu`,
+      { method: "GET" }
+    ).catch(() => [])
+    
+    const cts = await pveFetch<any[]>(
+      conn,
+      `/nodes/${encodeURIComponent(node)}/lxc`,
+      { method: "GET" }
+    ).catch(() => [])
+
+    // Formater les jobs
+    const formattedJobs = filteredJobs.map((job: any) => ({
+      id: job.id,
+      type: job.type,
+      guest: job.guest,
+      target: job.target,
+      schedule: job.schedule,
+      rate: job.rate,
+      comment: job.comment,
+      enabled: job.disable !== 1,
+      // Status info
+      lastSync: job.last_sync,
+      lastTry: job.last_try,
+      nextSync: job.next_sync,
+      duration: job.duration,
+      failCount: job.fail_count,
+      error: job.error,
+      state: job.fail_count > 0 ? 'error' : (job.last_sync ? 'ok' : 'unknown'),
+    }))
+
+    return NextResponse.json({ 
+      data: {
+        jobs: formattedJobs,
+        nodes: Array.isArray(nodes) ? nodes.map((n: any) => ({ 
+          node: n.node, 
+          status: n.status,
+          online: n.status === 'online'
+        })).filter((n: any) => n.node !== node) : [],
+        guests: [
+          ...((Array.isArray(vms) ? vms : []).filter((vm: any) => visible.has('qemu', vm.vmid)).map((vm: any) => ({
+            vmid: vm.vmid,
+            name: vm.name,
+            type: 'qemu',
+            status: vm.status
+          }))),
+          ...((Array.isArray(cts) ? cts : []).filter((ct: any) => visible.has('lxc', ct.vmid)).map((ct: any) => ({
+            vmid: ct.vmid,
+            name: ct.name,
+            type: 'lxc',
+            status: ct.status
+          })))
+        ].sort((a, b) => a.vmid - b.vmid)
+      }
+    })
+  } catch (error: any) {
+    console.error(`Error fetching replication jobs:`, error)
+    return NextResponse.json({ 
+      error: error.message || "Failed to fetch replication jobs",
+      data: { jobs: [], nodes: [], guests: [] }
+    }, { status: 500 })
+  }
+}
+
+// POST - Créer un nouveau job de réplication
+async function handlePost(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  const { id } = await ctx.params
+
+  const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", id)
+  if (denied) return denied
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  try {
+    const body = await req.json()
+    const { guest, target, schedule, rate, comment, enabled } = body
+
+    if (!guest || !target) {
+      return NextResponse.json({ error: "guest and target are required" }, { status: 400 })
+    }
+    const guestVmid = String(guest)
+    if (!isVmid(guestVmid)) {
+      return NextResponse.json({ error: "Invalid guest vmid" }, { status: 400 })
+    }
+
+    // A vDC session only replicates guests of its own pools (any type, any vDC node).
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type: null, node: null, vmid: guestVmid })
+    if (scopeDenied) return scopeDenied
+
+    // Trouver un numéro de job disponible pour ce guest
+    // Format de l'ID: vmid-jobnum (ex: 100-0, 100-1, etc.)
+    const existingJobs = await pveFetch<any[]>(conn, '/cluster/replication').catch(() => [])
+    let jobNum = 0
+    if (Array.isArray(existingJobs)) {
+      const guestJobs = existingJobs.filter((j: any) => String(j.guest) === String(guest))
+      if (guestJobs.length > 0) {
+        const usedNums = guestJobs.map((j: any) => {
+          const parts = String(j.id).split('-')
+          return Number.parseInt(parts[1] || '0')
+        })
+        jobNum = Math.max(...usedNums) + 1
+      }
+    }
+
+    // Construire les paramètres pour l'API Proxmox
+    const params: Record<string, string> = {
+      id: `${guest}-${jobNum}`,
+      target,
+      type: 'local',
+    }
+
+    if (schedule) params.schedule = schedule
+    if (rate) params.rate = String(rate)
+    if (comment) params.comment = comment
+    if (enabled === false) params.disable = '1'
+
+    // Créer le job de réplication via l'API cluster
+    const result = await pveFetch(
+      conn,
+      `/cluster/replication`,
+      {
+        method: 'POST',
+        body: new URLSearchParams(params),
+      }
+    )
+
+    return NextResponse.json({ data: result, success: true })
+  } catch (error: any) {
+    console.error(`Error creating replication job:`, error)
+    return NextResponse.json({ 
+      error: error.message || "Failed to create replication job"
+    }, { status: 500 })
+  }
+}
+
+// PUT - Modifier un job de réplication existant
+async function handlePut(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  const { id } = await ctx.params
+
+  const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", id)
+  if (denied) return denied
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  try {
+    const body = await req.json()
+    const { jobId, schedule, rate, comment, enabled } = body
+
+    if (!jobId) {
+      return NextResponse.json({ error: "jobId is required" }, { status: 400 })
+    }
+    // PVE job ids are <vmid>-<n>: the guest the job replicates is right there.
+    const jobVmid = replicationJobVmid(jobId)
+    if (!jobVmid) {
+      return NextResponse.json({ error: "Invalid jobId" }, { status: 400 })
+    }
+    const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type: null, node: null, vmid: jobVmid })
+    if (scopeDenied) return scopeDenied
+
+    // Construire les paramètres
+    // Une valeur vide efface l'option côté Proxmox (paramètre `delete`).
+    const params: Record<string, string> = {}
+    const toDelete: string[] = []
+    if (schedule !== undefined) params.schedule = schedule
+    if (rate !== undefined) {
+      if (rate === '' || rate === null) toDelete.push('rate')
+      else params.rate = String(rate)
+    }
+    if (comment !== undefined) {
+      if (comment === '' || comment === null) toDelete.push('comment')
+      else params.comment = comment
+    }
+    if (enabled !== undefined) params.disable = enabled ? '0' : '1'
+    if (toDelete.length > 0) params.delete = toDelete.join(',')
+
+    // Modifier le job via l'API cluster
+    await pveFetch(
+      conn,
+      `/cluster/replication/${encodeURIComponent(jobId)}`,
+      {
+        method: 'PUT',
+        body: new URLSearchParams(params),
+      }
+    )
+
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    console.error(`Error updating replication job:`, String(error?.message || error).replace(/[\r\n]/g, ''))
+    return NextResponse.json({ 
+      error: error.message || "Failed to update replication job"
+    }, { status: 500 })
+  }
+}
+
+// DELETE - Supprimer un job de réplication
+async function handleDelete(
+  req: Request,
+  ctx: { params: Promise<{ id: string; node: string }> }
+) {
+  const iaasDenied = await denyIaasTenant()
+  if (iaasDenied) return iaasDenied
+
+  const { id } = await ctx.params
+
+  const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", id)
+  if (denied) return denied
+
+  const url = new URL(req.url)
+  const jobId = url.searchParams.get('jobId')
+
+  if (!jobId) {
+    return NextResponse.json({ error: "jobId is required" }, { status: 400 })
+  }
+  const jobVmid = replicationJobVmid(jobId)
+  if (!jobVmid) {
+    return NextResponse.json({ error: "Invalid jobId" }, { status: 400 })
+  }
+
+  const conn = await getConnectionById(id)
+  if (!conn) {
+    return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+  }
+
+  const scopeDenied = await guardSessionGuest({ connectionId: id, conn, type: null, node: null, vmid: jobVmid })
+  if (scopeDenied) return scopeDenied
+
+  try {
+    await pveFetch(
+      conn,
+      `/cluster/replication/${encodeURIComponent(jobId)}`,
+      { method: 'DELETE' }
+    )
+
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    console.error(`Error deleting replication job:`, String(error?.message || error).replace(/[\r\n]/g, ''))
+    return NextResponse.json({ 
+      error: error.message || "Failed to delete replication job"
+    }, { status: 500 })
+  }
+}
+
+export const POST = withAudit({ category: "replication", resourceType: "node", resourceParam: "node" }, handlePost)
+export const PUT = withAudit({ category: "replication", resourceType: "node", resourceParam: "node" }, handlePut)
+export const DELETE = withAudit({ category: "replication", resourceType: "node", resourceParam: "node" }, handleDelete)

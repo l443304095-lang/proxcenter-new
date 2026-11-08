@@ -1,0 +1,2275 @@
+'use client'
+
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import type { ReactNode } from 'react'
+
+import { useLocale, useTranslations } from 'next-intl'
+
+import { formatDateTime, getDateLocale } from '@/lib/i18n/date'
+import { useTenant } from '@/contexts/TenantContext'
+import { Features, useLicense } from '@/contexts/LicenseContext'
+import RestoreDrillsTab from '@/components/backup/restoreDrills/RestoreDrillsTab'
+import NumericTextField from '@/components/ui/NumericTextField'
+import BackupSchedulePicker from './BackupSchedulePicker'
+import { useSWRFetch } from '@/hooks/useSWRFetch'
+import { formatDurationSec, runStatusChip, runsPollIntervalMs } from '@/lib/backups/runDisplay'
+import type { BackupRunsResult } from '@/lib/backups/vzdumpRunsService'
+import BackupPoolSelect from '@/components/backup/BackupPoolSelect'
+import BackupJobRunsDrawer from './BackupJobRunsDrawer'
+
+import {
+  Alert,
+  Autocomplete,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Collapse,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputLabel,
+  LinearProgress,
+  MenuItem,
+  Select,
+  Skeleton,
+  Stack,
+  Switch,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+  Typography,
+  useTheme
+} from '@mui/material'
+import { DataGrid } from '@mui/x-data-grid'
+import type { GridColDef, GridRenderCellParams } from '@mui/x-data-grid'
+
+/* -----------------------------
+  Types
+------------------------------ */
+
+type Translate = ReturnType<typeof useTranslations>
+
+interface Connection { id: string; name?: string; host?: string }
+
+/** A vzdump job as GET /connections/:id/backup-jobs lists it. */
+interface PveJob {
+  id: string
+  enabled: boolean
+  storage?: string
+  schedule?: string
+  node?: string | null
+  mode?: string
+  compress?: string
+  selectionMode?: string
+  pool?: string | null
+  vmids?: string[]
+  excludedVmids?: string[]
+  comment?: string
+  mailto?: string
+  mailnotification?: string
+  maxfiles?: number
+  namespace?: string | null
+  nextRun?: number | null
+}
+
+/** The PVE job dialog, also the body of its POST and PUT. */
+interface PveJobForm {
+  enabled: boolean
+  storage: string
+  schedule: string
+  node: string
+  mode: string
+  compress: string
+  selectionMode: string
+  pool: string
+  vmids: string[]
+  excludedVmids: string[]
+  comment: string
+  mailto: string
+  mailnotification: string
+  maxfiles: number
+}
+
+interface BackupStorage { id: string; name: string; type: string; isPbs?: boolean; namespace?: string; datastore?: string }
+interface PveNode { node: string }
+interface GuestOption { vmid: number; name: string; type: string; node: string; status: string }
+interface PveResource { vmid: number; name: string; type: string; node: string; status: string }
+interface PvePool { poolid: string; comment?: string | null }
+interface TenantPool { vdcId: string; vdcName: string; poolName: string; namespace: string; datastore: string }
+
+interface VdcRow {
+  id: string
+  name: string
+  connectionId?: string
+  connection_id?: string
+  pvePoolName?: string
+  pve_pool_name?: string
+  pbsBindings?: Array<{ namespace?: string; datastore?: string }>
+}
+
+/** A job creation asked from the coverage card (roadmap#48). */
+export interface CreateJobRequest { connId: string; vmid: number | string; nonce: number }
+
+/** A restore drill started from the backups list. */
+export interface DrillRequest { nonce: number }
+
+interface RunsDrawerState { key: string; focusUpid: string | null }
+
+type PbsJobType = 'sync' | 'verify' | 'prune' | 'gc' | 'tape'
+
+/** A PBS job as GET /pbs/:id/jobs lists it, every type in one shape. */
+interface PbsJob {
+  id: string
+  type: PbsJobType
+  enabled?: boolean
+  store?: string
+  datastore?: string
+  ns?: string
+  schedule?: string
+  comment?: string
+  remote?: string
+  remoteStore?: string
+  remoteNs?: string
+  removeVanished?: boolean
+  ignoreVerified?: boolean
+  outdatedAfter?: number
+  keepLast?: number
+  keepDaily?: number
+  keepWeekly?: number
+  keepMonthly?: number
+  keepYearly?: number
+  pool?: string
+  drive?: string
+  ejectMedia?: boolean
+  exportMediaSet?: boolean
+  latestOnly?: boolean
+  lastRunState?: string
+  lastRunEndtime?: string | number
+  nextRun?: string | number
+}
+
+type PbsJobLists = Record<'all' | PbsJobType, PbsJob[] | undefined>
+
+interface PbsStats {
+  total?: number
+  byType?: Partial<Record<PbsJobType, number>>
+  lastRunStates?: { ok?: number; error?: number; warning?: number }
+}
+
+/** The PBS job dialog, also the body of its POST and PUT. */
+interface PbsJobForm {
+  id: string
+  store: string
+  ns: string
+  schedule: string
+  comment: string
+  remote: string
+  remoteStore: string
+  remoteNs: string
+  removeVanished: boolean
+  ignoreVerified: boolean
+  outdatedAfter: number
+  keepLast: number
+  keepDaily: number
+  keepWeekly: number
+  keepMonthly: number
+  keepYearly: number
+  pool: string
+  drive: string
+  ejectMedia: boolean
+  exportMediaSet: boolean
+  latestOnly: boolean
+}
+
+type PbsDialogType = 'sync' | 'verify' | 'prune' | 'tape'
+
+const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : '')
+
+/* -----------------------------
+  Helpers
+------------------------------ */
+
+// PBS namespaces as storage.cfg writes them: '' is the root namespace.
+const normNamespace = (ns: unknown): string => {
+  if (typeof ns !== 'string') return ''
+  const trimmed = ns.trim()
+  let start = 0
+  let end = trimmed.length
+  while (start < end && trimmed[start] === '/') start++
+  while (end > start && trimmed[end - 1] === '/') end--
+
+  return trimmed.slice(start, end)
+}
+
+const MODE_CHIP_COLOR: Record<string, 'success' | 'warning'> = { snapshot: 'success', suspend: 'warning' }
+
+// Save and delete: sync, verify and tape jobs have their own endpoint, the others are prune jobs.
+const pbsJobEndpoint = (type: string): string => (['sync', 'verify', 'tape'].includes(type) ? type : 'prune')
+
+// Run now: garbage collection runs too.
+const pbsRunEndpoint = (type: string): string => (['sync', 'verify', 'prune', 'tape'].includes(type) ? type : 'gc')
+
+const formatSelection = (job: PveJob, t: Translate): string => {
+  if (job.selectionMode === 'all') {
+    const excluded = job.excludedVmids?.length ?? 0
+
+    return excluded > 0 ? t('backups.allExcept', { count: excluded }) : t('backups.allVms')
+  }
+  if (job.selectionMode === 'include') return t('backups.vmCount', { count: job.vmids?.length || 0 })
+  if (job.selectionMode === 'pool') return t('backups.pool', { name: job.pool ?? '' })
+
+  return '—'
+}
+
+// The vDCs of the tenant on a connection, with the PBS namespace of their binding.
+async function fetchTenantPools(connectionId: string): Promise<TenantPool[] | null> {
+  const res = await fetch('/api/v1/vdcs', { cache: 'no-store' })
+  if (!res.ok) return null
+  const json = await res.json()
+  const list: VdcRow[] = Array.isArray(json?.data) ? json.data : []
+
+  return list
+    .filter(v => (v.connectionId || v.connection_id) === connectionId)
+    .map(v => {
+      const binding = Array.isArray(v.pbsBindings) ? v.pbsBindings[0] : null
+      return {
+        vdcId: v.id,
+        vdcName: v.name,
+        poolName: v.pvePoolName || v.pve_pool_name || '',
+        namespace: binding?.namespace || '',
+        datastore: binding?.datastore || '',
+      }
+    })
+    .filter(p => !!p.poolName)
+}
+
+interface DeleteJobDialogProps {
+  open: boolean
+  deleting: boolean
+  title: string
+  message: string
+  onClose: () => void
+  onConfirm: () => void
+  children?: ReactNode
+}
+
+function DeleteJobDialog({ open, deleting, title, message, onClose, onConfirm, children }: Readonly<DeleteJobDialogProps>) {
+  const theme = useTheme()
+  const t = useTranslations()
+
+  return (
+    <Dialog open={open} onClose={() => !deleting && onClose()} maxWidth="xs" fullWidth>
+      <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <i className="ri-error-warning-line" style={{ fontSize: 24, color: theme.palette.error.main }} />
+        {title}
+      </DialogTitle>
+      <DialogContent>
+        <Typography>{message}</Typography>
+        {children && <Box sx={{ mt: 2, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>{children}</Box>}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} disabled={deleting}>{t('common.cancel')}</Button>
+        <Button
+          variant="contained"
+          color="error"
+          onClick={onConfirm}
+          disabled={deleting}
+          startIcon={deleting ? <CircularProgress size={16} /> : <i className="ri-delete-bin-line" />}
+        >
+          {t('common.delete')}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+
+const formatDate = (dateStr: string | number | null | undefined, locale: string): string => {
+  if (!dateStr) return '—'
+  const date = new Date(dateStr)
+
+
+return date.toLocaleString(locale, {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  })
+}
+
+const JobTypeChip = ({ type }: Readonly<{ type: string }>) => {
+  const configs: Record<string, { color: string; label: string; bg: string }> = {
+    sync: { color: '#2196F3', label: 'Sync', bg: 'rgba(33, 150, 243, 0.15)' },
+    verify: { color: '#4CAF50', label: 'Verify', bg: 'rgba(76, 175, 80, 0.15)' },
+    prune: { color: '#FF9800', label: 'Prune', bg: 'rgba(255, 152, 0, 0.15)' },
+    gc: { color: '#9C27B0', label: 'GC', bg: 'rgba(156, 39, 176, 0.15)' },
+    tape: { color: '#795548', label: 'Tape', bg: 'rgba(121, 85, 72, 0.15)' }
+  }
+  
+  const config = configs[type] || { color: '#757575', label: type?.toUpperCase() || '?', bg: 'rgba(117, 117, 117, 0.15)' }
+  
+  return (
+    <Chip 
+      size="small" 
+      label={config.label}
+      sx={{ 
+        bgcolor: config.bg, 
+        color: config.color,
+        fontWeight: 600,
+        fontSize: '0.7rem',
+        height: 22
+      }}
+    />
+  )
+}
+
+const StatusChip = ({ state, t }: Readonly<{ state?: string; t?: Translate }>) => {
+  if (!state) return <Chip size="small" label="N/A" variant="outlined" sx={{ opacity: 0.5 }} />
+
+  const stateUpper = String(state).toUpperCase()
+
+  if (stateUpper === 'OK') {
+    return <Chip size="small" color="success" label={t ? t('backups.ok') : 'OK'} />
+  }
+
+  if (stateUpper === 'ERROR') {
+    return <Chip size="small" color="error" label={t ? t('backups.error') : 'Error'} />
+  }
+
+  if (stateUpper === 'WARNING') {
+    return <Chip size="small" color="warning" label="Warning" />
+  }
+
+  if (stateUpper === 'RUNNING') {
+    return <Chip size="small" color="info" label={t ? t('backups.running') : 'Running'} icon={<CircularProgress size={12} />} />
+  }
+
+  return <Chip size="small" label={state} variant="outlined" />
+}
+
+/* -----------------------------
+  PVE Backup Jobs Tab
+------------------------------ */
+
+const MANUAL_RUNS_KEY = '__manual__'
+
+interface PveJobsTabProps {
+  pveConnections?: Connection[]
+  isVdcTenant?: boolean
+  createRequest?: CreateJobRequest | null
+  onJobsChanged?: () => void
+}
+
+function PveJobsTab({ pveConnections = [], isVdcTenant = false, createRequest = null, onJobsChanged }: Readonly<PveJobsTabProps>) {
+  const t = useTranslations()
+  const locale = useLocale()
+
+  const [selectedConnection, setSelectedConnection] = useState('')
+  const [jobs, setJobs] = useState<PveJob[]>([])
+  const [storages, setStorages] = useState<BackupStorage[]>([])
+  const [nodes, setNodes] = useState<PveNode[]>([])
+  const [vms, setVms] = useState<GuestOption[]>([])
+  // Tenant mode: list the pools (= one per vDC) the user is allowed to
+  // back up. The job-create dialog locks selectionMode='pool' for them
+  // and lets them pick from this list.
+  const [tenantPools, setTenantPools] = useState<TenantPool[]>([])
+  // Provider mode: the cluster's resource pools, so a job can target a
+  // pool the way Proxmox does (issue #746).
+  const [pools, setPools] = useState<PvePool[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // Connection whose jobs, storages and nodes are the ones in state: a job
+  // creation asked from the coverage card waits for it (roadmap#48).
+  const [loadedConnection, setLoadedConnection] = useState('')
+  const handledCreateRef = useRef<number | null>(null)
+  
+  // Dialog
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [dialogMode, setDialogMode] = useState<'create' | 'edit'>('create')
+  const [editingJob, setEditingJob] = useState<PveJob | null>(null)
+  const [saving, setSaving] = useState(false)
+  
+  // Delete dialog
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [jobToDelete, setJobToDelete] = useState<PveJob | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  
+  // Form state. Tenants always run in pool mode (cf. backend guard in
+  // lib/vdc/backupJobs.ts) — the dropdown is hidden and `pool` carries
+  // the chosen vDC pool name.
+  const [formData, setFormData] = useState<PveJobForm>({
+    enabled: true,
+    storage: '',
+    schedule: '00:00',
+    node: '',
+    mode: 'snapshot',
+    compress: 'zstd',
+    selectionMode: isVdcTenant ? 'pool' : 'all',
+    pool: '',
+    vmids: [],
+    excludedVmids: [],
+    comment: '',
+    mailto: '',
+    mailnotification: 'always',
+    maxfiles: 1,
+  })
+  // vDC tenant: the PBS namespace of its binding when no PBS storage of this
+  // connection writes to it (the namespace is a storage property, a job
+  // cannot carry one), so the dialog says so instead of saving.
+  const [missingNamespaceStorage, setMissingNamespaceStorage] = useState<string | null>(null)
+
+  // Run history (#1003): loaded apart from the jobs so the table never waits on it.
+  const [runsDrawer, setRunsDrawer] = useState<RunsDrawerState | null>(null) // key: jobId | MANUAL_RUNS_KEY
+  const runsUrl = selectedConnection
+    ? `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs/runs`
+    : null
+  // Poll fast while a run is in progress or a Run now has not shown up yet.
+  // The key stays the same across polls (the server cache is short while a
+  // task runs), so the table and the drawer stay on screen between them.
+  const awaitedUpid = runsDrawer?.focusUpid ?? null
+  const runsRefreshInterval = useCallback((json?: { data?: BackupRunsResult }) => runsPollIntervalMs(json?.data, awaitedUpid), [awaitedUpid])
+  const { data: runsJson, isLoading: runsLoading, error: runsError, mutate: reloadRuns } = useSWRFetch<{ data?: BackupRunsResult }>(runsUrl, {
+    refreshInterval: runsRefreshInterval,
+  })
+  const runsData = runsJson?.data
+  const runsByJob = useMemo(() => new Map((runsData?.jobs || []).map(j => [j.jobId, j])), [runsData])
+
+  const drawerRuns = useMemo(() => {
+    if (!runsDrawer) return []
+    const runs = runsDrawer.key === MANUAL_RUNS_KEY ? runsData?.manual?.runs : runsByJob.get(runsDrawer.key)?.runs
+
+    return runs || []
+  }, [runsDrawer, runsData, runsByJob])
+
+  const loadJobs = useCallback(async () => {
+    if (!selectedConnection) return
+    
+    setLoading(true)
+    setError(null)
+    
+    try {
+      const res = await fetch(`/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs`)
+      const json = await res.json()
+      
+      if (json.error) {
+        setError(json.error)
+      } else {
+        setJobs(json.data?.jobs || [])
+
+        // Utiliser allBackupStorages pour avoir tous les storages qui supportent backup
+        setStorages(json.data?.allBackupStorages || json.data?.storages || [])
+        setNodes(json.data?.nodes || [])
+        setLoadedConnection(selectedConnection)
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('errors.loadingError'))
+    } finally {
+      setLoading(false)
+    }
+  }, [selectedConnection, t])
+
+  const loadVms = useCallback(async () => {
+    if (!selectedConnection) return
+    
+    try {
+      const res = await fetch(`/api/v1/connections/${encodeURIComponent(selectedConnection)}/resources?type=vm`)
+      const json = await res.json()
+      
+      if (!json.error) {
+        const allVms = ((json.data || []) as PveResource[]).filter(r => r.type === 'qemu' || r.type === 'lxc')
+
+        setVms(allVms.map(vm => ({
+          vmid: vm.vmid,
+          name: vm.name,
+          type: vm.type,
+          node: vm.node,
+          status: vm.status
+        })))
+      }
+    } catch (e) {
+      console.error('Error loading VMs:', e)
+    }
+  }, [selectedConnection])
+
+  const loadPools = useCallback(async () => {
+    // Tenants pick a vDC instead, which carries its own pool (tenantPools).
+    if (!selectedConnection || isVdcTenant) {
+      setPools([])
+
+      return
+    }
+
+    try {
+      const res = await fetch(`/api/v1/connections/${encodeURIComponent(selectedConnection)}/pools`)
+      const json = await res.json()
+
+      if (!json.error) {
+        setPools(((json.data || []) as PvePool[]).filter(p => !!p?.poolid))
+      }
+    } catch (e) {
+      console.error('Error loading pools:', e)
+    }
+  }, [selectedConnection, isVdcTenant])
+
+  useEffect(() => {
+    if (selectedConnection) {
+      void loadJobs()
+      void loadVms()
+      void loadPools()
+    }
+  }, [selectedConnection, loadJobs, loadVms, loadPools])
+
+  useEffect(() => {
+    if (pveConnections.length > 0 && !selectedConnection) {
+      setSelectedConnection(pveConnections[0].id)
+    }
+  }, [pveConnections, selectedConnection])
+
+  // Tenant mode: load the vDC list scoped to the selected connection.
+  // We pull the PBS binding's namespace alongside the pool so the
+  // job-create dialog can auto-fill every PBS-side field (storage,
+  // namespace) and the PVE pool from a single "vDC" pick.
+  // The DB now enforces 1 vDC per (tenant, connection) — the N>1 branch
+  // below is pure defense against legacy rows.
+  useEffect(() => {
+    if (!isVdcTenant || !selectedConnection) { setTenantPools([]); return }
+    let cancelled = false
+    fetchTenantPools(selectedConnection)
+      .then(onConn => {
+        if (cancelled || !onConn) return
+        if (onConn.length > 1) {
+          // Defensive against legacy rows only — the DB enforces
+          // 1 vDC per (tenant, connection). Warn but don't fail — pick [0].
+          console.warn(`[BackupJobsTabs] tenant has ${onConn.length} vDCs on connection ${selectedConnection}; using "${onConn[0].vdcName}".`)
+        }
+        setTenantPools(onConn)
+      })
+      .catch(() => { /* ignore */ })
+    return () => { cancelled = true }
+  }, [isVdcTenant, selectedConnection])
+
+  // The pool of the job being edited may not be in the fetched list yet
+  // (still loading, or a pool outside the caller's RBAC perimeter), and a
+  // Select whose value has no option silently shows blank, which would
+  // then be saved back as an empty pool. Keep it as an option.
+  const poolOptions = useMemo(() => {
+    const options = pools.map(p => ({ poolid: p.poolid, comment: p.comment || null }))
+
+    if (formData.pool && !options.some(p => p.poolid === formData.pool)) {
+      options.unshift({ poolid: formData.pool, comment: null })
+    }
+
+    return options
+  }, [pools, formData.pool])
+
+  // Called with no argument by the Create Job button: never hand it the click
+  // event, whose fields would be merged into the job and break its JSON body.
+  const handleCreate = (prefill: Partial<PveJobForm> = {}) => {
+    // Trouver le premier storage PBS
+    const pbsStorages = storages.filter(s => s.isPbs || s.type === 'pbs')
+    let storageId = pbsStorages[0]?.id || ''
+
+    // Tenant: prefill everything from the first (and product-wise only)
+    // vDC on this connection. The PBS namespace of its binding lives on a
+    // PBS storage, so the storage bound to that namespace (and datastore) is
+    // preselected; without one there is nothing valid to save.
+    const tenantVdc = isVdcTenant ? tenantPools[0] : null
+    let missingNs = null
+    if (tenantVdc) {
+      const wanted = normNamespace(tenantVdc.namespace)
+      const match = pbsStorages.find(s =>
+        normNamespace(s.namespace) === wanted &&
+        (!tenantVdc.datastore || !s.datastore || s.datastore === tenantVdc.datastore)
+      )
+      storageId = match?.id || ''
+      if (!match) missingNs = wanted
+    }
+    setMissingNamespaceStorage(missingNs)
+
+    setFormData({
+      enabled: true,
+      storage: storageId,
+      schedule: '00:00',
+      node: '',
+      mode: 'snapshot',
+      compress: 'zstd',
+      selectionMode: isVdcTenant ? 'pool' : 'all',
+      pool: tenantVdc?.poolName || '',
+      vmids: [],
+      excludedVmids: [],
+      comment: '',
+      mailto: '',
+      mailnotification: 'always',
+      maxfiles: 1,
+      ...prefill,
+    })
+    setDialogMode('create')
+    setEditingJob(null)
+    setDialogOpen(true)
+  }
+  // Job creation asked from the coverage card (roadmap#48): switch to the
+  // guest's connection, wait for its storages, then open the create dialog
+  // with the guest preselected.
+  const [switchedFor, setSwitchedFor] = useState<CreateJobRequest | null>(null)
+  if (createRequest && createRequest !== switchedFor) {
+    setSwitchedFor(createRequest)
+    if (selectedConnection !== createRequest.connId) setSelectedConnection(createRequest.connId)
+  }
+  useEffect(() => {
+    if (!createRequest || handledCreateRef.current === createRequest.nonce) return
+    if (selectedConnection !== createRequest.connId || loading || loadedConnection !== createRequest.connId) return
+    handledCreateRef.current = createRequest.nonce
+    handleCreate({ selectionMode: 'include', vmids: [String(createRequest.vmid)] })
+  }, [createRequest, selectedConnection, loading, loadedConnection]) // eslint-disable-line react-hooks/exhaustive-deps
+
+
+  const handleEdit = (job: PveJob) => {
+    setFormData({
+      enabled: job.enabled,
+      storage: job.storage || '',
+      schedule: job.schedule || '00:00',
+      node: job.node || '',
+      mode: job.mode || 'snapshot',
+      compress: job.compress || 'zstd',
+      selectionMode: job.selectionMode || 'all',
+      pool: job.pool || '',
+      vmids: job.vmids || [],
+      excludedVmids: job.excludedVmids || [],
+      comment: job.comment || '',
+      mailto: job.mailto || '',
+      mailnotification: job.mailnotification || 'always',
+      maxfiles: job.maxfiles || 1,
+    })
+    setMissingNamespaceStorage(null)
+    setDialogMode('edit')
+    setEditingJob(job)
+    setDialogOpen(true)
+  }
+
+  const handleSave = async () => {
+    setSaving(true)
+    
+    try {
+      const url = dialogMode === 'create'
+        ? `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs`
+        : `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs/${encodeURIComponent(editingJob?.id ?? '')}`
+      
+      const res = await fetch(url, {
+        method: dialogMode === 'create' ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      })
+      
+      const json = await res.json()
+      
+      if (json.error) {
+        setError(json.code === 'namespace_storage_mismatch'
+          ? t('backups.namespaceStorageMismatch', { storage: json.storage, namespace: json.namespace })
+          : json.error)
+      } else {
+        setDialogOpen(false)
+        void loadJobs()
+        onJobsChanged?.()
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('backups.saveError'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleDeleteClick = (job: PveJob) => {
+    setJobToDelete(job)
+    setDeleteDialogOpen(true)
+  }
+
+  const handleDeleteConfirm = async () => {
+    if (!jobToDelete) return
+
+    setDeleting(true)
+
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs/${encodeURIComponent(jobToDelete.id)}`,
+        { method: 'DELETE' }
+      )
+
+      const json = await res.json()
+
+      if (json.error) {
+        setError(json.error)
+      } else {
+        void loadJobs()
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('backups.deleteError'))
+    } finally {
+      setDeleting(false)
+      setDeleteDialogOpen(false)
+      setJobToDelete(null)
+    }
+  }
+
+  const handleToggleEnabled = async (job: PveJob) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs/${encodeURIComponent(job.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: !job.enabled })
+        }
+      )
+      
+      const json = await res.json()
+      
+      if (!json.error) {
+        void loadJobs()
+      }
+    } catch (e) {
+      console.error('Error toggling job:', e)
+    }
+  }
+
+  const handleRunNow = async (job: PveJob) => {
+    try {
+      const res = await fetch(
+        `/api/v1/connections/${encodeURIComponent(selectedConnection)}/backup-jobs/${encodeURIComponent(job.id)}?action=run`,
+        { method: 'POST' }
+      )
+
+      const json = await res.json()
+
+      if (json.error) {
+        setError(json.error)
+      } else {
+        setRunsDrawer({ key: job.id, focusUpid: json.data?.tasks?.[0]?.upid ?? null })
+        void reloadRuns() // the run route invalidated the server cache
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('common.error'))
+    }
+  }
+
+  const columns: GridColDef<PveJob>[] = [
+    {
+      field: 'enabled',
+      headerName: '',
+      width: 60,
+      renderCell: (params) => (
+        <Switch
+          size="small"
+          checked={params.value}
+          onClick={(e) => e.stopPropagation()}
+          onChange={() => handleToggleEnabled(params.row)}
+        />
+      )
+    },
+    {
+      field: 'schedule',
+      headerName: t('backups.scheduleTime'),
+      width: 100,
+      renderCell: (params) => (
+        <Chip size="small" label={params.value} variant="outlined" />
+      )
+    },
+    {
+      field: 'lastRun',
+      headerName: t('backups.runs.colLastRun'),
+      width: 170,
+      sortable: false,
+      renderCell: (params) => {
+        const run = runsByJob.get(params.row.id)?.lastRun
+        // No history yet (loading, or the runs route failed): unknown, not "Never".
+        if (!runsData) return runsLoading ? <Skeleton width={120} /> : '—'
+        if (!run) return <Typography sx={{ opacity: 0.5, fontSize: '0.8rem' }}>{t('backups.runs.never')}</Typography>
+
+        return formatDateTime(run.start * 1000, locale, { dateStyle: 'short', timeStyle: 'short' })
+      }
+    },
+    {
+      field: 'lastDuration',
+      headerName: t('backups.runs.colDuration'),
+      width: 100,
+      sortable: false,
+      renderCell: (params) => formatDurationSec(runsByJob.get(params.row.id)?.lastRun?.durationSec)
+    },
+    {
+      field: 'lastStatus',
+      headerName: t('backups.runs.colStatus'),
+      width: 210,
+      sortable: false,
+      renderCell: (params) => {
+        const run = runsByJob.get(params.row.id)?.lastRun
+        if (!run) return null
+        const chip = runStatusChip(run)
+
+        return (
+          <Tooltip title={run.statusDetail.reason || ''}>
+            <Chip size="small" color={chip.color} label={chip.count ? `${t(chip.key)} (${chip.count})` : t(chip.key)} />
+          </Tooltip>
+        )
+      }
+    },
+    {
+      field: 'nextRun',
+      headerName: t('backups.runs.colNextRun'),
+      width: 150,
+      sortable: false,
+      renderCell: (params) => params.row.enabled && params.row.nextRun
+        ? formatDateTime(params.row.nextRun * 1000, locale, { dateStyle: 'short', timeStyle: 'short' })
+        : <Typography sx={{ opacity: 0.5 }}>—</Typography>
+    },
+    {
+      field: 'storage',
+      headerName: 'Storage',
+      width: 130
+    },
+    {
+      field: 'namespace',
+      headerName: 'Namespace',
+      width: 110,
+      renderCell: (params) => params.value 
+        ? <Chip size="small" label={params.value} variant="outlined" color="info" />
+        : <Typography sx={{ opacity: 0.5, fontSize: '0.75rem' }}>—</Typography>
+    },
+    {
+      field: 'node',
+      headerName: 'Node',
+      width: 120,
+      renderCell: (params) => params.value || <Typography sx={{ opacity: 0.5 }}>{t('backups.allNodes')}</Typography>
+    },
+    {
+      field: 'selection',
+      headerName: t('backups.selection'),
+      width: 140,
+      renderCell: (params) => formatSelection(params.row, t)
+    },
+    {
+      field: 'mode',
+      headerName: 'Mode',
+      width: 100,
+      renderCell: (params) => (
+        <Chip 
+          size="small" 
+          label={params.value} 
+          color={MODE_CHIP_COLOR[params.value] ?? 'error'}
+          variant="outlined"
+        />
+      )
+    },
+    {
+      field: 'comment',
+      headerName: t('network.comment'),
+      flex: 1,
+      minWidth: 150
+    },
+    {
+      field: 'actions',
+      headerName: '',
+      width: 120,
+      sortable: false,
+      renderCell: (params) => (
+        <Stack direction="row" spacing={0.5}>
+          <Tooltip title={t('backups.runNow')}>
+            <IconButton size="small" onClick={(e) => { e.stopPropagation(); void handleRunNow(params.row) }}>
+              <i className="ri-play-line" style={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title={t('common.edit')}>
+            <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleEdit(params.row) }}>
+              <i className="ri-edit-line" style={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title={t('common.delete')}>
+            <IconButton size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteClick(params.row) }}>
+              <i className="ri-delete-bin-line" style={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+        </Stack>
+      )
+    }
+  ]
+
+  if (pveConnections.length === 0) {
+    return (
+      <Alert severity="info">
+        {t('backups.noPveConfigured')}
+      </Alert>
+    )
+  }
+
+  return (
+    <Box>
+      {/* Header */}
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2, flexWrap: 'wrap', gap: 2 }}>
+        {/* PVE cluster picker: providers always see it; tenant-vDC users
+            see it only when their scope spans several clusters (multi-vDC
+            tenants). Single-cluster tenants keep the auto-selected
+            pveConnections[0] with no picker. */}
+        {(!isVdcTenant || pveConnections.length > 1) ? (
+          <FormControl size="small" sx={{ minWidth: 250, ...SMALL_SELECT_SX }}>
+            <InputLabel>{t('backups.pveCluster')}</InputLabel>
+            <Select
+              value={selectedConnection}
+              onChange={(e) => setSelectedConnection(e.target.value)}
+              label={t('backups.pveCluster')}
+            >
+              {pveConnections.map(conn => (
+                <MenuItem key={conn.id} value={conn.id}>
+                  {conn.name || conn.host}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        ) : <Box />}
+
+        <Box sx={{ display: 'flex', gap: 1 }}>
+          <Button
+            variant="contained"
+            size="small"
+            sx={TOOLBAR_CONTROL_SX}
+            startIcon={<i className="ri-add-line" />}
+            onClick={() => handleCreate()}
+            disabled={!selectedConnection}
+          >
+            {t('backups.createJob')}
+          </Button>
+          <Tooltip title={t('common.refresh')}>
+            <span>
+              <IconButton
+                aria-label={t('common.refresh')}
+                onClick={loadJobs}
+                disabled={loading || !selectedConnection}
+                size="small"
+                sx={{ ...TOOLBAR_CONTROL_SX, width: 35.86 }}
+              >
+                <i className={`ri-refresh-line ${loading ? 'ri-spin' : ''}`} />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Box>
+      </Box>
+      
+      {loading && <LinearProgress sx={{ mb: 2 }} />}
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      
+      {runsData && runsData.unreachableNodes.length > 0 && (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          {t('backups.runs.unreachable', { nodes: runsData.unreachableNodes.join(', ') })}
+        </Alert>
+      )}
+
+      {/* Table */}
+      <DataGrid
+        rows={jobs}
+        columns={columns}
+        getRowId={(row) => row.id}
+        pageSizeOptions={[10, 25, 50]}
+        initialState={{
+          pagination: { paginationModel: { pageSize: 10 } }
+        }}
+        disableRowSelectionOnClick
+        autoHeight
+        onRowClick={(params) => setRunsDrawer({ key: params.row.id, focusUpid: null })}
+        getRowClassName={() => 'backup-job-row'}
+        sx={{
+          border: 'none',
+          '& .MuiDataGrid-cell': { borderColor: 'divider' },
+          '& .MuiDataGrid-columnHeaders': { bgcolor: 'action.hover', borderRadius: 1 },
+          '& .backup-job-row': { cursor: 'pointer' }
+        }}
+        localeText={{
+          noRowsLabel: t('backups.noJobConfigured'),
+          paginationRowsPerPage: t('backups.rowsPerPage')
+        }}
+      />
+
+      {runsError && <Alert severity="warning" sx={{ mt: 1 }}>{t('backups.runs.loadError')}</Alert>}
+
+      {selectedConnection && (
+        <Box
+          role="button"
+          tabIndex={0}
+          onClick={() => setRunsDrawer({ key: MANUAL_RUNS_KEY, focusUpid: null })}
+          onKeyDown={(e) => { if (e.key === 'Enter') setRunsDrawer({ key: MANUAL_RUNS_KEY, focusUpid: null }) }}
+          sx={{ mt: 1, px: 2, py: 1, display: 'flex', alignItems: 'center', gap: 2, borderRadius: 1, bgcolor: 'action.hover', cursor: 'pointer' }}
+        >
+          <i className="ri-hand-coin-line" />
+          <Tooltip title={t('backups.runs.manualBackupsHint')}>
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>{t('backups.runs.manualBackups')}</Typography>
+          </Tooltip>
+          <Typography variant="body2" color="text.secondary" component="div">
+            {(() => {
+              if (!runsData) return runsLoading ? <Skeleton width={100} /> : '—'
+              if (!runsData.manual.lastRun) return t('backups.runs.never')
+
+              return formatDateTime(runsData.manual.lastRun.start * 1000, locale, { dateStyle: 'short', timeStyle: 'short' })
+            })()}
+          </Typography>
+          {runsData?.manual?.lastRun && (() => {
+            const chip = runStatusChip(runsData.manual.lastRun)
+            return <Chip size="small" color={chip.color} label={t(chip.key)} />
+          })()}
+          <Box sx={{ flex: 1 }} />
+          <Typography variant="caption" color="text.secondary">{runsData ? runsData.manual.runs.length : '—'}</Typography>
+        </Box>
+      )}
+
+      <BackupJobRunsDrawer
+        open={!!runsDrawer}
+        onClose={() => setRunsDrawer(null)}
+        connectionId={selectedConnection}
+        title={runsDrawer?.key === MANUAL_RUNS_KEY ? t('backups.runs.manualBackups') : runsDrawer?.key}
+        subtitle={(() => {
+          const job = jobs.find(j => j.id === runsDrawer?.key)
+          return job ? [job.schedule, job.storage, formatSelection(job, t)].filter(Boolean).join(' · ') : null
+        })()}
+        runs={drawerRuns}
+        focusUpid={runsDrawer?.focusUpid ?? null}
+        days={runsData?.window?.days ?? 30}
+        unreachableNodes={runsData?.unreachableNodes ?? []}
+        truncatedNodes={runsData?.truncatedNodes ?? []}
+      />
+
+      {/* Create/Edit Dialog */}
+      <Dialog open={dialogOpen} onClose={() => !saving && setDialogOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>
+          {dialogMode === 'create' ? t('backups.createBackupJob') : t('backups.editBackupJob')}
+        </DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+            {isVdcTenant && dialogMode === 'create' && missingNamespaceStorage !== null && (
+              <Alert severity="error">
+                {t('backups.noStorageForNamespace', { namespace: missingNamespaceStorage || t('backups.rootNamespace') })}
+              </Alert>
+            )}
+            {/* Row 1 — infra pickers (PBS storage, namespace, node)
+                are entirely hidden for tenants because the vDC drives
+                all of them: handleCreate prefills from tenantPools[0].
+                Provider keeps the open form. The Schedule moved to its
+                own structured block below (BackupSchedulePicker). */}
+            {!isVdcTenant && (
+              <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr' }, gap: 2 }}>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('backups.pbsStorage')}</InputLabel>
+                  <Select
+                    value={formData.storage}
+                    onChange={(e) => setFormData(prev => ({ ...prev, storage: e.target.value }))}
+                    label={t('backups.pbsStorage')}
+                  >
+                    {storages.filter(s => s.isPbs || s.type === 'pbs').map(s => (
+                      <MenuItem key={s.id} value={s.id}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <i className="ri-server-line" style={{ fontSize: 14, color: '#4CAF50' }} />
+                          {s.name}
+                        </Box>
+                      </MenuItem>
+                    ))}
+                    {storages.filter(s => s.isPbs || s.type === 'pbs').length === 0 && (
+                      <MenuItem disabled>
+                        <Typography variant="body2" sx={{ opacity: 0.5 }}>
+                          {t('backups.noPbsConfigured')}
+                        </Typography>
+                      </MenuItem>
+                    )}
+                  </Select>
+                </FormControl>
+
+                {/* Read only: PVE takes the namespace from the PBS storage
+                    entry (storage.cfg), a job has no namespace of its own. */}
+                <TextField
+                  size="small"
+                  label={t('backups.namespace')}
+                  value={(() => {
+                    const ns = normNamespace(storages.find(s => s.id === formData.storage)?.namespace)
+                    return formData.storage ? (ns || t('backups.rootNamespace')) : ''
+                  })()}
+                  helperText={t('backups.namespaceFromStorage')}
+                  slotProps={{ input: { readOnly: true } }}
+                  disabled={!formData.storage}
+                />
+
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('backups.node')}</InputLabel>
+                  <Select
+                    value={formData.node}
+                    onChange={(e) => setFormData(prev => ({ ...prev, node: e.target.value }))}
+                    label={t('backups.node')}
+                  >
+                    <MenuItem value="">{t('backups.allNodes')}</MenuItem>
+                    {nodes.map(n => (
+                      <MenuItem key={n.node} value={n.node}>{n.node}</MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Box>
+            )}
+
+            {/* Structured schedule picker — replaces the previous raw
+                cron-like text input. The picker compiles a PVE calendar
+                event spec from frequency + time + (days|day-of-month),
+                with an Advanced toggle for power users. */}
+            <Box sx={{ mt: 1 }}>
+              <Typography variant="caption" sx={{ display: 'block', mb: 0.5, opacity: 0.7, fontWeight: 600 }}>
+                {t('backups.scheduleSection')}
+              </Typography>
+              <BackupSchedulePicker
+                value={formData.schedule}
+                onChange={(v: string) => setFormData(prev => ({ ...prev, schedule: v }))}
+              />
+            </Box>
+
+            {/* Row 2 */}
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr' }, gap: 2 }}>
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('backups.mode')}</InputLabel>
+                <Select
+                  value={formData.mode}
+                  onChange={(e) => setFormData(prev => ({ ...prev, mode: e.target.value }))}
+                  label={t('backups.mode')}
+                >
+                  <MenuItem value="snapshot">{t('backups.snapshotFast')}</MenuItem>
+                  <MenuItem value="suspend">{t('backups.suspendPauseDuringBackup')}</MenuItem>
+                  <MenuItem value="stop">{t('backups.stopFullStop')}</MenuItem>
+                </Select>
+              </FormControl>
+
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('backups.compression')}</InputLabel>
+                <Select
+                  value={formData.compress}
+                  onChange={(e) => setFormData(prev => ({ ...prev, compress: e.target.value }))}
+                  label={t('backups.compression')}
+                >
+                  <MenuItem value="0">{t('backups.none')}</MenuItem>
+                  <MenuItem value="gzip">{t('backups.gzipCompression')}</MenuItem>
+                  <MenuItem value="lzo">{t('backups.lzoFastCompression')}</MenuItem>
+                  <MenuItem value="zstd">{t('backups.zstdRecommendedCompression')}</MenuItem>
+                </Select>
+              </FormControl>
+
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={formData.enabled}
+                    onChange={(e) => setFormData(prev => ({ ...prev, enabled: e.target.checked }))}
+                  />
+                }
+                label={t('common.enabled')}
+              />
+            </Box>
+
+            <Divider />
+
+            {/* VM Selection — hidden for tenants. The vDC pick above
+                already implies "back up everything in this vDC's pool";
+                provider keeps the open all/include/exclude options. */}
+            {!isVdcTenant && (
+              <Typography variant="subtitle2" fontWeight={600}>{t('backups.vmSelection')}</Typography>
+            )}
+            {!isVdcTenant && (
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 2fr' }, gap: 2 }}>
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('backups.selectionMode')}</InputLabel>
+                <Select
+                  value={formData.selectionMode}
+                  onChange={(e) => setFormData(prev => ({
+                    ...prev,
+                    selectionMode: e.target.value,
+                    pool: e.target.value === 'pool' ? prev.pool : '',
+                    vmids: [],
+                    excludedVmids: []
+                  }))}
+                  label={t('backups.selectionMode')}
+                >
+                  <MenuItem value="all">{t('backups.allVms')}</MenuItem>
+                  <MenuItem value="include">{t('backups.selectVms')}</MenuItem>
+                  <MenuItem value="exclude">{t('backups.allExceptMode')}</MenuItem>
+                  <MenuItem value="pool">{t('backups.poolBasedMode')}</MenuItem>
+                </Select>
+              </FormControl>
+
+              {formData.selectionMode === 'include' && (
+                <Autocomplete
+                  multiple
+                  size="small"
+                  options={vms}
+                  value={vms.filter(vm => formData.vmids.includes(String(vm.vmid)))}
+                  onChange={(_, newValue) => setFormData(prev => ({
+                    ...prev,
+                    vmids: newValue.map(v => String(v.vmid))
+                  }))}
+                  getOptionLabel={(option) => `${option.vmid} - ${option.name}`}
+                  renderInput={(params) => <TextField {...params} label={t('backups.vmsToInclude')} />}
+                  renderValue={(value, getItemProps) =>
+                    value.map((option, index) => {
+                      const { key, ...itemProps } = getItemProps({ index })
+                      return <Chip key={key} size="small" label={option.vmid} {...itemProps} />
+                    })
+                  }
+                />
+              )}
+
+              {formData.selectionMode === 'exclude' && (
+                <Autocomplete
+                  multiple
+                  size="small"
+                  options={vms}
+                  value={vms.filter(vm => formData.excludedVmids.includes(String(vm.vmid)))}
+                  onChange={(_, newValue) => setFormData(prev => ({
+                    ...prev,
+                    excludedVmids: newValue.map(v => String(v.vmid))
+                  }))}
+                  getOptionLabel={(option) => `${option.vmid} - ${option.name}`}
+                  renderInput={(params) => <TextField {...params} label={t('backups.vmsToExclude')} />}
+                  renderValue={(value, getItemProps) =>
+                    value.map((option, index) => {
+                      const { key, ...itemProps } = getItemProps({ index })
+                      return <Chip key={key} size="small" label={option.vmid} color="error" variant="outlined" {...itemProps} />
+                    })
+                  }
+                />
+              )}
+
+              {formData.selectionMode === 'pool' && (
+                <BackupPoolSelect
+                  label={t('backups.poolToBackup')}
+                  emptyLabel={t('backups.noResourcePool')}
+                  value={formData.pool}
+                  options={poolOptions}
+                  onChange={pool => setFormData(prev => ({ ...prev, pool }))}
+                />
+              )}
+            </Box>
+            )}
+
+            <Divider />
+
+            {/* Options */}
+            <Typography variant="subtitle2" fontWeight={600}>{t('backups.options')}</Typography>
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr 1fr' }, gap: 2 }}>
+              <TextField
+                size="small"
+                label={t('network.comment')}
+                value={formData.comment}
+                onChange={(e) => setFormData(prev => ({ ...prev, comment: e.target.value }))}
+              />
+              <NumericTextField
+                size="small"
+                label={t('backups.retention')}
+                type="number"
+                value={formData.maxfiles}
+                onChange={(v) => setFormData(prev => ({ ...prev, maxfiles: v }))}
+                fallback={1}
+                min={1}
+                slotProps={{ htmlInput: { min: 1 } }}
+              />
+              <TextField
+                size="small"
+                label={t('backups.notificationEmail')}
+                value={formData.mailto}
+                onChange={(e) => setFormData(prev => ({ ...prev, mailto: e.target.value }))}
+              />
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('backups.notifications')}</InputLabel>
+                <Select
+                  value={formData.mailnotification}
+                  onChange={(e) => setFormData(prev => ({ ...prev, mailnotification: e.target.value }))}
+                  label={t('backups.notifications')}
+                >
+                  <MenuItem value="always">{t('backups.always')}</MenuItem>
+                  <MenuItem value="failure">{t('backups.failureOnly')}</MenuItem>
+                </Select>
+              </FormControl>
+            </Box>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDialogOpen(false)} disabled={saving}>{t('common.cancel')}</Button>
+          <Button
+            variant="contained"
+            onClick={handleSave}
+            disabled={saving || !formData.storage || (formData.selectionMode === 'pool' && !formData.pool)}
+            startIcon={saving ? <CircularProgress size={16} /> : null}
+          >
+            {dialogMode === 'create' ? t('common.create') : t('common.save')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <DeleteJobDialog
+        open={deleteDialogOpen}
+        deleting={deleting}
+        title={t('backups.confirmDeleteJob')}
+        message={t('backups.deleteJobConfirm')}
+        onClose={() => setDeleteDialogOpen(false)}
+        onConfirm={() => void handleDeleteConfirm()}
+      >
+        {jobToDelete && (
+          <>
+            <Typography variant="body2" fontWeight={600}>
+              {jobToDelete.comment || t('backups.noComment')}
+            </Typography>
+            <Typography variant="caption" sx={{ opacity: 0.7 }}>
+              Storage: {jobToDelete.storage} • {t('backups.scheduleTime')}: {jobToDelete.schedule}
+            </Typography>
+          </>
+        )}
+      </DeleteJobDialog>
+    </Box>
+  )
+}
+
+/* -----------------------------
+  PBS Jobs Tab
+------------------------------ */
+
+interface PbsJobsTabProps {
+  pbsConnections?: Connection[]
+  isVdcTenant?: boolean
+}
+
+function PbsJobsTab({ pbsConnections = [], isVdcTenant = false }: Readonly<PbsJobsTabProps>) {
+  const theme = useTheme()
+  const t = useTranslations()
+  const dateLocale = getDateLocale(useLocale())
+
+  const [selectedPbs, setSelectedPbs] = useState('')
+  const [jobs, setJobs] = useState<PbsJobLists | null>(null)
+  const [datastores, setDatastores] = useState<string[]>([])
+  const [stats, setStats] = useState<PbsStats | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  
+  const [selectedType, setSelectedType] = useState<'all' | PbsJobType>('all')
+  
+  // Dialog states
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [dialogMode, setDialogMode] = useState<'create' | 'edit'>('create')
+  const [dialogType, setDialogType] = useState<PbsDialogType>('sync')
+  const [editingJob, setEditingJob] = useState<PbsJob | null>(null)
+  const [saving, setSaving] = useState(false)
+  
+  // Delete dialog
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [jobToDelete, setJobToDelete] = useState<PbsJob | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  
+  // Form data for different job types
+  const [formData, setFormData] = useState<PbsJobForm>({
+    id: '',
+    store: '',
+    ns: '',
+    schedule: '',
+    comment: '',
+
+    // Sync specific
+    remote: '',
+    remoteStore: '',
+    remoteNs: '',
+    removeVanished: false,
+
+    // Verify specific
+    ignoreVerified: true,
+    outdatedAfter: 30,
+
+    // Prune specific
+    keepLast: 3,
+    keepDaily: 7,
+    keepWeekly: 4,
+    keepMonthly: 6,
+    keepYearly: 1,
+
+    // Tape specific
+    pool: '',
+    drive: '',
+    ejectMedia: false,
+    exportMediaSet: false,
+    latestOnly: false
+  })
+
+  const loadJobs = useCallback(async () => {
+    if (!selectedPbs) return
+    
+    setLoading(true)
+    setError(null)
+    
+    try {
+      const res = await fetch(`/api/v1/pbs/${encodeURIComponent(selectedPbs)}/jobs`)
+      const json = await res.json()
+      
+      if (json.error) {
+        setError(json.error)
+      } else {
+        setJobs(json.data?.jobs || null)
+        setDatastores(json.data?.datastores || [])
+        setStats(json.data?.stats || null)
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('errors.loadingError'))
+    } finally {
+      setLoading(false)
+    }
+  }, [selectedPbs, t])
+
+  useEffect(() => {
+    if (selectedPbs) {
+      void loadJobs()
+    }
+  }, [selectedPbs, loadJobs])
+
+  useEffect(() => {
+    if (pbsConnections.length > 0 && !selectedPbs) {
+      setSelectedPbs(pbsConnections[0].id)
+    }
+  }, [pbsConnections, selectedPbs])
+
+  const handleCreate = (type: PbsDialogType) => {
+    setDialogType(type)
+    setDialogMode('create')
+    setEditingJob(null)
+    setFormData({
+      id: '',
+      store: datastores[0] || '',
+      ns: '',
+      schedule: '00:00',
+      comment: '',
+      remote: '',
+      remoteStore: '',
+      remoteNs: '',
+      removeVanished: false,
+      ignoreVerified: true,
+      outdatedAfter: 30,
+      keepLast: 3,
+      keepDaily: 7,
+      keepWeekly: 4,
+      keepMonthly: 6,
+      keepYearly: 1,
+      pool: '',
+      drive: '',
+      ejectMedia: false,
+      exportMediaSet: false,
+      latestOnly: false
+    })
+    setDialogOpen(true)
+  }
+
+  const handleEdit = (job: PbsJob) => {
+    // Only sync, verify, prune and tape jobs offer the edit action.
+    setDialogType(job.type as PbsDialogType)
+    setDialogMode('edit')
+    setEditingJob(job)
+    setFormData({
+      id: job.id,
+      store: job.store || job.datastore || '',
+      ns: job.ns || '',
+      schedule: job.schedule || '',
+      comment: job.comment || '',
+      remote: job.remote || '',
+      remoteStore: job.remoteStore || '',
+      remoteNs: job.remoteNs || '',
+      removeVanished: job.removeVanished || false,
+      ignoreVerified: job.ignoreVerified !== false,
+      outdatedAfter: job.outdatedAfter || 30,
+      keepLast: job.keepLast || 3,
+      keepDaily: job.keepDaily || 7,
+      keepWeekly: job.keepWeekly || 4,
+      keepMonthly: job.keepMonthly || 6,
+      keepYearly: job.keepYearly || 1,
+      pool: job.pool || '',
+      drive: job.drive || '',
+      ejectMedia: job.ejectMedia || false,
+      exportMediaSet: job.exportMediaSet || false,
+      latestOnly: job.latestOnly || false
+    })
+    setDialogOpen(true)
+  }
+
+  const handleSave = async () => {
+    setSaving(true)
+    
+    try {
+      const endpoint = pbsJobEndpoint(dialogType)
+      
+      // Pour prune, on a besoin du store dans l'URL
+      let url: string
+
+      if (dialogMode === 'create') {
+        url = `/api/v1/pbs/${encodeURIComponent(selectedPbs)}/jobs/${endpoint}`
+      } else {
+        url = `/api/v1/pbs/${encodeURIComponent(selectedPbs)}/jobs/${endpoint}/${encodeURIComponent(editingJob?.id ?? '')}`
+
+
+        // Pour prune, ajouter le store en query param pour le DELETE
+        if (dialogType === 'prune') {
+          url += `?store=${encodeURIComponent(formData.store)}`
+        }
+      }
+      
+      const res = await fetch(url, {
+        method: dialogMode === 'create' ? 'POST' : 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      })
+      
+      const json = await res.json()
+      
+      if (json.error) {
+        setError(json.error)
+      } else {
+        setDialogOpen(false)
+        void loadJobs()
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('backups.saveError'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleDeleteClick = (job: PbsJob) => {
+    setJobToDelete(job)
+    setDeleteDialogOpen(true)
+  }
+
+  const handleDeleteConfirm = async () => {
+    if (!jobToDelete) return
+
+    setDeleting(true)
+
+    try {
+      const endpoint = pbsJobEndpoint(jobToDelete.type)
+
+      let url = `/api/v1/pbs/${encodeURIComponent(selectedPbs)}/jobs/${endpoint}/${encodeURIComponent(jobToDelete.id)}`
+
+      // Pour prune, on a besoin du store en query param
+      if (jobToDelete.type === 'prune') {
+        const store = jobToDelete.store || jobToDelete.datastore || ''
+
+        url += `?store=${encodeURIComponent(store)}`
+      }
+
+      const res = await fetch(url, { method: 'DELETE' })
+
+      const json = await res.json()
+
+      if (json.error) {
+        setError(json.error)
+      } else {
+        void loadJobs()
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('backups.deleteError'))
+    } finally {
+      setDeleting(false)
+      setDeleteDialogOpen(false)
+      setJobToDelete(null)
+    }
+  }
+
+  const handleRunNow = async (job: PbsJob) => {
+    try {
+      const endpoint = pbsRunEndpoint(job.type)
+
+      const res = await fetch(
+        `/api/v1/pbs/${encodeURIComponent(selectedPbs)}/jobs/${endpoint}/${encodeURIComponent(job.id)}/run`,
+        { method: 'POST' }
+      )
+      
+      const json = await res.json()
+      
+      if (json.error) {
+        setError(json.error)
+      }
+    } catch (e) {
+      setError(errorMessage(e) || t('common.error'))
+    }
+  }
+
+  let filteredJobs: PbsJob[] = []
+  if (jobs) filteredJobs = (selectedType === 'all' ? jobs.all : jobs[selectedType]) ?? []
+
+  const renderDateCell = (params: GridRenderCellParams<PbsJob, string | number | undefined>) => (
+    <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+      <Typography variant="body2" sx={{ opacity: params.value ? 1 : 0.4, fontSize: '0.8rem' }}>
+        {formatDate(params.value, dateLocale)}
+      </Typography>
+    </Box>
+  )
+
+  const columns: GridColDef<PbsJob>[] = [
+    {
+      field: 'type',
+      headerName: t('backups.jobType'),
+      width: 85,
+      renderCell: (params) => <JobTypeChip type={params.value} />
+    },
+    {
+      field: 'enabled',
+      headerName: '',
+      width: 40,
+      renderCell: (params) => (
+        <Tooltip title={params.value !== false ? t('common.enabled') : t('common.disabled')}>
+          <i
+            className={params.value !== false ? 'ri-checkbox-circle-fill' : 'ri-close-circle-line'}
+            style={{ fontSize: 16, color: params.value !== false ? theme.palette.success.main : theme.palette.text.disabled }}
+          />
+        </Tooltip>
+      )
+    },
+    {
+      field: 'id',
+      headerName: 'ID',
+      width: 180,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <Typography variant="body2" noWrap title={params.value}>
+            {params.value}
+          </Typography>
+        </Box>
+      )
+    },
+    {
+      field: 'store',
+      headerName: t('backups.datastore'),
+      width: 130,
+      valueGetter: (_value, row) => row.store || row.datastore || '—'
+    },
+    {
+      field: 'ns',
+      headerName: 'Namespace',
+      width: 100,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          {params.value 
+            ? <Chip size="small" label={params.value} variant="outlined" sx={{ height: 22, fontSize: '0.7rem' }} />
+            : <Typography variant="body2" sx={{ opacity: 0.4 }}>—</Typography>
+          }
+        </Box>
+      )
+    },
+    {
+      field: 'schedule',
+      headerName: t('backups.planification'),
+      width: 120,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          {params.value
+            ? <Chip size="small" label={params.value} variant="outlined" sx={{ height: 22, fontSize: '0.7rem' }} />
+            : <Typography variant="body2" sx={{ opacity: 0.4 }}>{t('backups.manual')}</Typography>
+          }
+        </Box>
+      )
+    },
+    {
+      field: 'lastRunState',
+      headerName: t('backups.lastState'),
+      width: 100,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <StatusChip state={params.value} t={t} />
+        </Box>
+      )
+    },
+    {
+      field: 'lastRunEndtime',
+      headerName: t('backups.lastExecution'),
+      width: 140,
+      renderCell: renderDateCell
+    },
+    {
+      field: 'nextRun',
+      headerName: t('backups.nextExecution'),
+      width: 140,
+      renderCell: renderDateCell
+    },
+    {
+      field: 'comment',
+      headerName: t('network.comment'),
+      flex: 1,
+      minWidth: 100,
+      renderCell: (params) => (
+        <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+          <Typography variant="body2" noWrap sx={{ opacity: params.value ? 1 : 0.4 }} title={params.value}>
+            {params.value || '—'}
+          </Typography>
+        </Box>
+      )
+    },
+    {
+      field: 'actions',
+      headerName: '',
+      width: 100,
+      sortable: false,
+      renderCell: (params) => {
+        const jobType = params.row.type
+        const isRunning = params.row.lastRunState === 'running' || params.row.lastRunState === 'RUNNING'
+        const canEdit = ['sync', 'verify', 'prune', 'tape'].includes(jobType)
+        const canDelete = ['sync', 'verify', 'prune', 'tape'].includes(jobType)
+        const canRun = ['sync', 'verify', 'prune', 'gc', 'tape'].includes(jobType) && !isRunning
+
+        return (
+          <Stack direction="row" spacing={0}>
+            <Tooltip title={isRunning ? t('backups.running') + '...' : t('backups.runNow')}>
+              <span>
+                <IconButton
+                  aria-label={isRunning ? t('backups.running') + '...' : t('backups.runNow')}
+                  size="small"
+                  onClick={() => handleRunNow(params.row)}
+                  disabled={!canRun}
+                  sx={{ opacity: canRun ? 1 : 0.3 }}
+                >
+                  <i className={isRunning ? 'ri-loader-4-line ri-spin' : 'ri-play-line'} style={{ fontSize: 15 }} />
+                </IconButton>
+              </span>
+            </Tooltip>
+            {canEdit && (
+              <Tooltip title={t('common.edit')}>
+                <IconButton size="small" onClick={() => handleEdit(params.row)}>
+                  <i className="ri-edit-line" style={{ fontSize: 15 }} />
+                </IconButton>
+              </Tooltip>
+            )}
+            {canDelete && (
+              <Tooltip title={t('common.delete')}>
+                <IconButton size="small" color="error" onClick={() => handleDeleteClick(params.row)} sx={{ opacity: 0.7, '&:hover': { opacity: 1 } }}>
+                  <i className="ri-delete-bin-line" style={{ fontSize: 15 }} />
+                </IconButton>
+              </Tooltip>
+            )}
+          </Stack>
+        )
+      }
+    }
+  ]
+
+  if (pbsConnections.length === 0) {
+    return (
+      <Alert severity="info">
+        {t('backups.noPbsServerConfigured')}
+      </Alert>
+    )
+  }
+
+  return (
+    <Box>
+      {/* Header */}
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2, flexWrap: 'wrap', gap: 2 }}>
+        <Box sx={{ display: 'flex', gap: 2 }}>
+          {!isVdcTenant && (
+            <FormControl size="small" sx={{ minWidth: 200 }}>
+              <InputLabel>{t('backups.pbsServer')}</InputLabel>
+              <Select
+                value={selectedPbs}
+                onChange={(e) => setSelectedPbs(e.target.value)}
+                label={t('backups.pbsServer')}
+              >
+                {pbsConnections.map(conn => (
+                  <MenuItem key={conn.id} value={conn.id}>
+                    {conn.name || conn.host}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          )}
+
+          <FormControl size="small" sx={{ minWidth: 140 }}>
+            <InputLabel>{t('backups.jobType')}</InputLabel>
+            <Select
+              value={selectedType}
+              onChange={(e) => setSelectedType(e.target.value)}
+              label={t('backups.jobType')}
+            >
+              <MenuItem value="all">{t('common.all')} ({stats?.total || 0})</MenuItem>
+              <MenuItem value="sync">Sync ({stats?.byType?.sync || 0})</MenuItem>
+              <MenuItem value="verify">Verify ({stats?.byType?.verify || 0})</MenuItem>
+              <MenuItem value="prune">Prune ({stats?.byType?.prune || 0})</MenuItem>
+              <MenuItem value="gc">GC ({stats?.byType?.gc || 0})</MenuItem>
+              <MenuItem value="tape">Tape ({stats?.byType?.tape || 0})</MenuItem>
+            </Select>
+          </FormControl>
+        </Box>
+        
+        <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+          {/* Boutons de création par type */}
+          <Tooltip title={t('backups.createSyncJob')}>
+            <span>
+              <IconButton
+                aria-label={t('backups.createSyncJob')}
+                size="small"
+                onClick={() => handleCreate('sync')}
+                disabled={!selectedPbs}
+                sx={{ color: '#2196F3' }}
+              >
+                <i className="ri-refresh-line" style={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title={t('backups.createVerifyJob')}>
+            <span>
+              <IconButton
+                aria-label={t('backups.createVerifyJob')}
+                size="small"
+                onClick={() => handleCreate('verify')}
+                disabled={!selectedPbs}
+                sx={{ color: '#4CAF50' }}
+              >
+                <i className="ri-shield-check-line" style={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title={t('backups.createPruneJob')}>
+            <span>
+              <IconButton
+                aria-label={t('backups.createPruneJob')}
+                size="small"
+                onClick={() => handleCreate('prune')}
+                disabled={!selectedPbs}
+                sx={{ color: '#FF9800' }}
+              >
+                <i className="ri-scissors-cut-line" style={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title={t('backups.createTapeJob')}>
+            <span>
+              <IconButton
+                aria-label={t('backups.createTapeJob')}
+                size="small"
+                onClick={() => handleCreate('tape')}
+                disabled={!selectedPbs}
+                sx={{ color: '#795548' }}
+              >
+                <i className="ri-archive-drawer-line" style={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+          <Tooltip title={t('common.refresh')}>
+            <span>
+              <IconButton aria-label={t('common.refresh')} onClick={loadJobs} disabled={loading || !selectedPbs} size="small">
+                <i className={`ri-refresh-line ${loading ? 'ri-spin' : ''}`} style={{ fontSize: 18 }} />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Box>
+      </Box>
+      
+      {/* Stats */}
+      {stats && (
+        <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
+          <Chip size="small" color="success" label={`${stats.lastRunStates?.ok || 0} OK`} variant="outlined" />
+          <Chip size="small" color="error" label={t('backups.errorsCount', { count: stats.lastRunStates?.error || 0 })} variant="outlined" />
+          <Chip size="small" color="warning" label={t('backups.warningsCount', { count: stats.lastRunStates?.warning || 0 })} variant="outlined" />
+        </Box>
+      )}
+      
+      {loading && <LinearProgress sx={{ mb: 2 }} />}
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      
+      {/* Table */}
+      <DataGrid
+        rows={filteredJobs}
+        columns={columns}
+        getRowId={(row) => row.id}
+        pageSizeOptions={[10, 25, 50]}
+        initialState={{
+          pagination: { paginationModel: { pageSize: 10 } },
+          sorting: { sortModel: [{ field: 'lastRunEndtime', sort: 'desc' }] }
+        }}
+        disableRowSelectionOnClick
+        autoHeight
+        sx={{
+          border: 'none',
+          '& .MuiDataGrid-cell': { borderColor: 'divider' },
+          '& .MuiDataGrid-columnHeaders': { bgcolor: 'action.hover', borderRadius: 1 }
+        }}
+        localeText={{
+          noRowsLabel: t('backups.noJobFound'),
+          paginationRowsPerPage: t('backups.rowsPerPage')
+        }}
+      />
+
+      {/* Create/Edit Dialog */}
+      <Dialog open={dialogOpen} onClose={() => !saving && setDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>
+          {dialogMode === 'create' ? t('backups.createJobType', { type: dialogType }) : t('backups.editJob', { type: dialogType })}
+        </DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+            {/* Common fields */}
+            <TextField
+              size="small"
+              label={t('backups.jobId')}
+              value={formData.id}
+              onChange={(e) => setFormData(prev => ({ ...prev, id: e.target.value }))}
+              disabled={dialogMode === 'edit'}
+              placeholder="my-sync-job"
+            />
+
+            <FormControl fullWidth size="small">
+              <InputLabel>{t('backups.datastore')}</InputLabel>
+              <Select
+                value={formData.store}
+                onChange={(e) => setFormData(prev => ({ ...prev, store: e.target.value }))}
+                label={t('backups.datastore')}
+              >
+                {datastores.map(ds => (
+                  <MenuItem key={ds} value={ds}>{ds}</MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            <TextField
+              size="small"
+              label={t('backups.namespace')}
+              value={formData.ns}
+              onChange={(e) => setFormData(prev => ({ ...prev, ns: e.target.value }))}
+              placeholder="production/web"
+            />
+
+            {/* Same structured schedule picker as the PVE tab — PBS
+                accepts the exact same calendar event spec. */}
+            <Box>
+              <Typography variant="caption" sx={{ display: 'block', mb: 0.5, opacity: 0.7, fontWeight: 600 }}>
+                {t('backups.scheduleSection')}
+              </Typography>
+              <BackupSchedulePicker
+                value={formData.schedule}
+                onChange={(v: string) => setFormData(prev => ({ ...prev, schedule: v }))}
+              />
+            </Box>
+
+            <TextField
+              size="small"
+              label={t('network.comment')}
+              value={formData.comment}
+              onChange={(e) => setFormData(prev => ({ ...prev, comment: e.target.value }))}
+            />
+
+            {/* Sync specific */}
+            {dialogType === 'sync' && (
+              <>
+                <Divider />
+                <Typography variant="subtitle2" fontWeight={600}>{t('backups.syncConfig')}</Typography>
+                <TextField
+                  size="small"
+                  label={t('backups.remote')}
+                  value={formData.remote}
+                  onChange={(e) => setFormData(prev => ({ ...prev, remote: e.target.value }))}
+                  placeholder="remote-name"
+                />
+                <TextField
+                  size="small"
+                  label={t('backups.remoteDatastore')}
+                  value={formData.remoteStore}
+                  onChange={(e) => setFormData(prev => ({ ...prev, remoteStore: e.target.value }))}
+                />
+                <TextField
+                  size="small"
+                  label={t('backups.remoteNamespace')}
+                  value={formData.remoteNs}
+                  onChange={(e) => setFormData(prev => ({ ...prev, remoteNs: e.target.value }))}
+                />
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={formData.removeVanished}
+                      onChange={(e) => setFormData(prev => ({ ...prev, removeVanished: e.target.checked }))}
+                    />
+                  }
+                  label={t('backups.removeVanished')}
+                />
+              </>
+            )}
+
+            {/* Verify specific */}
+            {dialogType === 'verify' && (
+              <>
+                <Divider />
+                <Typography variant="subtitle2" fontWeight={600}>{t('backups.verifyConfig')}</Typography>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={formData.ignoreVerified}
+                      onChange={(e) => setFormData(prev => ({ ...prev, ignoreVerified: e.target.checked }))}
+                    />
+                  }
+                  label={t('backups.ignoreVerified')}
+                />
+                <NumericTextField
+                  size="small"
+                  label={t('backups.reVerifyAfter')}
+                  type="number"
+                  value={formData.outdatedAfter}
+                  onChange={(v) => setFormData(prev => ({ ...prev, outdatedAfter: v }))}
+                  fallback={30}
+                  min={1}
+                  slotProps={{ htmlInput: { min: 1 } }}
+                />
+              </>
+            )}
+
+            {/* Prune specific */}
+            {dialogType === 'prune' && (
+              <>
+                <Divider />
+                <Typography variant="subtitle2" fontWeight={600}>{t('backups.retentionPolicy')}</Typography>
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 2 }}>
+                  <NumericTextField
+                    size="small"
+                    label={t('backups.keepLast')}
+                    type="number"
+                    value={formData.keepLast}
+                    onChange={(v) => setFormData(prev => ({ ...prev, keepLast: v }))}
+                    fallback={0}
+                    min={0}
+                    slotProps={{ htmlInput: { min: 0 } }}
+                  />
+                  <NumericTextField
+                    size="small"
+                    label={t('backups.keepDaily')}
+                    type="number"
+                    value={formData.keepDaily}
+                    onChange={(v) => setFormData(prev => ({ ...prev, keepDaily: v }))}
+                    fallback={0}
+                    min={0}
+                    slotProps={{ htmlInput: { min: 0 } }}
+                  />
+                  <NumericTextField
+                    size="small"
+                    label={t('backups.keepWeekly')}
+                    type="number"
+                    value={formData.keepWeekly}
+                    onChange={(v) => setFormData(prev => ({ ...prev, keepWeekly: v }))}
+                    fallback={0}
+                    min={0}
+                    slotProps={{ htmlInput: { min: 0 } }}
+                  />
+                  <NumericTextField
+                    size="small"
+                    label={t('backups.keepMonthly')}
+                    type="number"
+                    value={formData.keepMonthly}
+                    onChange={(v) => setFormData(prev => ({ ...prev, keepMonthly: v }))}
+                    fallback={0}
+                    min={0}
+                    slotProps={{ htmlInput: { min: 0 } }}
+                  />
+                  <NumericTextField
+                    size="small"
+                    label={t('backups.keepYearly')}
+                    type="number"
+                    value={formData.keepYearly}
+                    onChange={(v) => setFormData(prev => ({ ...prev, keepYearly: v }))}
+                    fallback={0}
+                    min={0}
+                    slotProps={{ htmlInput: { min: 0 } }}
+                  />
+                </Box>
+              </>
+            )}
+
+            {/* Tape specific */}
+            {dialogType === 'tape' && (
+              <>
+                <Divider />
+                <Typography variant="subtitle2" fontWeight={600}>{t('backups.tapeBackupConfig')}</Typography>
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2 }}>
+                  <TextField
+                    size="small"
+                    label={t('backups.mediaPool')}
+                    value={formData.pool}
+                    onChange={(e) => setFormData(prev => ({ ...prev, pool: e.target.value }))}
+                    placeholder="MediaPool"
+                  />
+                  <TextField
+                    size="small"
+                    label={t('backups.drive')}
+                    value={formData.drive}
+                    onChange={(e) => setFormData(prev => ({ ...prev, drive: e.target.value }))}
+                    placeholder="drive0"
+                  />
+                </Box>
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={formData.ejectMedia}
+                        onChange={(e) => setFormData(prev => ({ ...prev, ejectMedia: e.target.checked }))}
+                      />
+                    }
+                    label={t('backups.ejectMedia')}
+                  />
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={formData.exportMediaSet}
+                        onChange={(e) => setFormData(prev => ({ ...prev, exportMediaSet: e.target.checked }))}
+                      />
+                    }
+                    label={t('backups.exportMediaSet')}
+                  />
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={formData.latestOnly}
+                        onChange={(e) => setFormData(prev => ({ ...prev, latestOnly: e.target.checked }))}
+                      />
+                    }
+                    label={t('backups.backupLatestOnly')}
+                  />
+                </Box>
+              </>
+            )}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDialogOpen(false)} disabled={saving}>{t('common.cancel')}</Button>
+          <Button
+            variant="contained"
+            onClick={handleSave}
+            disabled={saving || !formData.id || !formData.store || (dialogType === 'tape' && (!formData.pool || !formData.drive))}
+            startIcon={saving ? <CircularProgress size={16} /> : null}
+          >
+            {dialogMode === 'create' ? t('common.create') : t('common.save')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <DeleteJobDialog
+        open={deleteDialogOpen}
+        deleting={deleting}
+        title={t('backups.confirmDeleteJobTitle')}
+        message={t('backups.confirmDeleteJobMessage')}
+        onClose={() => setDeleteDialogOpen(false)}
+        onConfirm={() => void handleDeleteConfirm()}
+      >
+        {jobToDelete && (
+          <>
+            <Typography variant="body2" fontWeight={600}>{jobToDelete.id}</Typography>
+            <Typography variant="caption" sx={{ opacity: 0.7 }}>
+              {t('common.type')}: {jobToDelete.type} • Datastore: {jobToDelete.store || jobToDelete.datastore}
+            </Typography>
+          </>
+        )}
+      </DeleteJobDialog>
+    </Box>
+  )
+}
+
+/* -----------------------------
+  Main Component with Tabs
+------------------------------ */
+
+// Same toolbar metrics as the Backups list below: a small Select is 38px and a
+// small input 35.86px, so the two rows of this page would not line up.
+const SMALL_SELECT_SX = { '& .MuiInputBase-input.MuiSelect-select': { minHeight: '1.4375em', lineHeight: '1.4375em' } }
+const TOOLBAR_CONTROL_SX = { height: 35.86 }
+
+// Index of the Restore drills tab (roadmap#35), shown after PVE and PBS.
+const DRILLS_TAB = 2
+
+interface BackupJobsTabsProps {
+  pveConnections?: Connection[]
+  pbsConnections?: Connection[]
+  createRequest?: CreateJobRequest | null
+  onJobsChanged?: () => void
+  drillRequest?: DrillRequest | null
+}
+
+export default function BackupJobsTabs({ pveConnections = [], pbsConnections = [], createRequest = null, onJobsChanged, drillRequest = null }: Readonly<BackupJobsTabsProps>) {
+  const theme = useTheme()
+  const t = useTranslations()
+  const [activeTab, setActiveTab] = useState(0)
+  const [expanded, setExpanded] = useState(false)
+  // Tenant flag: drives the sub-tab UI (hide cluster/server pickers,
+  // lock job-create dialog into pool selection, etc.). Provider gets the
+  // unrestricted view.
+  const { currentTenant, loading: tenantLoading } = useTenant()
+  const isVdcTenant = !tenantLoading && !!currentTenant && currentTenant.id !== 'default'
+
+  // A job creation asked from the coverage card opens this section on the PVE tab.
+  const [seenRequest, setSeenRequest] = useState<CreateJobRequest | null>(null)
+  if (createRequest && createRequest !== seenRequest) {
+    setSeenRequest(createRequest)
+    setExpanded(true)
+    setActiveTab(0)
+  }
+
+  // Restore drills: Enterprise feature, provider only (a vDC tenant never sees it).
+  const { hasFeature } = useLicense()
+  const showDrills = hasFeature(Features.BACKUP_RESTORE_DRILLS) && !isVdcTenant
+
+  // A drill started from the backups list opens this section on its tab.
+  const [seenDrillRequest, setSeenDrillRequest] = useState<DrillRequest | null>(null)
+  if (drillRequest && drillRequest !== seenDrillRequest) {
+    setSeenDrillRequest(drillRequest)
+    setExpanded(true)
+    setActiveTab(DRILLS_TAB)
+  }
+  const currentTab = activeTab === DRILLS_TAB && !showDrills ? 0 : activeTab
+
+  return (
+    <Card variant="outlined">
+      <CardContent sx={{ '&:last-child': { pb: expanded ? 2 : 1 } }}>
+        <Box
+          sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}
+          onClick={() => setExpanded(!expanded)}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <i className="ri-calendar-schedule-line" style={{ fontSize: 22, color: theme.palette.primary.main }} />
+            <Typography variant="h6">{t('backups.backupJobs')}</Typography>
+          </Box>
+          <IconButton size="small">
+            <i
+              className={expanded ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'}
+              style={{ fontSize: 20 }}
+            />
+          </IconButton>
+        </Box>
+
+        <Collapse in={expanded}>
+          <Tabs
+            value={currentTab}
+            onChange={(_, v: number) => setActiveTab(v)}
+            sx={{ mt: 2, mb: 3, borderBottom: 1, borderColor: 'divider' }}
+          >
+            <Tab
+              icon={<i className="ri-server-line" style={{ fontSize: 18 }} />}
+              iconPosition="start"
+              label={`PVE (${pveConnections.length})`}
+            />
+            <Tab
+              icon={<i className="ri-archive-line" style={{ fontSize: 18 }} />}
+              iconPosition="start"
+              label={`PBS (${pbsConnections.length})`}
+            />
+            {showDrills && (
+              <Tab
+                icon={<i className="ri-lifebuoy-line" style={{ fontSize: 18 }} />}
+                iconPosition="start"
+                label={t('backups.restoreDrills.tab')}
+              />
+            )}
+          </Tabs>
+
+          {currentTab === 0 && <PveJobsTab pveConnections={pveConnections} isVdcTenant={isVdcTenant} createRequest={createRequest} onJobsChanged={onJobsChanged} />}
+          {currentTab === 1 && <PbsJobsTab pbsConnections={pbsConnections} isVdcTenant={isVdcTenant} />}
+          {currentTab === DRILLS_TAB && showDrills && <RestoreDrillsTab pveConnections={pveConnections} pbsConnections={pbsConnections} refreshKey={drillRequest?.nonce ?? 0} />}
+        </Collapse>
+      </CardContent>
+    </Card>
+  )
+}

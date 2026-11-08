@@ -1,0 +1,784 @@
+import { describe, it, expect, vi, beforeEach } from "vitest"
+
+// Capture the after() callbacks so the test can run the background dispatch.
+const h = vi.hoisted(() => ({
+  afterCbs: [] as Array<() => Promise<void>>,
+  licensed: true,
+  infra: { kind: "provider" } as any,
+  prisma: {
+    connection: { findUnique: vi.fn() },
+    migrationJob: { create: vi.fn(async () => ({ id: "job-1" })), findFirst: vi.fn(async () => null), findMany: vi.fn(async () => [] as any[]) },
+  },
+}))
+
+vi.mock("next/server", async (io) => {
+  const actual = await io<typeof import("next/server")>()
+  return { ...actual, after: (fn: () => Promise<void>) => { h.afterCbs.push(fn) } }
+})
+vi.mock("next-auth", () => ({ getServerSession: vi.fn(async () => ({ user: { id: "u1" } })) }))
+vi.mock("@/lib/auth/config", () => ({ authOptions: {} }))
+vi.mock("@/lib/auth/requireEnterprise", () => ({ hasServerFeature: vi.fn(async () => h.licensed) }))
+vi.mock("@/lib/tenant/infraScope", async (orig) => ({
+  ...(await orig<typeof import("@/lib/tenant/infraScope")>()),
+  getTenantInfrastructureScope: vi.fn(async () => h.infra),
+}))
+vi.mock("@/lib/rbac", () => ({ getCurrentRbacInfraScope: vi.fn(async () => null), checkPermission: vi.fn(async () => null), PERMISSIONS: { VM_MIGRATE: "vm.migrate", CONNECTION_MANAGE: "connection.manage" } }))
+vi.mock("@/lib/tenant", () => ({
+  getSessionPrisma: vi.fn(async () => h.prisma),
+  getCurrentTenantId: vi.fn(async () => "default"),
+  getTenantPrisma: vi.fn(() => h.prisma),
+}))
+vi.mock("@/lib/migration/warm/warm-pipeline", () => ({ runWarmMigration: vi.fn() }))
+vi.mock("@/lib/migration/warm/xcpng-warm-pipeline", () => ({ runXcpngWarmMigration: vi.fn() }))
+vi.mock("@/lib/migration/pipeline", () => ({ runMigrationPipeline: vi.fn() }))
+vi.mock("@/lib/migration/v2v-pipeline", () => ({ runV2vMigrationPipeline: vi.fn() }))
+vi.mock("@/lib/migration/xcpng-pipeline", () => ({ runXcpngMigrationPipeline: vi.fn() }))
+vi.mock("@/lib/vmware/soap", () => ({ soapLogin: vi.fn(), soapLogout: vi.fn(), soapGetVmConfig: vi.fn(), parseVmConfig: vi.fn() }))
+vi.mock("@/lib/crypto/secret", () => ({ decryptSecret: vi.fn(() => "root:pass") }))
+vi.mock("@/lib/migration/orphan-sweep", () => ({ resolveInstanceId: vi.fn(() => "inst-1") }))
+vi.mock("@/lib/tasks/sharedTask", () => ({ TERMINAL_STATUSES: ["completed", "failed", "cancelled"] }))
+
+import { GET, POST } from "./route"
+import { callRoute, readJson } from "@/__tests__/setup/route-test"
+import { runWarmMigration } from "@/lib/migration/warm/warm-pipeline"
+import { runXcpngWarmMigration } from "@/lib/migration/warm/xcpng-warm-pipeline"
+import { runMigrationPipeline } from "@/lib/migration/pipeline"
+import { runV2vMigrationPipeline } from "@/lib/migration/v2v-pipeline"
+
+const warm = runWarmMigration as unknown as ReturnType<typeof vi.fn>
+const xcpngWarm = runXcpngWarmMigration as unknown as ReturnType<typeof vi.fn>
+const cold = runMigrationPipeline as unknown as ReturnType<typeof vi.fn>
+const v2v = runV2vMigrationPipeline as unknown as ReturnType<typeof vi.fn>
+
+const body = {
+  sourceConnectionId: "src", sourceVmId: "vm-1", targetConnectionId: "tgt",
+  targetNode: "pve1", targetStorage: "local-lvm", migrationType: "warm",
+}
+
+async function runAfters() { for (const cb of h.afterCbs) await cb() }
+
+/** The `data` payload of the first migrationJob.create call of the test. */
+function createdJobData(): any {
+  return (h.prisma.migrationJob.create as any).mock.calls[0][0].data
+}
+
+beforeEach(() => {
+  h.afterCbs.length = 0
+  warm.mockReset(); xcpngWarm.mockReset(); cold.mockReset(); v2v.mockReset()
+  h.prisma.connection.findUnique.mockReset()
+  h.prisma.migrationJob.create.mockReset().mockResolvedValue({ id: "job-1" })
+  h.prisma.migrationJob.findFirst.mockReset().mockResolvedValue(null)
+})
+
+describe("POST /api/v1/migrations — warm routing", () => {
+  it("dispatches an ESXi-direct warm request to runWarmMigration, never the cold pipeline", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, downtimeBudgetSec: 600 } })
+    expect(res.status).toBe(200)
+    expect((await readJson<any>(res))?.data?.jobId).toBe("job-1")
+
+    await runAfters()
+    expect(warm).toHaveBeenCalledTimes(1)
+    expect(warm.mock.calls[0][0]).toBe("job-1")
+    // a valid downtimeBudgetSec is parsed and forwarded to the warm pipeline
+    expect(warm.mock.calls[0][1]).toMatchObject({ sourceConnectionId: "src", targetStorage: "local-lvm", downtimeBudgetSec: 600 })
+    expect(cold).not.toHaveBeenCalled()
+  })
+
+  it("forwards a manual cutoverMode to the warm pipeline", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, cutoverMode: "manual" } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ cutoverMode: "manual" })
+    // persisted too, so a retry keeps the hold instead of cutting over on its own
+    expect(h.prisma.migrationJob.create.mock.calls[0][0].data.config).toMatchObject({ cutoverMode: "manual" })
+  })
+
+  it("leaves cutoverMode out of the payload when the caller omits it", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+    expect(warm.mock.calls[0][1]).not.toHaveProperty("cutoverMode")
+  })
+
+  it("rejects an unknown cutoverMode instead of falling back to auto", async () => {
+    // Silently defaulting a typo to "auto" would cut a production VM over in the
+    // middle of the day, which is the opposite of what the caller asked for.
+    const res = await callRoute(POST, { body: { ...body, cutoverMode: "manuel" } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/cutoverMode/i)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(warm).not.toHaveBeenCalled()
+  })
+
+  // roadmap#45: a bad zeroing cap is refused, never turned into "unlimited",
+  // which is exactly what the operator is trying to avoid on a shared LUN.
+  it.each([-1, 1.5, "abc", 100_001])("rejects the zeroing cap %j before creating a job", async (cap) => {
+    const res = await callRoute(POST, { body: { ...body, zeroRateLimitMBps: cap } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/zeroRateLimitMBps/)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(warm).not.toHaveBeenCalled()
+  })
+
+  it("keeps the zeroing cap of the job on Enterprise and drops it without the migration feature", async () => {
+    const pair = () => h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    pair()
+    expect((await callRoute(POST, { body: { ...body, zeroRateLimitMBps: 150 } })).status).toBe(200)
+    expect(h.prisma.migrationJob.create.mock.calls[0][0].data.config).toMatchObject({ zeroRateLimitMBps: 150 })
+
+    h.licensed = false
+    try {
+      pair()
+      expect((await callRoute(POST, { body: { ...body, zeroRateLimitMBps: 0 } })).status).toBe(200)
+      expect(h.prisma.migrationJob.create.mock.calls[1][0].data.config).not.toHaveProperty("zeroRateLimitMBps")
+    } finally {
+      h.licensed = true
+    }
+  })
+
+  it("rejects a malformed downtimeBudgetSec before creating a job", async () => {
+    // validated up front (before the connection lookup), so no source mocks needed
+    const res = await callRoute(POST, { body: { ...body, downtimeBudgetSec: "abc" } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/downtimeBudgetSec/i)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(warm).not.toHaveBeenCalled()
+  })
+
+  // targetStorage is interpolated into `qm disk import ... ${targetStorage}` on
+  // the target node by the pipelines, so a value carrying shell metacharacters
+  // must be rejected before any job is created (command injection).
+  it.each([
+    "local-lvm; rm -rf /",
+    "$(id)",
+    "store`whoami`",
+    "a/b",
+    "store with spaces",
+  ])("rejects a malformed targetStorage %j before creating a job", async (targetStorage) => {
+    const res = await callRoute(POST, { body: { ...body, targetStorage } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/targetStorage/i)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(warm).not.toHaveBeenCalled()
+    expect(cold).not.toHaveBeenCalled()
+  })
+
+  // #608 orphan detection: the pipeline runs in this process's after()
+  // continuation, so the created row must carry this server's instance id.
+  it("persists the owner instance id on the created job", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect(h.prisma.migrationJob.create).toHaveBeenCalledTimes(1)
+    expect(h.prisma.migrationJob.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ ownerInstanceId: "inst-1" }) }),
+    )
+  })
+
+  // Boolean options must be coerced strictly: raw API callers serialise form
+  // state as strings, and `"false"` is truthy. That is how a job whose caller
+  // "did not select the option to start VM" still logged `Target VM started`
+  // (#443) — the same class of bug the new convertDisksToQcow2 flag would have.
+  it('coerces the string "false" to real false for startAfterMigration and convertDisksToQcow2', async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, startAfterMigration: "false", convertDisksToQcow2: "false" } })
+    expect(res.status).toBe(200)
+
+    // persisted config (what a retry replays) holds real booleans
+    expect(createdJobData().config.startAfterMigration).toBe(false)
+    expect(createdJobData().config.convertDisksToQcow2).toBe(false)
+
+    // and the pipeline gate receives the same
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ startAfterMigration: false, convertDisksToQcow2: false })
+  })
+
+  it("defaults both options to false when omitted, and forwards an explicit true", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValue({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    await callRoute(POST, { body })
+    expect(createdJobData().config).toMatchObject({
+      startAfterMigration: false, convertDisksToQcow2: false,
+    })
+
+    h.prisma.migrationJob.create.mockClear()
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    await callRoute(POST, { body: { ...body, startAfterMigration: true, convertDisksToQcow2: true } })
+    expect(createdJobData().config).toMatchObject({
+      startAfterMigration: true, convertDisksToQcow2: true,
+    })
+
+    await runAfters()
+    const last = warm.mock.calls[warm.mock.calls.length - 1][1]
+    expect(last).toMatchObject({ startAfterMigration: true, convertDisksToQcow2: true })
+  })
+
+  it("dispatches a vCenter warm request to runWarmMigration, never the cold pipeline", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect((await readJson<any>(res))?.data?.jobId).toBe("job-1")
+
+    await runAfters()
+    expect(warm).toHaveBeenCalledTimes(1)
+    expect(warm.mock.calls[0][0]).toBe("job-1")
+    expect(warm.mock.calls[0][1]).toMatchObject({ sourceConnectionId: "src", targetStorage: "local-lvm" })
+    expect(cold).not.toHaveBeenCalled()
+  })
+
+  it("dispatches a direct XAPI XCP-ng warm request to runXcpngWarmMigration", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "xcpng", subType: "xapi", name: "pool", baseUrl: "https://xcpng" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect((await readJson<any>(res))?.data?.jobId).toBe("job-1")
+
+    await runAfters()
+    expect(xcpngWarm).toHaveBeenCalledTimes(1)
+    expect(xcpngWarm.mock.calls[0][0]).toBe("job-1")
+    expect(xcpngWarm.mock.calls[0][1]).toMatchObject({
+      sourceConnectionId: "src",
+      sourceVmId: "vm-1",
+      targetConnectionId: "tgt",
+      targetNode: "pve1",
+      targetStorage: "local-lvm",
+      networkBridge: "vmbr0",
+    })
+    expect(warm).not.toHaveBeenCalled()
+    expect(cold).not.toHaveBeenCalled()
+  })
+
+  it("rejects XCP-ng warm migration through Xen Orchestra", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "xcpng", subType: "xo", name: "xo", baseUrl: "https://xo" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toContain("Xen Orchestra")
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects XCP-ng live migration because it is no longer available", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "xcpng", subType: "xapi", name: "pool", baseUrl: "https://xcpng" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, migrationType: "live" } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toContain("no longer available")
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+})
+
+describe("POST /api/v1/migrations, virt-v2v root filesystem", () => {
+  // v2vRoot ends up in `virt-v2v --root <value>` on the target node, so a value
+  // carrying shell metacharacters must never reach the pipeline. Rejected here
+  // rather than in the pipeline so the caller sees a 400 instead of a job that
+  // fails hours later.
+  it.each([
+    "/dev/sda2; rm -rf /",
+    "$(whoami)",
+    "root`id`",
+    "/dev/system/root /dev/sda2",
+    "/dev/system/root\nreboot",
+  ])("rejects a malformed v2vRoot %j before creating a job", async (v2vRoot) => {
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", v2vRoot } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/v2vRoot/i)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(v2v).not.toHaveBeenCalled()
+    expect(cold).not.toHaveBeenCalled()
+  })
+
+  it("forwards a valid v2vRoot to the virt-v2v pipeline", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, {
+      body: { ...body, migrationType: "cold", v2vRoot: " /dev/system/root " },
+    })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+    expect(v2v).toHaveBeenCalledTimes(1)
+    // trimmed on the way through, so the pipeline never has to guess
+    expect(v2v.mock.calls[0][1]).toMatchObject({ v2vRoot: "/dev/system/root" })
+  })
+
+  it("leaves v2vRoot out of the payload when the caller omits it", async () => {
+    // Absence matters: an empty string would be passed to virt-v2v as --root ''
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", v2vRoot: "" } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+    expect(v2v).toHaveBeenCalledTimes(1)
+    expect(v2v.mock.calls[0][1]).not.toHaveProperty("v2vRoot")
+  })
+})
+
+describe("POST /api/v1/migrations, NFC concurrency (#807)", () => {
+  const vcenterConnections = () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+  }
+
+  it.each([0, 9, -1, 2.5, "many", ""])("rejects nfcConcurrency %j before creating a job", async (nfcConcurrency) => {
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", nfcConcurrency } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toMatch(/nfcConcurrency/)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(v2v).not.toHaveBeenCalled()
+  })
+
+  it("forwards the slider value to the virt-v2v pipeline and persists it for retries", async () => {
+    vcenterConnections()
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", nfcConcurrency: 3 } })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config).toMatchObject({ nfcConcurrency: 3 })
+    await runAfters()
+    expect(v2v).toHaveBeenCalledTimes(1)
+    expect(v2v.mock.calls[0]?.[1]).toMatchObject({ nfcConcurrency: 3 })
+  })
+
+  it("accepts the value as a numeric string from a raw API caller", async () => {
+    vcenterConnections()
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", nfcConcurrency: "4" } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(v2v.mock.calls[0]?.[1]).toMatchObject({ nfcConcurrency: 4 })
+  })
+
+  it("leaves nfcConcurrency out of the payload when the caller omits it", async () => {
+    vcenterConnections()
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold" } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(v2v.mock.calls[0]?.[1]).not.toHaveProperty("nfcConcurrency")
+    expect(createdJobData().config).not.toHaveProperty("nfcConcurrency")
+  })
+})
+
+
+describe("POST /api/v1/migrations, who may migrate onto a cluster (#317)", () => {
+  it.each([
+    ["a vDC tenant, never", { kind: "iaas", vdcScope: { vnetsByConnection: new Map(), sharedBridgesByConnection: new Map() } }],
+    ["an MSP that does not own the target cluster", { kind: "msp", connectionIds: new Set(["src"]) }],
+    ["an MSP that does not own the source", { kind: "msp", connectionIds: new Set(["tgt"]) }],
+  ])("refuses %s, with a 404 that reveals nothing", async (_label, infra) => {
+    const { getCurrentTenantId } = await import("@/lib/tenant")
+    vi.mocked(getCurrentTenantId).mockResolvedValueOnce("tenant-1")
+    h.infra = infra
+    try {
+      const res = await callRoute(POST, { body: { ...body, sourceConnectionId: "src", targetConnectionId: "tgt" } })
+      expect(res.status).toBe(404)
+      expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    } finally {
+      h.infra = { kind: "provider" }
+    }
+  })
+
+  it("lets an MSP migrate between its own clusters", async () => {
+    const { getCurrentTenantId } = await import("@/lib/tenant")
+    vi.mocked(getCurrentTenantId).mockResolvedValueOnce("tenant-1")
+    h.infra = { kind: "msp", connectionIds: new Set(["src", "tgt"]) }
+    try {
+      h.prisma.connection.findUnique
+        .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+        .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+      const res = await callRoute(POST, { body: { ...body, sourceConnectionId: "src", targetConnectionId: "tgt" } })
+      expect(res.status).toBe(200)
+    } finally {
+      h.infra = { kind: "provider" }
+    }
+  })
+})
+
+describe("POST /api/v1/migrations, pinning the copy network (roadmap#53)", () => {
+  it("keeps the adapter only: an address sent by the browser is never stored", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const res = await callRoute(POST, { body: { ...body, migrationType: "warm", copyVmk: "vmk2", copyAddress: "169.254.169.254" } })
+    expect(res.status).toBe(200)
+    const config = h.prisma.migrationJob.create.mock.calls[0][0].data.config
+    expect(config).toMatchObject({ copyVmk: "vmk2" })
+    expect(config).not.toHaveProperty("copyAddress")
+    expect((await callRoute(POST, { body: { ...body, copyVmk: "eth0" } })).status).toBe(400)
+  })
+
+  it("needs the right to manage the source connection: the adapter is applied as a host network setting", async () => {
+    const { checkPermission } = await import("@/lib/rbac")
+    vi.mocked(checkPermission).mockImplementation(async (perm: string) => (perm === "connection.manage" ? Response.json({ error: "denied" }, { status: 403 }) as any : null))
+    try {
+      const res = await callRoute(POST, { body: { ...body, copyVmk: "vmk2", copyAddress: "10.42.53.21" } })
+      expect(res.status).toBe(403)
+      expect(checkPermission).toHaveBeenCalledWith("connection.manage", "connection", "src")
+      expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    } finally {
+      vi.mocked(checkPermission).mockImplementation(async () => null)
+    }
+  })
+})
+
+describe('tenant migration VLAN identity', () => {
+  it('requires an explicit VLAN grant before scheduling a migration', async () => {
+    const { getCurrentTenantId } = await import('@/lib/tenant')
+    const { checkPermission } = await import('@/lib/rbac')
+    vi.mocked(getCurrentTenantId).mockResolvedValueOnce('tenant-1')
+    vi.mocked(checkPermission).mockImplementationOnce(async () => null).mockImplementationOnce(async () => Response.json({ error: 'denied' }, { status: 403 }) as any)
+    const res = await callRoute(POST, { body: { ...body, vlanTag: 100 } })
+    expect(res.status).toBe(403)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    expect(h.afterCbs).toHaveLength(0)
+  })
+})
+
+describe("POST /api/v1/migrations, one job per source VM (roadmap#23)", () => {
+  function mockConnections() {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+  }
+
+  it("refuses with 409 while a job for the same source VM is still running, and creates nothing", async () => {
+    mockConnections()
+    h.prisma.migrationJob.findFirst.mockResolvedValueOnce({ id: "job-0", status: "transferring" })
+
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(409)
+    const json = await readJson<any>(res)
+    expect(json.error).toContain("already in progress")
+    expect(json.jobId).toBe("job-0")
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    await runAfters()
+    expect(warm).not.toHaveBeenCalled()
+  })
+
+  it("only looks at non-terminal jobs of that very source VM", async () => {
+    mockConnections()
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect(h.prisma.migrationJob.findFirst.mock.calls[0][0].where).toMatchObject({
+      sourceConnectionId: "src", sourceVmId: "vm-1", status: { notIn: ["completed", "failed", "cancelled"] },
+    })
+  })
+})
+
+describe("POST /api/v1/migrations, CPU type of the created VM (roadmap#24)", () => {
+  function mockConnections() {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+  }
+
+  it("defaults to x86-64-v2-AES, forwards it to the pipeline and persists it for retries", async () => {
+    mockConnections()
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config.cpuType).toBe("x86-64-v2-AES")
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ cpuType: "x86-64-v2-AES" })
+  })
+
+  it("forwards an offered model such as host as is", async () => {
+    mockConnections()
+    const res = await callRoute(POST, { body: { ...body, cpuType: "host" } })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config.cpuType).toBe("host")
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ cpuType: "host" })
+  })
+
+  it("rejects a model outside the offered list before creating a job", async () => {
+    const res = await callRoute(POST, { body: { ...body, cpuType: "host,flags=+aes" } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toContain("cpuType")
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+})
+
+describe("POST /api/v1/migrations, direct-ESXi cold Windows guest routed to virt-v2v", () => {
+  const esxiCold = () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi01.lab.local" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+      .mockResolvedValueOnce({
+        apiTokenEnc: "enc", baseUrl: "https://esxi01.lab.local/", insecureTLS: true,
+        sshKeyEnc: "key", sshPassEnc: null, sshEnabled: true,
+      })
+  }
+
+  beforeEach(async () => {
+    const soap = await import("@/lib/vmware/soap") as any
+    soap.soapLogin.mockReset().mockResolvedValue({ cookie: "c" })
+    soap.soapLogout.mockReset().mockResolvedValue(undefined)
+    soap.soapGetVmConfig.mockReset().mockResolvedValue("<xml/>")
+    soap.parseVmConfig.mockReset()
+  })
+
+  it("converts the datastore vmPathName into the /vmfs/volumes POSIX path", async () => {
+    const soap = await import("@/lib/vmware/soap") as any
+    soap.parseVmConfig.mockReturnValue({
+      guestOS: "Microsoft Windows Server 2022 (64-bit)", guestId: "windows2019srvNext_64Guest",
+      vmPathName: "[datastore1 SSD] win2022/win2022 copy.vmx",
+    })
+    esxiCold()
+
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold" } })
+    expect(res.status).toBe(200)
+    await runAfters()
+
+    expect(cold).not.toHaveBeenCalled()
+    expect(v2v).toHaveBeenCalledTimes(1)
+    expect(v2v.mock.calls[0][1]).toMatchObject({
+      sourceType: "esxi-direct",
+      vmxPath: "/vmfs/volumes/datastore1 SSD/win2022/win2022 copy.vmx",
+      esxiHost: "esxi01.lab.local",
+      migrationType: "cold",
+    })
+  })
+
+  it("falls back to the in-house pipeline when vmPathName has no [datastore] prefix", async () => {
+    const soap = await import("@/lib/vmware/soap") as any
+    soap.parseVmConfig.mockReturnValue({ guestOS: "Windows 11", guestId: "windows11_64Guest", vmPathName: "win11/win11.vmx" })
+    esxiCold()
+
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold" } })
+    expect(res.status).toBe(200)
+    await runAfters()
+
+    expect(v2v).not.toHaveBeenCalled()
+    expect(cold).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("POST /api/v1/migrations: review-step overrides (#317)", () => {
+  const vmwareConns = () => h.prisma.connection.findUnique
+    .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+    .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+  it("persists hardware and nics in the job config and forwards them to the warm engine", async () => {
+    vmwareConns()
+    const res = await callRoute(POST, { body: { ...body, hardware: { cores: "4", memoryMB: 8192 }, nics: [{ index: 1, bridge: "vf95117a", vlanTag: "20", model: "e1000" }, { index: 0, bridge: "vmbr0" }] } })
+    expect(res.status).toBe(200)
+    const expected = { hardware: { cores: 4, memoryMB: 8192 }, nics: [{ index: 0, bridge: "vmbr0" }, { index: 1, bridge: "vf95117a", vlanTag: 20, model: "e1000" }] }
+    expect(createdJobData().config).toMatchObject(expected)
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject(expected)
+  })
+
+  it("forwards them to the vCenter virt-v2v pipeline too", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", hardware: { sockets: 2 }, nics: [{ index: 0, bridge: "vmbr1" }] } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(v2v.mock.calls[0][1]).toMatchObject({ hardware: { sockets: 2 }, nics: [{ index: 0, bridge: "vmbr1" }] })
+  })
+
+  it("persists the per-disk storage and exclusions (lot 2) and forwards them to the warm engine", async () => {
+    vmwareConns()
+    const res = await callRoute(POST, { body: { ...body, disks: [{ index: 2, exclude: true }, { index: 1, targetStorage: "ZFS-Pool" }, { index: 0, targetStorage: "local-lvm" }] } })
+    expect(res.status).toBe(200)
+    const disks = [{ index: 0, targetStorage: "local-lvm" }, { index: 1, targetStorage: "ZFS-Pool" }, { index: 2, exclude: true }]
+    expect(createdJobData().config).toMatchObject({ disks })
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ disks })
+  })
+
+  it("forwards the per-disk storage to the vCenter virt-v2v pipeline", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: "vcenter", name: "vc", baseUrl: "https://vc" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", disks: [{ index: 1, targetStorage: "ZFS-Pool" }] } })
+    expect(res.status).toBe(200)
+    await runAfters()
+    expect(v2v.mock.calls[0][1]).toMatchObject({ disks: [{ index: 1, targetStorage: "ZFS-Pool" }] })
+  })
+
+  it("leaves the fields out when the caller omits them", async () => {
+    vmwareConns()
+    const res = await callRoute(POST, { body })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config).not.toHaveProperty("hardware")
+    expect(createdJobData().config).not.toHaveProperty("nics")
+    expect(createdJobData().config).not.toHaveProperty("disks")
+    await runAfters()
+    expect(warm.mock.calls[0][1]).not.toHaveProperty("nics")
+  })
+
+  it.each([
+    [{ hardware: { cores: 0 } }, /hardware\.cores/],
+    [{ hardware: "4" }, /hardware must be an object/],
+    [{ nics: [{ index: 0, bridge: "vmbr0; rm -rf /" }] }, /bridge/],
+    [{ nics: [{ index: 0, bridge: "vmbr0", vlanTag: 5000 }] }, /vlanTag/],
+    [{ nics: [{ index: 0, bridge: "vmbr0" }, { index: 0, bridge: "vmbr1" }] }, /listed twice/],
+    [{ disks: [{ index: 1, targetStorage: "local; rm -rf /" }] }, /targetStorage/],
+    [{ disks: [{ index: 0, exclude: true }] }, /boot disk/],
+    [{ disks: [{ index: 1, targetStorage: "a" }, { index: 1, exclude: true }] }, /listed twice/],
+    [{ disks: "local-lvm" }, /disks must be an array/],
+  ])("answers 400 on %j", async (extra, message) => {
+    vmwareConns()
+    const res = await callRoute(POST, { body: { ...body, ...extra } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toMatch(message)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+
+  it("refuses the fields on a non-VMware source instead of ignoring them", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "xcpng", subType: "xapi", name: "xcp", baseUrl: "https://xcp" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", nics: [{ index: 0, bridge: "vmbr0" }] } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toMatch(/only supported for VMware/)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+
+  it("refuses per-disk storage on a non-VMware source too", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "hyperv", subType: null, name: "hv", baseUrl: "https://hv" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", disks: [{ index: 1, targetStorage: "ZFS-Pool" }] } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res)).error).toMatch(/only supported for VMware/)
+  })
+
+  it("accepts any QEMU model Proxmox knows and a cluster custom model as cpuType", async () => {
+    for (const cpuType of ["EPYC-Rome", "custom-gold"]) {
+      h.afterCbs.length = 0
+      h.prisma.migrationJob.create.mockReset().mockResolvedValue({ id: "job-1" })
+      vmwareConns()
+      const res = await callRoute(POST, { body: { ...body, cpuType } })
+      expect(res.status).toBe(200)
+      expect(createdJobData().config.cpuType).toBe(cpuType)
+    }
+  })
+
+  it("still refuses a cpuType that is not a model name", async () => {
+    vmwareConns()
+    const res = await callRoute(POST, { body: { ...body, cpuType: "host; reboot" } })
+    expect(res.status).toBe(400)
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+})
+
+describe("POST /api/v1/migrations — guest conversion at cutover (#1000)", () => {
+  const esxi = () => h.prisma.connection.findUnique
+    .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+    .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+  it("persists the conversion as on when a VMware warm caller omits it, and forwards it", async () => {
+    esxi()
+    expect((await callRoute(POST, { body })).status).toBe(200)
+    expect(createdJobData().config).toMatchObject({ convertGuest: true })
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ convertGuest: true })
+  })
+
+  it("keeps an explicit off, and a forced bus per disk", async () => {
+    esxi()
+    const res = await callRoute(POST, { body: { ...body, convertGuest: false, disks: [{ index: 0, bus: "scsi" }] } })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config).toMatchObject({ convertGuest: false, disks: [{ index: 0, bus: "scsi" }] })
+  })
+
+  it("refuses a non-boolean value", async () => {
+    esxi()
+    const res = await callRoute(POST, { body: { ...body, convertGuest: "yes" } })
+    expect(res.status).toBe(400)
+    expect((await readJson<any>(res))?.error).toBe("convertGuest must be a boolean")
+  })
+
+  it("refuses the conversion outside a warm migration and the bus outside a VMware warm one", async () => {
+    esxi()
+    const cold = await callRoute(POST, { body: { ...body, migrationType: "cold", convertGuest: true } })
+    expect((await readJson<any>(cold))?.error).toBe("convertGuest is only available for warm migrations")
+    esxi()
+    const bus = await callRoute(POST, { body: { ...body, migrationType: "cold", disks: [{ index: 0, bus: "sata" }] } })
+    expect((await readJson<any>(bus))?.error).toBe("disks[].bus is only available for warm migrations from VMware")
+    esxi()
+    await callRoute(POST, { body: { ...body, migrationType: "cold" } })
+    expect(createdJobData().config).not.toHaveProperty("convertGuest")
+  })
+
+  it("persists and forwards the conversion of an XCP-ng warm migration too", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "xcpng", subType: "xapi", name: "pool", baseUrl: "https://xcpng" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    expect((await callRoute(POST, { body: { ...body, convertGuest: false } })).status).toBe(200)
+    expect(createdJobData().config).toMatchObject({ convertGuest: false })
+    await runAfters()
+    expect(xcpngWarm.mock.calls[0][1]).toMatchObject({ convertGuest: false })
+  })
+})
+
+describe("GET /api/v1/migrations", () => {
+  beforeEach(() => {
+    h.prisma.migrationJob.findMany.mockReset().mockResolvedValue([
+      { id: "j1", sourceVmId: "vm-1", status: "completed", bytesTransferred: BigInt(4096), totalBytes: null },
+    ])
+  })
+
+  it("lists the last jobs without reading their logs", async () => {
+    const body: any = await readJson(await callRoute(GET, { method: "GET" }))
+
+    expect(h.prisma.migrationJob.findMany).toHaveBeenCalledWith({ where: {}, omit: { logs: true }, orderBy: { createdAt: "desc" }, take: 50 })
+    expect(body.data).toEqual([{ id: "j1", sourceVmId: "vm-1", status: "completed", bytesTransferred: 4096, totalBytes: null }])
+  })
+
+  it("keeps the jobs of one source VM when the inventory asks for them", async () => {
+    await callRoute(GET, { method: "GET", searchParams: { sourceConnectionId: "src", sourceVmId: "vm-1" } })
+
+    expect((h.prisma.migrationJob.findMany.mock.calls[0] as any[])[0].where).toEqual({ sourceVmId: "vm-1", sourceConnectionId: "src" })
+  })
+})

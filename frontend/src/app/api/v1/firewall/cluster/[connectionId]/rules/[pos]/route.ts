@@ -1,0 +1,80 @@
+export const dynamic = "force-dynamic"
+// src/app/api/v1/firewall/cluster/[connectionId]/rules/[pos]/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+
+import { getOrchestratorClient } from '@/lib/orchestrator/client'
+import { verifyConnectionOwnership } from '@/lib/tenant'
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { withPublicApiGuard } from '@/lib/api-tokens/routeGuard'
+import { orchestratorOrPve } from '@/lib/firewall/withPveFallback'
+import * as pveDirect from '@/lib/firewall/pveDirect'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { withAudit } from '@/lib/audit/withAudit'
+
+// PUT /api/v1/firewall/cluster/[connectionId]/rules/[pos] - Update/move cluster rule
+async function putHandler(
+  request: NextRequest,
+  { params }: { params: Promise<{ connectionId: string; pos: string }> }
+) {
+  try {
+    const { connectionId, pos } = await params
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", connectionId)
+    if (denied) return denied
+
+    const body = await request.json()
+
+    const orchestrator = getOrchestratorClient()
+    const result = await orchestratorOrPve(
+      'firewall/cluster/rules',
+      () => orchestrator.put(`/firewall/cluster/${connectionId}/rules/${pos}`, body),
+      async () => pveDirect.updateClusterRule(await getConnectionById(connectionId), pos, body),
+    )
+
+    return NextResponse.json(result)
+  } catch (error: any) {
+    console.error('Error updating cluster rule:', error)
+    
+return NextResponse.json(
+      { error: error.message || 'Failed to update cluster rule' },
+      { status: 500 }
+    )
+  }
+}
+
+// DELETE /api/v1/firewall/cluster/[connectionId]/rules/[pos] - Delete cluster rule
+async function deleteHandler(
+  request: NextRequest,
+  { params }: { params: Promise<{ connectionId: string; pos: string }> }
+) {
+  try {
+    const { connectionId, pos } = await params
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", connectionId)
+    if (denied) return denied
+
+    const orchestrator = getOrchestratorClient()
+
+    await orchestratorOrPve(
+      'firewall/cluster/rules',
+      () => orchestrator.delete(`/firewall/cluster/${connectionId}/rules/${pos}`),
+      async () => pveDirect.deleteClusterRule(await getConnectionById(connectionId), pos),
+    )
+
+    return NextResponse.json({ status: 'deleted' })
+  } catch (error: any) {
+    console.error('Error deleting cluster rule:', error)
+    
+return NextResponse.json(
+      { error: error.message || 'Failed to delete cluster rule' },
+      { status: 500 }
+    )
+  }
+}
+
+export const PUT = withAudit({ category: 'firewall', resourceType: 'rule', resourceParam: 'pos' }, withPublicApiGuard("fw-cluster-rule-update", putHandler))
+export const DELETE = withAudit({ category: 'firewall', resourceType: 'rule', resourceParam: 'pos' }, withPublicApiGuard("fw-cluster-rule-delete", deleteHandler))

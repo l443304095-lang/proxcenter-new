@@ -1,0 +1,377 @@
+import { describe, it, expect, vi, beforeEach } from "vitest"
+
+const { isSessionTenantDisabledMock } = vi.hoisted(() => ({
+  isSessionTenantDisabledMock: vi.fn(),
+}))
+
+vi.mock("@/lib/db/prisma", () => ({
+  prisma: {
+    user: { findUnique: vi.fn(), update: vi.fn(), create: vi.fn() },
+    userTenant: { findFirst: vi.fn(), upsert: vi.fn() },
+    rbacUserRole: { findFirst: vi.fn() },
+  },
+}))
+vi.mock("@/lib/auth/password", () => ({
+  verifyPassword: vi.fn(),
+  hashPassword: vi.fn(),
+  needsRehash: vi.fn().mockReturnValue(false),
+  burnPasswordCheck: vi.fn(),
+}))
+vi.mock("@/lib/auth/verify-second-factor", () => ({
+  verifyTotpOrRecovery: vi.fn(),
+}))
+vi.mock("./ldap", () => ({
+  isLdapEnabled: vi.fn().mockResolvedValue(true),
+  authenticateLdapDetailed: vi.fn(),
+  getLdapConfig: vi.fn().mockResolvedValue(null),
+  resolveLdapRole: vi.fn(),
+  syncLdapRoleAssignment: vi.fn(),
+}))
+vi.mock("./loginLockout", () => ({ beginLoginAttempt: vi.fn() }))
+// The always-on second factor floor is proven in totpThrottle.db.test.ts;
+// here it passes the verifier's answer through.
+vi.mock("./totpThrottle", () => ({
+  withTotpThrottle: vi.fn(async (_userId: string, _context: string, verify: () => Promise<boolean>) =>
+    (await verify()) ? "ok" : "invalid"),
+}))
+vi.mock("@/lib/audit", () => ({ audit: vi.fn() }))
+vi.mock("./jwtContext", () => ({
+  loadJwtContext: vi.fn(),
+  isSessionTenantDisabled: isSessionTenantDisabledMock,
+}))
+
+import { prisma } from "@/lib/db/prisma"
+import { audit } from "@/lib/audit"
+import { verifyPassword, hashPassword, needsRehash, burnPasswordCheck } from "@/lib/auth/password"
+import { verifyTotpOrRecovery } from "@/lib/auth/verify-second-factor"
+import { authenticateLdapDetailed, getLdapConfig } from "./ldap"
+import { beginLoginAttempt } from "./loginLockout"
+import { withTotpThrottle } from "./totpThrottle"
+import { authOptions } from "./config"
+
+function authorizeOf(id: string) {
+  // CredentialsProvider keeps the custom id in `options`; the top-level id stays "credentials".
+  const p = (authOptions.providers as any[]).find((p) => (p.options?.id ?? p.id) === id)
+  return p.options.authorize.bind(p.options)
+}
+
+const REQ = { headers: { "x-forwarded-for": "203.0.113.5" } }
+const fail = vi.fn()
+const succeed = vi.fn()
+
+function lockoutReturns(locked: boolean) {
+  ;(beginLoginAttempt as any).mockResolvedValue({ locked, fail, succeed })
+}
+
+const LOCAL_USER = {
+  id: "u1", email: "a@b.com", password: "h", name: null, avatar: null,
+  enabled: true, role: "viewer", totpEnabled: false,
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  lockoutReturns(false)
+  isSessionTenantDisabledMock.mockResolvedValue(false)
+  ;(prisma.userTenant.findFirst as any).mockResolvedValue({ userId: "u1" })
+})
+
+describe("credentials authorize with the lockout policy", () => {
+  it("refuses a locked account with the wrong-password message, without checking the password", async () => {
+    lockoutReturns(true)
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+
+    await expect(authorizeOf("credentials")({ email: "A@b.com", password: "right" }, REQ)).rejects.toThrow(
+      /^Invalid credentials$/,
+    )
+    expect(beginLoginAttempt).toHaveBeenCalledWith("a@b.com", REQ, "credentials")
+    expect(verifyPassword).not.toHaveBeenCalled()
+  })
+
+  it("counts a wrong password", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(false)
+
+    await expect(authorizeOf("credentials")({ email: "a@b.com", password: "bad" }, REQ)).rejects.toThrow(
+      /^Invalid credentials$/,
+    )
+    expect(fail).toHaveBeenCalledExactlyOnceWith(true)
+    expect(succeed).not.toHaveBeenCalled()
+  })
+
+  it("counts an unknown account against the IP only, with the same message as a wrong password", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(null)
+
+    await expect(authorizeOf("credentials")({ email: "nobody@b.com", password: "x" }, REQ)).rejects.toThrow(
+      /^Invalid credentials$/,
+    )
+    expect(fail).toHaveBeenCalledExactlyOnceWith(false)
+  })
+
+  it("counts an account without a local password against the IP only", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue({ ...LOCAL_USER, password: null })
+
+    await expect(authorizeOf("credentials")({ email: "a@b.com", password: "x" }, REQ)).rejects.toThrow()
+    expect(fail).toHaveBeenCalledExactlyOnceWith(false)
+  })
+
+  it("counts a wrong second factor (2FA is checked inside the same authorize)", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue({ ...LOCAL_USER, totpEnabled: true })
+    ;(verifyPassword as any).mockResolvedValue(true)
+    ;(verifyTotpOrRecovery as any).mockResolvedValue(false)
+
+    await expect(
+      authorizeOf("credentials")({ email: "a@b.com", password: "right", totpCode: "000000" }, REQ),
+    ).rejects.toThrow(/Invalid credentials/)
+    expect(fail).toHaveBeenCalledExactlyOnceWith(true)
+  })
+
+  it("does not count the TOTP_REQUIRED step, nor reset the counter on it", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue({ ...LOCAL_USER, totpEnabled: true })
+    ;(verifyPassword as any).mockResolvedValue(true)
+
+    await expect(authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ)).rejects.toThrow(
+      "TOTP_REQUIRED",
+    )
+    expect(fail).not.toHaveBeenCalled()
+    expect(succeed).not.toHaveBeenCalled()
+  })
+
+  it("refuses a disabled tenant only after the password has been verified", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+    isSessionTenantDisabledMock.mockResolvedValue(true)
+
+    await expect(
+      authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ),
+    ).rejects.toThrow(/^Tenant disabled$/)
+
+    expect(verifyPassword).toHaveBeenCalledExactlyOnceWith("right", "h")
+    expect(isSessionTenantDisabledMock).toHaveBeenCalledExactlyOnceWith("u1")
+    expect(fail).not.toHaveBeenCalled()
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: "login_failed",
+      details: { reason: "Tenant disabled", provider: "credentials" },
+    }))
+  })
+
+  it("does not count a refusal that happens after a correct password (no tenant)", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+    ;(prisma.userTenant.findFirst as any).mockResolvedValue(null)
+    ;(prisma.rbacUserRole.findFirst as any).mockResolvedValue(null)
+
+    await expect(authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ)).rejects.toThrow()
+    expect(fail).not.toHaveBeenCalled()
+  })
+
+  it("resets the account counter on success", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+
+    const user = await authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ)
+    expect(user.id).toBe("u1")
+    expect(succeed).toHaveBeenCalledTimes(1)
+    expect(fail).not.toHaveBeenCalled()
+  })
+})
+
+describe("credentials authorize password hash upkeep", () => {
+  it("rewrites a legacy hash as argon2id after a successful login", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+    ;(needsRehash as any).mockReturnValueOnce(true)
+    ;(hashPassword as any).mockResolvedValue("$argon2id$new")
+
+    await authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ)
+
+    expect(needsRehash).toHaveBeenCalledWith("h")
+    expect(hashPassword).toHaveBeenCalledExactlyOnceWith("right")
+    expect(prisma.user.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "u1" },
+      data: expect.objectContaining({ password: "$argon2id$new" }),
+    }))
+  })
+
+  it("leaves a current hash untouched", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue(LOCAL_USER)
+    ;(verifyPassword as any).mockResolvedValue(true)
+
+    await authorizeOf("credentials")({ email: "a@b.com", password: "right" }, REQ)
+
+    expect(hashPassword).not.toHaveBeenCalled()
+    expect((prisma.user.update as any).mock.calls[0][0].data).not.toHaveProperty("password")
+  })
+
+  it("does not rehash when the second factor fails", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValue({ ...LOCAL_USER, totpEnabled: true })
+    ;(verifyPassword as any).mockResolvedValue(true)
+    ;(verifyTotpOrRecovery as any).mockResolvedValue(false)
+    ;(needsRehash as any).mockReturnValue(true)
+
+    await expect(
+      authorizeOf("credentials")({ email: "a@b.com", password: "right", totpCode: "000000" }, REQ),
+    ).rejects.toThrow(/Invalid credentials/)
+    expect(hashPassword).not.toHaveBeenCalled()
+    ;(needsRehash as any).mockReturnValue(false)
+  })
+
+  it("spends a password check on an unknown account and on an account without a local password", async () => {
+    ;(prisma.user.findUnique as any).mockResolvedValueOnce(null)
+    await expect(authorizeOf("credentials")({ email: "nobody@b.com", password: "x" }, REQ)).rejects.toThrow()
+
+    ;(prisma.user.findUnique as any).mockResolvedValueOnce({ ...LOCAL_USER, password: null })
+    await expect(authorizeOf("credentials")({ email: "a@b.com", password: "y" }, REQ)).rejects.toThrow()
+
+    expect(burnPasswordCheck).toHaveBeenNthCalledWith(1, "x")
+    expect(burnPasswordCheck).toHaveBeenNthCalledWith(2, "y")
+    expect(verifyPassword).not.toHaveBeenCalled()
+  })
+})
+
+describe("LDAP authorize with the lockout policy", () => {
+  it("refuses a locked account before binding to the directory", async () => {
+    lockoutReturns(true)
+
+    await expect(authorizeOf("ldap")({ username: "jdoe", password: "right" }, REQ)).rejects.toThrow(
+      /^Invalid LDAP credentials$/,
+    )
+    expect(beginLoginAttempt).toHaveBeenCalledWith("jdoe", REQ, "ldap")
+    expect(authenticateLdapDetailed).not.toHaveBeenCalled()
+  })
+
+  it("counts a refused bind against the account", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({ user: null, failure: "invalid_password" })
+
+    await expect(authorizeOf("ldap")({ username: "jdoe", password: "bad" }, REQ)).rejects.toThrow(
+      /^Invalid LDAP credentials$/,
+    )
+    expect(fail).toHaveBeenCalledExactlyOnceWith(true)
+  })
+
+  it("counts a user the directory does not know against the IP only, same message", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({ user: null, failure: "user_not_found" })
+
+    await expect(authorizeOf("ldap")({ username: "ghost", password: "x" }, REQ)).rejects.toThrow(
+      /^Invalid LDAP credentials$/,
+    )
+    expect(fail).toHaveBeenCalledExactlyOnceWith(false)
+  })
+
+  it("does not count an LDAP or orchestrator error", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({ user: null, failure: "error" })
+
+    await expect(authorizeOf("ldap")({ username: "jdoe", password: "x" }, REQ)).rejects.toThrow()
+    expect(fail).not.toHaveBeenCalled()
+  })
+
+  it("counts a wrong second factor", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({
+      user: { email: "j@d.io", name: "J", avatar: null, dn: "cn=j", groups: [] },
+      failure: null,
+    })
+    ;(prisma.user.findUnique as any)
+      .mockResolvedValueOnce({ id: "u2", email: "j@d.io", name: "J", role: "viewer", enabled: true })
+      .mockResolvedValueOnce({ totpEnabled: true })
+    ;(verifyTotpOrRecovery as any).mockResolvedValue(false)
+
+    await expect(
+      authorizeOf("ldap")({ username: "jdoe", password: "right", totpCode: "000000" }, REQ),
+    ).rejects.toThrow(/Invalid LDAP credentials/)
+    expect(fail).toHaveBeenCalledTimes(1)
+    expect(succeed).not.toHaveBeenCalled()
+  })
+
+  it("a throttled second factor counts against the policy too, with the same message", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({
+      user: { email: "j@d.io", name: "J", avatar: null, dn: "cn=j", groups: [] },
+      failure: null,
+    })
+    ;(prisma.user.findUnique as any)
+      .mockResolvedValueOnce({ id: "u2", email: "j@d.io", name: "J", role: "viewer", enabled: true })
+      .mockResolvedValueOnce({ totpEnabled: true })
+    ;(withTotpThrottle as any).mockResolvedValueOnce("throttled")
+
+    await expect(
+      authorizeOf("ldap")({ username: "jdoe", password: "right", totpCode: "123456" }, REQ),
+    ).rejects.toThrow(/^Invalid LDAP credentials$/)
+    expect(withTotpThrottle).toHaveBeenCalledWith("u2", "login", expect.any(Function))
+    expect(verifyTotpOrRecovery).not.toHaveBeenCalled()
+    expect(fail).toHaveBeenCalledExactlyOnceWith(true)
+  })
+
+  it("resets the account counter on success", async () => {
+    ;(authenticateLdapDetailed as any).mockResolvedValue({
+      user: { email: "j@d.io", name: "J", avatar: null, dn: "cn=j", groups: [] },
+      failure: null,
+    })
+    ;(prisma.user.findUnique as any)
+      .mockResolvedValueOnce({ id: "u2", email: "j@d.io", name: "J", role: "viewer", enabled: true })
+      .mockResolvedValueOnce({ totpEnabled: false })
+
+    const user = await authorizeOf("ldap")({ username: "jdoe", password: "right" }, REQ)
+    expect(user.id).toBe("u2")
+    expect(succeed).toHaveBeenCalledTimes(1)
+    expect(fail).not.toHaveBeenCalled()
+  })
+})
+
+// roadmap#38: the cause of a refusal reaches the server log and the audit
+// trail, while the person signing in keeps the generic message.
+describe("LDAP authorize records why a sign-in was refused", () => {
+  it("audits the orchestrator reason, never the password", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    ;(authenticateLdapDetailed as any).mockResolvedValue({
+      user: null, failure: "user_not_found", reason: "user_not_found", detail: "Invalid credentials",
+    })
+
+    await expect(authorizeOf("ldap")({ username: "bob", password: "pa55" }, REQ)).rejects.toThrow(
+      /^Invalid LDAP credentials$/,
+    )
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      action: "login_failed",
+      userEmail: "bob",
+      details: { reason: "user_not_found", provider: "ldap", detail: "Invalid credentials" },
+    }))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("user_not_found"))
+    expect(JSON.stringify((audit as any).mock.calls) + JSON.stringify(warn.mock.calls)).not.toContain("pa55")
+    warn.mockRestore()
+  })
+
+  it("audits an ambiguous match without counting it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    ;(authenticateLdapDetailed as any).mockResolvedValue({ user: null, failure: "error", reason: "ambiguous_match" })
+
+    await expect(authorizeOf("ldap")({ username: "dup", password: "x" }, REQ)).rejects.toThrow(/^Invalid LDAP credentials$/)
+    expect(fail).not.toHaveBeenCalled()
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({ details: { reason: "ambiguous_match", provider: "ldap" } }))
+    warn.mockRestore()
+  })
+
+  it("audits a refusal by the allowed-group restriction", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    ;(authenticateLdapDetailed as any).mockResolvedValue({
+      user: { email: "c@r38.lab", name: "C", avatar: null, dn: "uid=carol", groups: ["cn=vc-ops-nested,dc=x"] },
+      failure: null,
+    })
+    ;(getLdapConfig as any).mockResolvedValueOnce({ requireGroup: true, allowedGroups: ["dcvCenter Admins"] })
+
+    await expect(authorizeOf("ldap")({ username: "carol", password: "x" }, REQ)).rejects.toThrow(/not in an authorized group/)
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      details: expect.objectContaining({ reason: "not_in_allowed_group", provider: "ldap" }),
+    }))
+    warn.mockRestore()
+  })
+
+  it("a failing audit does not change the refusal", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const error = vi.spyOn(console, "error").mockImplementation(() => {})
+    ;(audit as any).mockRejectedValueOnce(new Error("db down"))
+    ;(authenticateLdapDetailed as any).mockResolvedValue({ user: null, failure: "invalid_password", reason: "invalid_password" })
+
+    await expect(authorizeOf("ldap")({ username: "jdoe", password: "x" }, REQ)).rejects.toThrow(/^Invalid LDAP credentials$/)
+    expect(error).toHaveBeenCalled()
+    warn.mockRestore()
+    error.mockRestore()
+  })
+})

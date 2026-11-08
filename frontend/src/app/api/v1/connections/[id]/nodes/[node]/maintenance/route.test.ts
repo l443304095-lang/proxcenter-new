@@ -1,0 +1,371 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+
+// The IaaS tenant gate of this route is covered by lib/tenant/iaasGuard.routes.test.ts (roadmap#189).
+vi.mock("@/lib/tenant/iaasGuard", () => ({ denyIaasTenant: async () => null }))
+
+import { callRoute, readJson } from '@/__tests__/setup/route-test'
+
+vi.mock('@/lib/connections/getConnection', () => ({
+  getConnectionById: vi.fn<(id: string) => Promise<any>>(),
+  // Real pure helper: matches the production "connection not found" detection.
+  isConnectionNotFoundError: (err: unknown) =>
+    /connection not found/i.test((err as { message?: string } | null)?.message || ''),
+}))
+
+vi.mock('@/lib/proxmox/client', () => ({
+  pveFetch: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: vi.fn<(...args: any[]) => Promise<any>>(),
+  buildNodeResourceId: vi.fn<(connId: string, node: string) => string>(
+    (connId, node) => `${connId}:${node}`
+  ),
+  PERMISSIONS: {
+    NODE_VIEW: 'node.view',
+    NODE_MANAGE: 'node.manage',
+  },
+}))
+
+vi.mock('@/lib/ssh/exec', () => ({
+  executeSSH: vi.fn<(...args: any[]) => Promise<any>>(),
+}))
+
+vi.mock('@/lib/ssh/node-ip', () => ({
+  getNodeIp: vi.fn<(...args: any[]) => Promise<string>>(),
+}))
+// Routes resolve the node through resolveNodeSshEndpoint; keep the address
+// coming from the getNodeIp mock above and the connection port (22).
+vi.mock('@/lib/ssh/node-endpoint', async () => {
+  const nodeIp = await import('@/lib/ssh/node-ip')
+  return {
+    ...(await import('@/lib/ssh/node-endpoint-core')),
+    resolveNodeSshEndpoint: async (conn: any, node: string) =>
+      ({ host: await nodeIp.getNodeIp(conn, node), port: 22, source: 'proxmox' }),
+  }
+})
+
+import { GET, POST, DELETE } from './route'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { pveFetch } from '@/lib/proxmox/client'
+import { checkPermission } from '@/lib/rbac'
+import { executeSSH } from '@/lib/ssh/exec'
+import { getNodeIp } from '@/lib/ssh/node-ip'
+import { PveLicenseExcludedError } from '@/lib/license/exclusions'
+
+const getConnectionByIdMock = getConnectionById as any
+const pveFetchMock = pveFetch as any
+const checkPermissionMock = checkPermission as any
+const executeSSHMock = executeSSH as any
+const getNodeIpMock = getNodeIp as any
+
+const CONN_ID = 'conn-1'
+const NODE = 'pve-node-01'
+const NODE_IP = '10.0.0.1'
+
+const baseParams = { id: CONN_ID, node: NODE }
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  checkPermissionMock.mockResolvedValue(null)
+  getConnectionByIdMock.mockResolvedValue({ id: CONN_ID })
+  pveFetchMock.mockResolvedValue([])
+  getNodeIpMock.mockResolvedValue(NODE_IP)
+  executeSSHMock.mockResolvedValue({ success: true, output: '' })
+})
+
+// ---------------------------------------------------------------------------
+// GET
+// ---------------------------------------------------------------------------
+describe('GET /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('returns maintenance=null when node is not in maintenance', async () => {
+    pveFetchMock.mockResolvedValue([{ node: NODE, hastate: 'started' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBeNull()
+  })
+
+  it('returns maintenance="maintenance" when hastate is maintenance', async () => {
+    pveFetchMock.mockResolvedValue([{ node: NODE, hastate: 'maintenance' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBe('maintenance')
+  })
+
+  it('returns maintenance=null when node is not in the resource list', async () => {
+    pveFetchMock.mockResolvedValue([{ node: 'other-node', hastate: 'maintenance' }])
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.data.maintenance).toBeNull()
+  })
+
+  it('500 when pveFetch rejects (cluster error now surfaces)', async () => {
+    pveFetchMock.mockRejectedValue(new Error('cluster unreachable'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toMatch(/cluster unreachable/i)
+  })
+
+  it('403 when RBAC denies node.view', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('500 when getConnectionById throws', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('404 when getConnectionById rejects with a not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(res.status).toBe(404)
+    const body = await readJson<any>(res)
+    expect(body.error).toMatch(/not found/i)
+  })
+
+  it('calls pveFetch with correct cluster resources path', async () => {
+    pveFetchMock.mockResolvedValue([])
+    await GET(new Request('http://test.local/_'), {
+      params: Promise.resolve(baseParams),
+    })
+    expect(pveFetchMock).toHaveBeenCalledWith(
+      { id: CONN_ID },
+      '/cluster/resources?type=node'
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// POST (enter maintenance)
+// ---------------------------------------------------------------------------
+describe('POST /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('403 when RBAC denies node.manage', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('404 when connection not found', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('500 when getConnectionById rejects with a non-not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('200 happy path: executes enable SSH command and returns output', async () => {
+    executeSSHMock.mockResolvedValue({ success: true, output: 'ok' })
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.success).toBe(true)
+    expect(body.method).toBe('ssh')
+    expect(body.output).toBe('ok')
+
+    expect(getNodeIpMock).toHaveBeenCalledWith({ id: CONN_ID }, NODE)
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      expect.objectContaining({ host: NODE_IP }),
+      `ha-manager crm-command node-maintenance enable ${NODE}`
+    )
+  })
+
+  it('500 when SSH command fails (success=false)', async () => {
+    executeSSHMock.mockResolvedValue({ success: false, error: 'permission denied' })
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('permission denied')
+    expect(body.hint).toContain('ha-manager crm-command node-maintenance enable')
+  })
+
+  it('500 when executeSSH throws', async () => {
+    executeSSHMock.mockRejectedValue(new Error('SSH connection refused'))
+    const res = await callRoute(POST as any, {
+      method: 'POST',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('SSH connection refused')
+  })
+
+  it('403 with its code when the cluster is outside the license (roadmap#58)', async () => {
+    // executeSSH refused the command itself, before any SSH: the route must
+    // say so with the code the UI recognises, not a generic 500.
+    executeSSHMock.mockRejectedValue(new PveLicenseExcludedError(CONN_ID))
+    const res = await callRoute(POST as any, { method: 'POST', params: baseParams })
+    expect(res.status).toBe(403)
+    const body = await readJson<any>(res)
+    expect(body).toMatchObject({ code: 'CONNECTION_LICENSE_EXCLUDED' })
+    expect(body.error).toBe('This cluster is outside the license: ProxCenter refuses any change on it.')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// DELETE (exit maintenance)
+// ---------------------------------------------------------------------------
+describe('DELETE /api/v1/connections/[id]/nodes/[node]/maintenance', () => {
+  it('403 when RBAC denies node.manage', async () => {
+    const denied = new Response(JSON.stringify({ error: 'Forbidden' }), { status: 403 })
+    checkPermissionMock.mockResolvedValue(denied)
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('404 when connection not found', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('Connection not found: conn-1'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(404)
+  })
+
+  it('500 when getConnectionById rejects with a non-not-found error', async () => {
+    getConnectionByIdMock.mockRejectedValue(new Error('DB error'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+  })
+
+  it('200 happy path: executes disable SSH command and returns output', async () => {
+    executeSSHMock.mockResolvedValue({ success: true, output: 'done' })
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(200)
+    const body = await readJson<any>(res)
+    expect(body.success).toBe(true)
+    expect(body.method).toBe('ssh')
+
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      expect.objectContaining({ host: NODE_IP }),
+      `ha-manager crm-command node-maintenance disable ${NODE}`
+    )
+  })
+
+  it('500 when SSH command fails (success=false)', async () => {
+    executeSSHMock.mockResolvedValue({ success: false, error: 'not in maintenance' })
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('not in maintenance')
+    expect(body.hint).toContain('ha-manager crm-command node-maintenance disable')
+  })
+
+  it('500 when executeSSH throws', async () => {
+    executeSSHMock.mockRejectedValue(new Error('timeout'))
+    const res = await callRoute(DELETE as any, {
+      method: 'DELETE',
+      params: baseParams,
+    })
+    expect(res.status).toBe(500)
+    const body = await readJson<any>(res)
+    expect(body.error).toBe('timeout')
+  })
+
+  it('403 with its code when the cluster is outside the license (roadmap#58)', async () => {
+    executeSSHMock.mockRejectedValue(new PveLicenseExcludedError(CONN_ID))
+    const res = await callRoute(DELETE as any, { method: 'DELETE', params: baseParams })
+    expect(res.status).toBe(403)
+    expect(await readJson<any>(res)).toMatchObject({ code: 'CONNECTION_LICENSE_EXCLUDED' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Command-injection guard: the [node] path segment is interpolated into the
+// `ha-manager crm-command ... ${node}` shell command, so a name carrying shell
+// metacharacters must be rejected with 400 before any SSH runs.
+// ---------------------------------------------------------------------------
+describe('node-name validation (command injection)', () => {
+  const MALICIOUS = [
+    'pve1; touch /tmp/pwn',
+    'pve1$(id)',
+    'pve1`whoami`',
+    'pve1 && reboot',
+    'pve1|cat /etc/passwd',
+    '-injected',
+    'a\nb',
+  ]
+
+  for (const node of MALICIOUS) {
+    it(`POST rejects ${JSON.stringify(node)} with 400 and never runs SSH`, async () => {
+      const res = await callRoute(POST as any, { method: 'POST', params: { id: CONN_ID, node } })
+      expect(res.status).toBe(400)
+      const body = await readJson<any>(res)
+      expect(body.error).toMatch(/invalid node name/i)
+      expect(executeSSHMock).not.toHaveBeenCalled()
+      expect(getNodeIpMock).not.toHaveBeenCalled()
+    })
+
+    it(`DELETE rejects ${JSON.stringify(node)} with 400 and never runs SSH`, async () => {
+      const res = await callRoute(DELETE as any, { method: 'DELETE', params: { id: CONN_ID, node } })
+      expect(res.status).toBe(400)
+      expect(executeSSHMock).not.toHaveBeenCalled()
+    })
+  }
+
+  it('accepts a well-formed node name and reaches SSH', async () => {
+    const res = await callRoute(POST as any, { method: 'POST', params: { id: CONN_ID, node: 'pve-node-02' } })
+    expect(res.status).toBe(200)
+    expect(executeSSHMock).toHaveBeenCalledWith(
+      CONN_ID,
+      expect.objectContaining({ host: NODE_IP }),
+      'ha-manager crm-command node-maintenance enable pve-node-02',
+    )
+  })
+})

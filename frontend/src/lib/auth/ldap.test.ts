@@ -1,0 +1,305 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+import { resolveLdapRole } from './ldap'
+import type { LdapConfig } from './ldap'
+import type { GroupRoleEntry } from './groupMapping'
+
+// vi.hoisted : le module est importé statiquement en tête de fichier, donc la
+// fabrique de mock s'exécute avant une simple const.
+const { findUniqueMock } = vi.hoisted(() => ({ findUniqueMock: vi.fn() }))
+
+vi.mock('@/lib/db/prisma', () => ({
+  prisma: { ldapConfig: { findUnique: findUniqueMock } },
+}))
+
+vi.mock('@/lib/crypto/secret', () => ({ decryptSecret: (v: string) => v.replace(/^enc:/, '') }))
+
+// The mapping is an ordered list; an object literal is still accepted here for
+// the tests that do not care about order (JS keeps its insertion order, so the
+// entries come out in the order they were written).
+function makeConfig(mapping: Record<string, string> | GroupRoleEntry[]): LdapConfig {
+  const entries: GroupRoleEntry[] = Array.isArray(mapping)
+    ? mapping
+    : Object.entries(mapping).map(([group, role]) => ({ group, role }))
+
+  return {
+    enabled: true,
+    url: 'ldap://example.com',
+    bindDn: '',
+    bindPassword: '',
+    baseDn: 'dc=example,dc=com',
+    userFilter: '(uid={{username}})',
+    emailAttribute: 'mail',
+    nameAttribute: 'cn',
+    tlsInsecure: false,
+    caCert: null,
+    groupAttribute: 'memberOf',
+    groupRoleMapping: entries,
+    defaultRole: 'role_viewer',
+    requireGroup: false,
+    allowedGroups: [],
+  }
+}
+
+describe('resolveLdapRole', () => {
+  it('returns null when groups list is missing or empty', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole([], cfg)).toBeNull()
+    expect(resolveLdapRole(undefined as any, cfg)).toBeNull()
+  })
+
+  it('returns null when the mapping is empty', () => {
+    const cfg = makeConfig({})
+    expect(resolveLdapRole(['admin'], cfg)).toBeNull()
+  })
+
+  it('matches a plain group name from the directory', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole(['admin'], cfg)).toBe('role_admin')
+  })
+
+  it('falls back to extracting the CN from a DN-style group', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole(['CN=admin,OU=Groups,DC=example,DC=com'], cfg)).toBe('role_admin')
+  })
+
+  it('trims whitespace on incoming group names before lookup', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole([' admin '], cfg)).toBe('role_admin')
+  })
+
+  it('trims the extracted CN before comparing', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole(['CN= admin ,OU=Groups'], cfg)).toBe('role_admin')
+  })
+
+  it('skips empty entries in the groups list', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole(['', '   ', 'admin'], cfg)).toBe('role_admin')
+  })
+
+  it('returns null when no group matches so manual roles stay intact', () => {
+    const cfg = makeConfig({ admin: 'role_admin' })
+    expect(resolveLdapRole(['unknown'], cfg)).toBeNull()
+  })
+
+  // Issue #992: for a user in several mapped groups the winner used to be
+  // whichever group the directory listed first, which no admin can influence.
+  // The mapping rows decide now, so the order shown in the form is the order
+  // that applies.
+  it('reads the mapping from the top down, whatever order the directory returns', () => {
+    const cfg = makeConfig([
+      { group: 'admins', role: 'role_admin' },
+      { group: 'devs', role: 'role_operator' },
+    ])
+    expect(resolveLdapRole(['devs', 'admins'], cfg)).toBe('role_admin')
+    expect(resolveLdapRole(['admins', 'devs'], cfg)).toBe('role_admin')
+  })
+
+  it('follows the rows when they are reordered', () => {
+    const cfg = makeConfig([
+      { group: 'devs', role: 'role_operator' },
+      { group: 'admins', role: 'role_admin' },
+    ])
+    expect(resolveLdapRole(['devs', 'admins'], cfg)).toBe('role_operator')
+  })
+
+  it('matches a row written as a CN against a member listed by its full DN', () => {
+    const cfg = makeConfig([
+      { group: 'CN=nobody,OU=Groups,DC=example,DC=com', role: 'role_viewer' },
+      { group: 'admins', role: 'role_admin' },
+    ])
+    expect(resolveLdapRole(['CN=admins,OU=Groups,DC=example,DC=com'], cfg)).toBe('role_admin')
+  })
+})
+
+/**
+ * The CA certificate of issue #981 is read from the row and forwarded to the
+ * orchestrator: it is the stored value, not the form, that has to reach the
+ * bind, otherwise a sign-in fails on a directory the test button accepted.
+ */
+const ROW = {
+  enabled: true,
+  url: 'ldaps://dc.example.org:636',
+  bindDn: 'cn=admin,dc=example,dc=org',
+  bindPasswordEnc: 'enc:secret',
+  baseDn: 'dc=example,dc=org',
+  userFilter: '(uid={{username}})',
+  emailAttribute: 'mail',
+  nameAttribute: 'cn',
+  tlsInsecure: false,
+  caCert: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----',
+  groupAttribute: 'memberOf',
+  groupRoleMapping: [],
+  defaultRole: 'role_viewer',
+  requireGroup: false,
+  allowedGroups: [],
+}
+
+describe('getLdapConfig', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('carries the stored CA certificate', async () => {
+    findUniqueMock.mockResolvedValue(ROW)
+    const { getLdapConfig } = await import('./ldap')
+    const cfg = await getLdapConfig()
+    expect(cfg?.caCert).toBe(ROW.caCert)
+  })
+
+  it('reports no certificate as null rather than an empty string', async () => {
+    findUniqueMock.mockResolvedValue({ ...ROW, caCert: null })
+    const { getLdapConfig } = await import('./ldap')
+    const cfg = await getLdapConfig()
+    expect(cfg?.caCert).toBeNull()
+  })
+})
+
+describe('authenticateLdap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('sends the stored CA certificate with the bind request', async () => {
+    findUniqueMock.mockResolvedValue(ROW)
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, user: { dn: 'uid=jdoe', email: 'jdoe@example.org', name: 'John Doe' } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { authenticateLdap } = await import('./ldap')
+    const user = await authenticateLdap('jdoe', 'secret')
+
+    expect(user?.email).toBe('jdoe@example.org')
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(sent.config.ca_cert).toBe(ROW.caCert)
+  })
+
+  it('sends an empty certificate when none is stored, leaving the system store in place', async () => {
+    findUniqueMock.mockResolvedValue({ ...ROW, caCert: null })
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ success: true, user: { dn: 'uid=jdoe', email: 'jdoe@example.org', name: 'John Doe' } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const { authenticateLdap } = await import('./ldap')
+    await authenticateLdap('jdoe', 'secret')
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).config.ca_cert).toBe('')
+  })
+})
+
+describe('authenticateLdapDetailed, failure reasons for the lockout policy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    findUniqueMock.mockResolvedValue(ROW)
+  })
+
+  function orchestratorAnswers(body: Record<string, unknown>, ok = true) {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok, status: ok ? 200 : 502, json: async () => body, text: async () => '' }))
+  }
+
+  it('user_found false = user_not_found', async () => {
+    orchestratorAnswers({ success: false, error: 'Invalid credentials', user_found: false })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('ghost', 'x')).toMatchObject({ user: null, failure: 'user_not_found', reason: 'user_not_found' })
+  })
+
+  it('user_found true = invalid_password', async () => {
+    orchestratorAnswers({ success: false, error: 'Invalid credentials', user_found: true })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('jdoe', 'x')).toMatchObject({ user: null, failure: 'invalid_password', reason: 'invalid_password' })
+  })
+
+  it('an orchestrator without user_found is read as a refused bind', async () => {
+    orchestratorAnswers({ success: false, error: 'Invalid credentials' })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('jdoe', 'x')).toMatchObject({ user: null, failure: 'invalid_password' })
+  })
+
+  it('an LDAP or orchestrator error is not a credential failure', async () => {
+    orchestratorAnswers({ success: false, error: 'Failed to connect to LDAP server: refused' })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('jdoe', 'x')).toMatchObject({ user: null, failure: 'error', reason: 'directory_error' })
+
+    orchestratorAnswers({}, false)
+    expect(await authenticateLdapDetailed('jdoe', 'x')).toMatchObject({ user: null, failure: 'error', reason: 'orchestrator_error' })
+  })
+
+  // roadmap#38: the precise cause travels with the failure so sign-in can
+  // log and audit it, without changing what the lockout counts.
+  it('keeps the orchestrator reason and error text', async () => {
+    orchestratorAnswers({ success: false, error: 'Invalid credentials', user_found: false, reason: 'user_not_found' })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('bob', 'x')).toEqual({
+      user: null, failure: 'user_not_found', reason: 'user_not_found', detail: 'Invalid credentials',
+    })
+
+    orchestratorAnswers({ success: false, error: 'Ambiguous user filter: several directory entries match this username', reason: 'ambiguous_match' })
+    expect(await authenticateLdapDetailed('dup', 'x')).toMatchObject({ failure: 'error', reason: 'ambiguous_match' })
+  })
+
+  it('reports a disabled configuration', async () => {
+    findUniqueMock.mockResolvedValue({ ...ROW, enabled: false })
+    const { authenticateLdapDetailed } = await import('./ldap')
+    expect(await authenticateLdapDetailed('jdoe', 'x')).toMatchObject({ failure: 'error', reason: 'disabled' })
+  })
+})
+
+describe('matchLdapRoleEntry', () => {
+  it('returns the winning row, not only its role', async () => {
+    const { matchLdapRoleEntry } = await import('./ldap')
+    const mapping = [{ group: 'ops', role: 'role_operator' }, { group: 'dcvCenter Admins', role: 'role_vm_admin' }]
+    expect(matchLdapRoleEntry(['cn=dcvCenter Admins,ou=groups,dc=r38,dc=lab'], mapping)).toEqual(mapping[1])
+    expect(matchLdapRoleEntry(['cn=other,dc=x'], mapping)).toBeNull()
+    expect(matchLdapRoleEntry(['ops'], null)).toBeNull()
+  })
+})
+
+describe('bindPasswordOrSaved', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('keeps the typed password', async () => {
+    const { bindPasswordOrSaved } = await import('./ldap')
+    expect(await bindPasswordOrSaved('cn=svc', 'typed')).toBe('typed')
+    expect(findUniqueMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the saved one only with a bind DN', async () => {
+    findUniqueMock.mockResolvedValue({ bindPasswordEnc: 'enc:saved' })
+    const { bindPasswordOrSaved } = await import('./ldap')
+    expect(await bindPasswordOrSaved('cn=svc', '')).toBe('saved')
+    expect(await bindPasswordOrSaved('', '')).toBeUndefined()
+    findUniqueMock.mockRejectedValue(new Error('db down'))
+    expect(await bindPasswordOrSaved('cn=svc', '')).toBeUndefined()
+  })
+})
+
+describe('ldap English error messages', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('logs a bind password that cannot be decrypted and carries on without it', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    findUniqueMock.mockResolvedValue({ ...ROW, bindPasswordEnc: 42 })
+    const { getLdapConfig } = await import('./ldap')
+    const cfg = await getLdapConfig()
+    expect(cfg?.bindPassword).toBeNull()
+    expect(errorSpy).toHaveBeenCalledWith('LDAP bind password decryption error:', expect.anything())
+  })
+
+  it('reports an unreachable orchestrator in English', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    findUniqueMock.mockResolvedValue(ROW)
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')))
+    const { authenticateLdapDetailed } = await import('./ldap')
+    await expect(authenticateLdapDetailed('jdoe', 'x')).rejects.toThrow(
+      'Communication error with the orchestrator during LDAP authentication',
+    )
+    expect(errorSpy).toHaveBeenCalledWith('Orchestrator LDAP auth error:', 'ECONNREFUSED')
+  })
+})

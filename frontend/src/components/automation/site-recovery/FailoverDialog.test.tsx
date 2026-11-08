@@ -1,0 +1,816 @@
+/**
+ * Component tests for FailoverDialog's persistent "test failover active" UI
+ * (issue #664, point 4).
+ *
+ * Before this fix, the dialog kept both the "confirm" and the "Cleanup"
+ * blocks visible once a test execution had completed (`!isExecuting` stayed
+ * true for any non-running status). It must now show exactly one of the two,
+ * driven by whether an execution is known at all — which also covers the
+ * reload case, where the execution is rehydrated from
+ * `plan.active_test_execution_id` instead of living only in React state.
+ */
+
+import { describe, expect, it, vi, afterEach } from 'vitest'
+import { cleanup } from '@testing-library/react'
+import { SWRConfig } from 'swr'
+
+import { renderWithProviders, screen, userEvent, fireEvent } from '@/__tests__/setup/renderWithProviders'
+import type { RecoveryPlan, RecoveryExecution, PlanRestorePoints } from '@/lib/orchestrator/site-recovery.types'
+
+import FailoverDialog from './FailoverDialog'
+
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+function plan(overrides: Partial<RecoveryPlan> = {}): RecoveryPlan {
+  return {
+    id: 'plan-1',
+    name: 'Prod DR',
+    description: '',
+    status: 'ready',
+    source_cluster: 'src',
+    target_cluster: 'dst',
+    vms: [{ vm_id: 100, vm_name: 'web-01', replication_job_id: 'job-1', tier: 1, boot_order: 1 }],
+    last_test: null,
+    last_failover: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...overrides,
+  }
+}
+
+function execution(overrides: Partial<RecoveryExecution> = {}): RecoveryExecution {
+  return {
+    id: 'exec-1',
+    plan_id: 'plan-1',
+    type: 'test',
+    status: 'completed',
+    started_at: '2026-01-01T00:00:00Z',
+    vm_results: [],
+    ...overrides,
+  }
+}
+
+function restorePoints(overrides: Partial<PlanRestorePoints> = {}): PlanRestorePoints {
+  return {
+    plan_id: 'plan-1',
+    target_cluster: 'dst',
+    vms: [
+      {
+        vm_id: 100,
+        vm_name: 'web-01',
+        target_vmid: 9100,
+        disk_count: 1,
+        restore_points: [
+          { snapshot: 'snap-2', created_ts: 2, created_iso: '2026-06-15T12:00:00Z' },
+          { snapshot: 'snap-1', created_ts: 1, created_iso: '2026-06-10T12:00:00Z' },
+        ],
+      },
+    ],
+    ...overrides,
+  }
+}
+
+type Props = Parameters<typeof FailoverDialog>[0]
+
+function renderDialog(overrides: Partial<Props> = {}) {
+  const onConfirm = vi.fn()
+  const onClose = vi.fn()
+
+  renderWithProviders(
+    <FailoverDialog
+      open
+      onClose={onClose}
+      plan={plan()}
+      type='test'
+      onConfirm={onConfirm}
+      execution={null}
+      {...overrides}
+    />,
+  )
+
+  return { onConfirm, onClose }
+}
+
+describe('FailoverDialog', () => {
+  it('hides Confirm and shows Cleanup once a test execution is known (completed)', () => {
+    renderDialog({ execution: execution(), onCleanup: vi.fn() })
+
+    expect(screen.queryByRole('button', { name: 'Test Failover' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cleanup test' })).toBeInTheDocument()
+  })
+
+  it('shows the Confirm button when there is no execution at all', () => {
+    renderDialog({ execution: null })
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Cleanup test' })).not.toBeInTheDocument()
+  })
+
+  it('renders the error alert when errorMessage is set', () => {
+    const message = 'A test failover is already active for this plan. Clean it up first.'
+    renderDialog({ errorMessage: message })
+
+    expect(screen.getByText(message)).toBeInTheDocument()
+  })
+
+  it('disables Confirm and shows the warning banner when the plan has an unresolved active test', () => {
+    renderDialog({
+      plan: plan({ active_test_execution_id: 'exec-1', last_test: '2026-08-01T10:00:00Z' }),
+      execution: null,
+    })
+
+    expect(screen.getByRole('button', { name: 'Test Failover' })).toBeDisabled()
+    expect(screen.getByText(/awaiting cleanup/)).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog restore-point selection (issue #664)', () => {
+  it('renders a restore-point selector per VM, defaulting to Latest', () => {
+    renderDialog({ type: 'test', restorePoints: restorePoints() })
+
+    const select = screen.getByRole('combobox')
+    expect(select).toHaveTextContent('Latest (default)')
+  })
+
+  it('shows a muted caption instead of a selector when a VM has no restore points', () => {
+    renderDialog({
+      type: 'test',
+      restorePoints: restorePoints({ vms: [{ vm_id: 100, vm_name: 'web-01', target_vmid: 9100, disk_count: 1, restore_points: [] }] }),
+    })
+
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    expect(screen.getByText('No restore points')).toBeInTheDocument()
+  })
+
+  it('sends onConfirm only the non-latest selection', async () => {
+    const { onConfirm } = renderDialog({
+      type: 'failover',
+      restorePoints: restorePoints(),
+    })
+
+    fireEvent.mouseDown(screen.getByRole('combobox'))
+    const options = await screen.findAllByRole('option')
+    // options[0] is "Latest (default)"; options[1] is the newest restore point (snap-2).
+    await userEvent.click(options[1])
+
+    await userEvent.type(screen.getByPlaceholderText('Prod DR'), 'Prod DR')
+    await userEvent.click(screen.getByRole('button', { name: 'Execute Failover' }))
+
+    expect(onConfirm).toHaveBeenCalledWith({ restorePoints: { 100: 'snap-2' } })
+  })
+
+  it('omits restorePoints (but keeps the network/delay defaults) when Latest stays selected', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', restorePoints: restorePoints() })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Test Failover' }))
+
+    expect(onConfirm).toHaveBeenCalledWith({ networkIsolated: true, screenshotDelaySeconds: 45 })
+  })
+
+  it('hides selectors and shows the info alert in degraded mode (restore points failed to load)', () => {
+    renderDialog({ type: 'test', restorePointsError: true })
+
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    expect(screen.getByText(/Restore points could not be loaded/)).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog boot screenshot step checklist (issue #664 follow-up)', () => {
+  const runningVMResults = [
+    { vm_id: 100, vm_name: 'web-01', status: 'completed' as const, progress_percent: 100 },
+  ]
+
+  it('shows the stabilize step spinning while the execution phase is stabilizing', () => {
+    renderDialog({
+      execution: execution({ status: 'running', phase: 'stabilizing', vm_results: runningVMResults }),
+    })
+
+    const label = screen.getByText('Letting guests settle')
+    const row = label.closest('div')
+
+    expect(row?.querySelector('.ri-loader-4-line')).toBeInTheDocument()
+  })
+
+  it('shows the capture step spinning while the execution phase is capturing', () => {
+    renderDialog({
+      execution: execution({ status: 'running', phase: 'capturing', vm_results: runningVMResults }),
+    })
+
+    const label = screen.getByText('Capturing boot screenshots')
+    const row = label.closest('div')
+
+    expect(row?.querySelector('.ri-loader-4-line')).toBeInTheDocument()
+
+    // The stabilize step is done by the time we're capturing.
+    const stabilizeRow = screen.getByText('Letting guests settle').closest('div')
+
+    expect(stabilizeRow?.querySelector('.ri-check-line')).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog stabilization countdown (issue #664 follow-up)', () => {
+  it('appends a live countdown to the stabilize label when phase_ends_at is set', () => {
+    renderDialog({
+      execution: execution({
+        status: 'running',
+        phase: 'stabilizing',
+        phase_ends_at: new Date(Date.now() + 30500).toISOString(),
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100 },
+        ],
+      }),
+    })
+
+    expect(screen.getByText(/Letting guests settle \(3?\d s\)/)).toBeInTheDocument()
+  })
+
+  it('does not append a countdown when phase_ends_at is absent', () => {
+    renderDialog({
+      execution: execution({
+        status: 'running',
+        phase: 'stabilizing',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100 },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Letting guests settle')).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog real-failover per-VM steps and completion summary (issue #664 follow-up)', () => {
+  it('shows the translated step caption while a failover VM is running a known step', () => {
+    renderDialog({
+      type: 'failover',
+      execution: execution({
+        type: 'failover',
+        status: 'running',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 40, step: 'fencing' },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Stopping the source VM')).toBeInTheDocument()
+  })
+
+  it('shows a completion summary alert and hides the confirm input once a failover execution has completed', () => {
+    renderDialog({
+      type: 'failover',
+      execution: execution({
+        type: 'failover',
+        status: 'completed',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100 },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Failover complete')).toBeInTheDocument()
+    expect(screen.getByText(/1\/1/)).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('Prod DR')).not.toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog failback reverse-sync monitor (issue #664 failback)', () => {
+  it('renders the per-VM sync table and both action buttons during reverse_sync', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z', last_reverse_sync_bytes: 5242880 },
+        ],
+      }),
+    })
+
+    // "web-01" appears both in the Plan Summary list above and in the new
+    // reverse-sync table — assert both are present rather than picking one.
+    expect(screen.getAllByText('web-01').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getByText(new Date('2026-08-10T10:00:00Z').toLocaleString())).toBeInTheDocument()
+    expect(screen.getByText('5 MiB')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cancel failback' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cutover' })).toBeInTheDocument()
+  })
+
+  it('shows the phase1Title heading and the table header row instead of the generic "Operation in progress" text', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Reverse replication in progress')).toBeInTheDocument()
+    expect(screen.queryByText('Operation in progress...')).not.toBeInTheDocument()
+    expect(screen.getByText('VM')).toBeInTheDocument()
+    expect(screen.getByText('Last reverse sync')).toBeInTheDocument()
+    expect(screen.getByText('Transferred')).toBeInTheDocument()
+  })
+
+  it('renders the animated data-flow banner with the DR and source endpoint labels', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+        ],
+      }),
+    })
+
+    // No `connections` prop passed here, so both endpoints fall back to
+    // their generic labels ("DR" / "Source") rather than a resolved cluster
+    // name — covered separately below.
+    const banner = screen.getByTestId('failback-flow-banner')
+    expect(banner).toBeInTheDocument()
+    expect(banner).toHaveTextContent('DR')
+    expect(banner).toHaveTextContent('Source')
+  })
+
+  it('resolves the DR and source endpoint labels from the connections list when available', () => {
+    renderDialog({
+      type: 'failback',
+      plan: plan({ source_cluster: 'src', target_cluster: 'dst' }),
+      connections: [{ id: 'src', name: 'Paris-Prod' }, { id: 'dst', name: 'Lyon-DR' }],
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+        ],
+      }),
+    })
+
+    const banner = screen.getByTestId('failback-flow-banner')
+    expect(banner).toHaveTextContent('Lyon-DR')
+    expect(banner).toHaveTextContent('Paris-Prod')
+  })
+
+  it('shows "No reverse sync yet" for a VM that has not synced back, and its error caption when set', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, error: 'disk offline' },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('No reverse sync yet')).toBeInTheDocument()
+    expect(screen.getByText('disk offline')).toBeInTheDocument()
+  })
+
+  it('shows a Close button during reverse_sync (issue: dialog unclosable for days) and calls onClose when clicked', async () => {
+    const { onClose } = renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+        ],
+      }),
+    })
+
+    const closeButton = screen.getByRole('button', { name: 'Close' })
+    expect(closeButton).toBeInTheDocument()
+    await userEvent.click(closeButton)
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it('disables Cutover while any VM has not completed a reverse sync yet', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+          { vm_id: 200, vm_name: 'web-02', status: 'running', progress_percent: 0 },
+        ],
+      }),
+    })
+
+    expect(screen.getByRole('button', { name: 'Cutover' })).toBeDisabled()
+  })
+
+  it('enables Cutover once every VM has completed at least one reverse sync', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'reverse_sync',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:00:00Z' },
+          { vm_id: 200, vm_name: 'web-02', status: 'running', progress_percent: 0, last_reverse_sync_at: '2026-08-10T10:05:00Z' },
+        ],
+      }),
+    })
+
+    expect(screen.getByRole('button', { name: 'Cutover' })).not.toBeDisabled()
+  })
+
+  it('opens a confirm dialog before calling onFailbackCutover, passing the plan id', async () => {
+    const onFailbackCutover = vi.fn()
+    renderDialog({
+      type: 'failback',
+      execution: execution({ type: 'failback', status: 'running', phase: 'reverse_sync', vm_results: [] }),
+      onFailbackCutover,
+    })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cutover' }))
+    expect(onFailbackCutover).not.toHaveBeenCalled()
+    expect(screen.getByText('Stop the DR VMs, apply the final delta and start the source VMs?')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    expect(onFailbackCutover).toHaveBeenCalledWith('plan-1')
+  })
+
+  it('opens a confirm dialog before calling onFailbackCancel, passing the plan id', async () => {
+    const onFailbackCancel = vi.fn()
+    renderDialog({
+      type: 'failback',
+      execution: execution({ type: 'failback', status: 'running', phase: 'reverse_sync', vm_results: [] }),
+      onFailbackCancel,
+    })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel failback' }))
+    expect(onFailbackCancel).not.toHaveBeenCalled()
+    expect(screen.getByText('Stop reverse replication and return the plan to failed over? Nothing is changed on the VMs.')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm' }))
+    expect(onFailbackCancel).toHaveBeenCalledWith('plan-1')
+  })
+})
+
+describe('FailoverDialog failback cutover phase (issue #664 failback)', () => {
+  it('shows the translated step caption for the final_sync step', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'running',
+        phase: 'cutover',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'running', progress_percent: 60, step: 'final_sync' },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Applying the final delta')).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog failback completion summary (issue #664 failback)', () => {
+  it('shows the failback completion summary once the execution has completed', () => {
+    renderDialog({
+      type: 'failback',
+      execution: execution({
+        type: 'failback',
+        status: 'completed',
+        vm_results: [
+          { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100 },
+        ],
+      }),
+    })
+
+    expect(screen.getByText('Failback complete')).toBeInTheDocument()
+    expect(screen.getByText('Source VMs are running and replication protects them again in the original direction.')).toBeInTheDocument()
+  })
+})
+
+describe('FailoverDialog camera button on rehydrated results (issue #664 follow-up)', () => {
+  it('shows the camera button in the Plan Summary rows for a rehydrated (non-running) execution, and opens the preview dialog on click', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([
+        { vm_id: 100, target_vmid: 9100, captured_at: '2026-08-11T07:47:35Z' },
+      ]), { status: 200, headers: { 'content-type': 'application/json' } })
+    ))
+
+    renderWithProviders(
+      // renderWithProviders's own SWRConfig sets revalidateOnMount:false; the
+      // camera button depends on the screenshots list SWR fetch actually
+      // resolving, so override it back on here (same pattern as
+      // ExecutionScreenshots.test.tsx).
+      <SWRConfig value={{ revalidateOnMount: true }}>
+        <FailoverDialog
+          open
+          onClose={vi.fn()}
+          plan={plan()}
+          type='test'
+          onConfirm={vi.fn()}
+          execution={execution({
+            status: 'completed',
+            vm_results: [
+              { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100, target_node: 'dr-1', target_vmid: 9100 },
+            ],
+          })}
+        />
+      </SWRConfig>,
+    )
+
+    const cameraButton = await screen.findByRole('button', { name: 'View boot screenshot' })
+
+    await userEvent.click(cameraButton)
+
+    const previewImg = await screen.findByRole('img')
+    expect(previewImg).toHaveAttribute('src', '/api/v1/orchestrator/replication/executions/exec-1/screenshots/100')
+  })
+})
+
+describe('FailoverDialog test-failover options (issues #744, #747)', () => {
+  const networkConnectedWarning = 'The DR VMs will boot with their production addresses on the mapped target bridges. Only run this where the DR site is not bridged to production, otherwise addresses will collide.'
+
+  it('shows the network isolation switch and screenshot delay field only for a test failover with no execution yet', () => {
+    renderDialog({ type: 'test', execution: null })
+
+    expect(screen.getByRole('switch', { name: 'Network isolation' })).toBeInTheDocument()
+    expect(screen.getByRole('spinbutton', { name: 'Boot screenshot delay' })).toBeInTheDocument()
+  })
+
+  it('hides the options block once a test execution exists, showing the status chip instead', () => {
+    renderDialog({ type: 'test', execution: execution() })
+
+    expect(screen.queryByRole('switch', { name: 'Network isolation' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Boot screenshot delay' })).not.toBeInTheDocument()
+    expect(screen.getByText('Network Isolated')).toBeInTheDocument()
+  })
+
+  it('does not show the options block for a real failover', () => {
+    renderDialog({ type: 'failover', execution: null })
+
+    expect(screen.queryByRole('switch', { name: 'Network isolation' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Boot screenshot delay' })).not.toBeInTheDocument()
+  })
+
+  it('shows the network-connected warning only after the isolation switch is turned off', async () => {
+    renderDialog({ type: 'test', execution: null })
+
+    expect(screen.queryByText(networkConnectedWarning)).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('switch', { name: 'Network isolation' }))
+
+    expect(screen.getByText(networkConnectedWarning)).toBeInTheDocument()
+  })
+
+  it('hides the warning again once the switch is turned back on', async () => {
+    renderDialog({ type: 'test', execution: null })
+
+    const isolationSwitch = screen.getByRole('switch', { name: 'Network isolation' })
+    await userEvent.click(isolationSwitch)
+    expect(screen.getByText(networkConnectedWarning)).toBeInTheDocument()
+
+    await userEvent.click(isolationSwitch)
+
+    expect(screen.queryByText(networkConnectedWarning)).not.toBeInTheDocument()
+  })
+
+  it('sends the default networkIsolated true and screenshotDelaySeconds 45 when nothing is touched', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', execution: null })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Test Failover' }))
+
+    expect(onConfirm).toHaveBeenCalledWith({ networkIsolated: true, screenshotDelaySeconds: 45 })
+  })
+
+  it('sends networkIsolated false and the edited delay after interacting with the options', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', execution: null })
+
+    await userEvent.click(screen.getByRole('switch', { name: 'Network isolation' }))
+    const delayInput = screen.getByRole('spinbutton', { name: 'Boot screenshot delay' })
+    await userEvent.clear(delayInput)
+    await userEvent.type(delayInput, '180')
+    await userEvent.click(screen.getByRole('button', { name: 'Test Failover' }))
+
+    expect(onConfirm).toHaveBeenCalledWith({ networkIsolated: false, screenshotDelaySeconds: 180 })
+  })
+
+  it('disables Confirm and never calls onConfirm once the screenshot delay is cleared', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', execution: null })
+
+    await userEvent.clear(screen.getByRole('spinbutton', { name: 'Boot screenshot delay' }))
+
+    const confirmButton = screen.getByRole('button', { name: 'Test Failover' })
+    expect(confirmButton).toBeDisabled()
+
+    // MUI sets `pointer-events: none` on a disabled button, which
+    // userEvent.click refuses to target, so use fireEvent (a plain DOM
+    // click) to prove the native `disabled` attribute blocks the handler.
+    fireEvent.click(confirmButton)
+    expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it('disables Confirm and never calls onConfirm once the screenshot delay exceeds the 600s cap', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', execution: null })
+
+    const delayInput = screen.getByRole('spinbutton', { name: 'Boot screenshot delay' })
+    await userEvent.clear(delayInput)
+    await userEvent.type(delayInput, '900')
+
+    const confirmButton = screen.getByRole('button', { name: 'Test Failover' })
+    expect(confirmButton).toBeDisabled()
+
+    fireEvent.click(confirmButton)
+    expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it('disables Confirm when the screenshot delay falls under the 5s floor', async () => {
+    const { onConfirm } = renderDialog({ type: 'test', execution: null })
+
+    const delayInput = screen.getByRole('spinbutton', { name: 'Boot screenshot delay' })
+    await userEvent.clear(delayInput)
+    await userEvent.type(delayInput, '0')
+
+    const confirmButton = screen.getByRole('button', { name: 'Test Failover' })
+    expect(confirmButton).toBeDisabled()
+
+    fireEvent.click(confirmButton)
+    expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  it('shows the "network connected" chip variant when the execution ran with the network connected', () => {
+    renderDialog({ type: 'test', execution: execution({ network_isolated: false }) })
+
+    expect(screen.getByText('Network connected')).toBeInTheDocument()
+    expect(screen.queryByText('Network Isolated')).not.toBeInTheDocument()
+  })
+
+  it('shows the "network isolated" chip variant by default (network_isolated not false)', () => {
+    renderDialog({ type: 'test', execution: execution() })
+
+    expect(screen.getByText('Network Isolated')).toBeInTheDocument()
+    expect(screen.queryByText('Network connected')).not.toBeInTheDocument()
+  })
+
+  it('still calls onConfirm without networkIsolated/screenshotDelaySeconds for a real failover', async () => {
+    const { onConfirm } = renderDialog({ type: 'failover', execution: null })
+
+    await userEvent.type(screen.getByPlaceholderText('Prod DR'), 'Prod DR')
+    await userEvent.click(screen.getByRole('button', { name: 'Execute Failover' }))
+
+    expect(onConfirm).toHaveBeenCalledWith(undefined)
+  })
+})
+
+const cloneVM = {
+  vm_id: 100, vm_name: 'web-01', status: 'completed' as const, progress_percent: 100,
+  target_node: 'dr1', test_point: 'mirror-1', test_state: 'started' as const,
+  test_clones: [{ device: 'scsi0', storage: 'local-zfs', original: 'rpool/data/vm-9100-disk-0', clone: 'rpool/data/vm-9100-disk-0-test', options: 'size=4G' }],
+}
+
+it('describes clone cleanup using the execution manifest', () => {
+  renderDialog({ execution: execution({ vm_results: [cloneVM] }), cleanupResult: { all_cleaned: true, vms_stopped: 1, disks_rolled: 1, jobs_resumed: 1, errors: [] } })
+  expect(screen.getByText(/Clones destroyed, configuration restored/)).toBeInTheDocument()
+  expect(screen.queryByText(/RBD disk\(s\) rolled back/)).not.toBeInTheDocument()
+  expect(screen.getByText(/dr1/)).toBeInTheDocument()
+})
+
+it('keeps cleanup retry available for an interrupted clone test with partial cleanup errors', async () => {
+  const onCleanup = vi.fn()
+  renderDialog({ plan: plan({ status: 'degraded', active_test_execution_id: 'exec-1' }), execution: execution({ status: 'failed', vm_results: [{ ...cloneVM, test_state: 'cleanup_pending' }] }),
+    onCleanup, cleanupResult: { vms_stopped: 1, disks_rolled: 0, jobs_resumed: 0, errors: ['clone still in use'] } })
+  expect(screen.queryByText(/Clones destroyed, configuration restored/)).not.toBeInTheDocument()
+  expect(screen.getByText('clone still in use')).toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'Cleanup test' }))
+  expect(onCleanup).toHaveBeenCalledOnce()
+})
+
+// Reported from the field: a cleanup whose call was aborted came back as an
+// error body, and the dialog read its missing `errors` key as "no errors" and
+// announced "Cleanup completed" with no detail line, while two DR guests were
+// still running on their replica images. Only all_cleaned may claim success.
+it.each([
+  ['an aborted call', { error: 'Orchestrator request timeout' }],
+  ['a payload without the verdict', { vms_stopped: 1, disks_rolled: 1, jobs_resumed: 1, errors: [] }],
+  ['an explicitly unfinished run', { all_cleaned: false, vms_stopped: 1, disks_rolled: 0, jobs_resumed: 0, errors: ['VM 2000102 is not stopped'] }],
+])('never announces a completed cleanup for %s', async (_label, cleanupResult) => {
+  const onCleanup = vi.fn()
+  renderDialog({ execution: execution(), onCleanup, cleanupResult: cleanupResult as never })
+  expect(screen.queryByText('Cleanup completed')).not.toBeInTheDocument()
+  expect(screen.getByText('Cleanup did not complete')).toBeInTheDocument()
+  await userEvent.click(screen.getByRole('button', { name: 'Cleanup test' }))
+  expect(onCleanup).toHaveBeenCalledOnce()
+})
+
+it('announces a completed cleanup only on the orchestrator verdict', () => {
+  renderDialog({ execution: execution(), onCleanup: vi.fn(), cleanupResult: { all_cleaned: true, vms_stopped: 2, disks_rolled: 3, jobs_resumed: 1, errors: [] } })
+  expect(screen.getByText('Cleanup completed')).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Cleanup test' })).not.toBeInTheDocument()
+})
+
+// ui#958: the cleanup runs on the orchestrator, past any request timeout, so
+// the dialog follows it instead of waiting. While it runs it must not borrow
+// the verdict of the previous attempt in either direction — neither the green
+// "completed" nor the orange "did not complete".
+describe('FailoverDialog cleanup in flight (ui#958)', () => {
+  const cleaningExec = () => execution({
+    phase: 'cleaning',
+    vm_results: [
+      { vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100, test_state: 'cleaning' },
+    ],
+  })
+
+  it('announces the cleanup as running rather than as a verdict', () => {
+    renderDialog({ execution: cleaningExec(), onCleanup: vi.fn(), cleanupLoading: true })
+
+    expect(screen.getByText('Cleanup in progress')).toBeInTheDocument()
+    expect(screen.queryByText('Cleanup completed')).not.toBeInTheDocument()
+    expect(screen.queryByText('Cleanup did not complete')).not.toBeInTheDocument()
+  })
+
+  it('reports guest-by-guest progress while it runs', () => {
+    renderDialog({
+      execution: cleaningExec(),
+      onCleanup: vi.fn(),
+      cleanupLoading: true,
+      cleanupResult: { guests_total: 3, guests_cleaned: 1, vms_stopped: 1, disks_rolled: 2, jobs_resumed: 0, errors: [] },
+    })
+
+    expect(screen.getByText('1 of 3 guests cleaned up')).toBeInTheDocument()
+  })
+
+  // The phase alone must carry it: a page reloaded mid-cleanup has no
+  // in-memory loading flag, only what the orchestrator wrote on the execution.
+  it('follows a cleanup that was already running before the page loaded', () => {
+    renderDialog({ execution: cleaningExec(), onCleanup: vi.fn() })
+
+    expect(screen.getByText('Cleanup in progress')).toBeInTheDocument()
+  })
+
+  it('keeps the retry button, disabled, while the cleanup runs', () => {
+    renderDialog({ execution: cleaningExec(), onCleanup: vi.fn(), cleanupLoading: true })
+
+    expect(screen.getByRole('button', { name: 'Cleanup test' })).toBeDisabled()
+  })
+
+  // The per-guest glyph is the only place that says WHICH guest is still up on
+  // its replica image: the banner counts, it does not name.
+  it('marks each guest with where its own cleanup stands', async () => {
+    const threeGuests = plan({
+      vms: [
+        { vm_id: 100, vm_name: 'VMTest1', replication_job_id: 'job-1', tier: 1, boot_order: 1 },
+        { vm_id: 101, vm_name: 'VMTest2', replication_job_id: 'job-1', tier: 1, boot_order: 2 },
+        { vm_id: 102, vm_name: 'VMTest3', replication_job_id: 'job-1', tier: 3, boot_order: 3 },
+      ],
+    })
+
+    renderDialog({
+      plan: threeGuests,
+      onCleanup: vi.fn(),
+      cleanupLoading: true,
+      execution: execution({
+        phase: 'cleaning',
+        vm_results: [
+          { vm_id: 100, vm_name: 'VMTest1', status: 'completed', progress_percent: 100, test_state: 'cleaned' },
+          { vm_id: 101, vm_name: 'VMTest2', status: 'completed', progress_percent: 100, test_state: 'cleaning' },
+          { vm_id: 102, vm_name: 'VMTest3', status: 'completed', progress_percent: 100, test_state: 'started' },
+        ],
+      }),
+    })
+
+    // A guest the cleanup has not reached yet is still up on its replica
+    // image, and must not wear the green check its boot status would give it.
+    const pending = await screen.findAllByLabelText('Still running on its replica image')
+    expect(pending).toHaveLength(1)
+    expect(await screen.findAllByLabelText('Cleaned up')).toHaveLength(1)
+    expect(await screen.findAllByLabelText('Cleaning up')).toHaveLength(1)
+  })
+
+  it('still reports the verdict once the phase clears', () => {
+    renderDialog({
+      execution: execution({ vm_results: [{ vm_id: 100, vm_name: 'web-01', status: 'completed', progress_percent: 100, test_state: 'cleaned' }] }),
+      onCleanup: vi.fn(),
+      cleanupResult: { all_cleaned: true, guests_total: 1, guests_cleaned: 1, vms_stopped: 1, disks_rolled: 1, jobs_resumed: 1, errors: [] },
+    })
+
+    expect(screen.getByText('Cleanup completed')).toBeInTheDocument()
+    expect(screen.getByText('1 of 1 guests cleaned up')).toBeInTheDocument()
+  })
+})
+
+it('shows an explicit cleanup-first banner for a 409', () => {
+  renderDialog({ type: 'failover', errorStatus: 409, errorMessage: 'raw backend error' })
+  expect(screen.getByText('A test failover is active. Run cleanup before starting this operation.')).toBeInTheDocument()
+  expect(screen.queryByText('raw backend error')).not.toBeInTheDocument()
+})

@@ -1,0 +1,205 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { callRoute } from '@/__tests__/setup/route-test'
+
+const checkPermissionMock = vi.fn()
+const getSettingMock = vi.fn()
+const setSettingMock = vi.fn()
+const updateThresholdsMock = vi.fn()
+let currentTenant = 'default'
+
+vi.mock('@/lib/rbac', () => ({
+  checkPermission: (...a: any[]) => checkPermissionMock(...a),
+  PERMISSIONS: { ADMIN_SETTINGS: 'admin.settings' },
+}))
+vi.mock('@/lib/tenant', () => ({
+  DEFAULT_TENANT_ID: 'default',
+  getCurrentTenantId: async () => currentTenant,
+}))
+vi.mock('@/lib/db/settings', () => ({
+  getSetting: (...a: any[]) => getSettingMock(...a),
+  setSetting: (...a: any[]) => setSettingMock(...a),
+}))
+vi.mock('@/lib/demo/demo-api', () => ({
+  demoResponse: () => null,
+}))
+vi.mock('@/lib/orchestrator/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/orchestrator/client')>()
+  return {
+    ...actual,
+    alertsApi: { updateThresholds: (...a: any[]) => updateThresholdsMock(...a) },
+  }
+})
+
+import { GET, PUT } from './route'
+
+const originalOrchestratorUrl = process.env.ORCHESTRATOR_URL
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  currentTenant = 'default'
+  checkPermissionMock.mockResolvedValue(null)
+  getSettingMock.mockResolvedValue(null)
+  setSettingMock.mockResolvedValue(undefined)
+  updateThresholdsMock.mockResolvedValue({ data: {}, status: 200 })
+  process.env.ORCHESTRATOR_URL = 'http://orchestrator.test'
+})
+
+afterEach(() => {
+  process.env.ORCHESTRATOR_URL = originalOrchestratorUrl
+})
+
+describe('GET /api/v1/settings/alerts/thresholds', () => {
+  it('returns the defaults with an empty exclude pattern when nothing is stored', async () => {
+    const res = await callRoute(GET as any)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.snapshot_max_age_days).toBe(7)
+    expect(body.snapshot_exclude_pattern).toBe('')
+  })
+
+  it('merges a stored pattern over the defaults and ignores a non-string one', async () => {
+    getSettingMock.mockResolvedValue({ snapshot_exclude_pattern: '(?i)replica', cpu_warning: 70 })
+    let body = await (await callRoute(GET as any)).json()
+    expect(body.snapshot_exclude_pattern).toBe('(?i)replica')
+    expect(body.cpu_warning).toBe(70)
+
+    getSettingMock.mockResolvedValue({ snapshot_exclude_pattern: 42 })
+    body = await (await callRoute(GET as any)).json()
+    expect(body.snapshot_exclude_pattern).toBe('')
+  })
+})
+
+describe('guest disk latency peak thresholds (#881)', () => {
+  it('defaults to a disabled peak check with a 500 ms critical level', async () => {
+    const body = await (await callRoute(GET as any)).json()
+    expect(body.disk_latency_peak_warning).toBe(0)
+    expect(body.disk_latency_peak_critical).toBe(500)
+  })
+
+  it('pushes the peak thresholds to the orchestrator and stores them', async () => {
+    const res = await callRoute(PUT as any, {
+      method: 'PUT',
+      body: { disk_latency_peak_warning: 150, disk_latency_peak_critical: 400 },
+    })
+    expect(res.status).toBe(200)
+    const expected = expect.objectContaining({ disk_latency_peak_warning: 150, disk_latency_peak_critical: 400 })
+    expect(updateThresholdsMock).toHaveBeenCalledWith(expected)
+    expect(setSettingMock).toHaveBeenCalledWith('alert_thresholds', 'default', expected)
+  })
+})
+
+describe('backup coverage settings (roadmap#48)', () => {
+  it('defaults to the alert off, 24 h of grace and the no-backup tag', async () => {
+    const body = await (await callRoute(GET as any)).json()
+    expect(body).toMatchObject({ backup_coverage_alerts: 0, backup_coverage_grace_hours: 24, backup_coverage_exclude_tag: 'no-backup' })
+  })
+
+  it('pushes the switch and the normalized settings to the orchestrator and stores them', async () => {
+    const res = await callRoute(PUT as any, {
+      method: 'PUT',
+      body: { backup_coverage_alerts: 1, backup_coverage_grace_hours: 48.6, backup_coverage_exclude_tag: ' Skip ' },
+    })
+    expect(res.status).toBe(200)
+    const expected = expect.objectContaining({ backup_coverage_alerts: 1, backup_coverage_grace_hours: 48, backup_coverage_exclude_tag: 'skip' })
+    expect(updateThresholdsMock).toHaveBeenCalledWith(expected)
+    expect(setSettingMock).toHaveBeenCalledWith('alert_thresholds', 'default', expected)
+  })
+
+  it('falls back to the default tag when PVE would refuse the value', async () => {
+    const body = await (await callRoute(PUT as any, { method: 'PUT', body: { backup_coverage_exclude_tag: 'has space' } })).json()
+    expect(body.backup_coverage_exclude_tag).toBe('no-backup')
+  })
+})
+
+describe('PUT /api/v1/settings/alerts/thresholds', () => {
+  it('trims the pattern, pushes it to the orchestrator and stores it', async () => {
+    const res = await callRoute(PUT as any, {
+      method: 'PUT',
+      body: { snapshot_max_age_days: 7, snapshot_exclude_pattern: '  (?i)replica ' },
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).snapshot_exclude_pattern).toBe('(?i)replica')
+    expect(updateThresholdsMock).toHaveBeenCalledWith(expect.objectContaining({ snapshot_exclude_pattern: '(?i)replica' }))
+    expect(setSettingMock).toHaveBeenCalledWith('alert_thresholds', 'default', expect.objectContaining({ snapshot_exclude_pattern: '(?i)replica' }))
+  })
+
+  it('relays the orchestrator refusal of an invalid RE2 pattern and stores nothing', async () => {
+    // The Go side rejects the regex; a JS RegExp cannot stand in for it, since
+    // JS rejects (?i) and accepts the lookahead RE2 refuses.
+    updateThresholdsMock.mockRejectedValue(new Error(
+      'Orchestrator 400: {"error":"invalid snapshot_exclude_pattern: error parsing regexp: invalid or unsupported Perl syntax: `(?!`"}',
+    ))
+    const res = await callRoute(PUT as any, {
+      method: 'PUT',
+      body: { snapshot_exclude_pattern: '(?!replica)' },
+    })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toMatch(/invalid snapshot_exclude_pattern/)
+    expect(setSettingMock).not.toHaveBeenCalled()
+  })
+
+  it('still stores the thresholds when the orchestrator is unreachable', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    updateThresholdsMock.mockRejectedValue(new Error('fetch failed'))
+    const res = await callRoute(PUT as any, {
+      method: 'PUT',
+      body: { snapshot_exclude_pattern: '(?i)replica' },
+    })
+    expect(res.status).toBe(200)
+    expect(setSettingMock).toHaveBeenCalledTimes(1)
+    warn.mockRestore()
+  })
+
+  it('stores a tenant\'s thresholds without pushing them to the shared orchestrator', async () => {
+    currentTenant = 'tenant-1'
+    const res = await callRoute(PUT as any, { method: 'PUT', body: { cpu_warning: 75, metrics_retention_days: 1 } })
+    expect(res.status).toBe(200)
+    expect(updateThresholdsMock).not.toHaveBeenCalled()
+    expect(setSettingMock).toHaveBeenCalledWith('alert_thresholds', 'tenant-1', expect.objectContaining({ cpu_warning: 75 }))
+  })
+
+  it('defaults the Ceph noout delays to 8 h and 30 min and stores them as whole, non-negative numbers (ui#1164)', async () => {
+    let body = await (await callRoute(GET as any)).json()
+    expect(body.ceph_noout_max_hours).toBe(8)
+    expect(body.ceph_noout_orphan_minutes).toBe(30)
+
+    const res = await callRoute(PUT as any, { method: 'PUT', body: { ceph_noout_max_hours: 4.7, ceph_noout_orphan_minutes: -5 } })
+    expect(res.status).toBe(200)
+    body = await res.json()
+    expect(body.ceph_noout_max_hours).toBe(4)
+    expect(body.ceph_noout_orphan_minutes).toBe(0)
+    expect(updateThresholdsMock).toHaveBeenCalledWith(expect.objectContaining({ ceph_noout_max_hours: 4, ceph_noout_orphan_minutes: 0 }))
+    expect(setSettingMock).toHaveBeenCalledWith('alert_thresholds', 'default', expect.objectContaining({ ceph_noout_max_hours: 4, ceph_noout_orphan_minutes: 0 }))
+  })
+
+  it('keeps the metrics retention within 1 to 365 whole days (#1129)', async () => {
+    for (const [sent, kept] of [[0, 1], [-5, 1], [30.7, 30], [9999, 365]]) {
+      updateThresholdsMock.mockClear()
+      await callRoute(PUT as any, { method: 'PUT', body: { metrics_retention_days: sent } })
+      expect(updateThresholdsMock).toHaveBeenCalledWith(expect.objectContaining({ metrics_retention_days: kept }))
+    }
+  })
+
+  it('keeps the Ceph history retention within 1 to 365 whole days', async () => {
+    for (const [sent, kept] of [[0, 1], [-5, 1], [45.9, 45], [9999, 365]]) {
+      updateThresholdsMock.mockClear()
+      await callRoute(PUT as any, { method: 'PUT', body: { ceph_metrics_retention_days: sent } })
+      expect(updateThresholdsMock).toHaveBeenCalledWith(expect.objectContaining({ ceph_metrics_retention_days: kept }))
+    }
+  })
+
+  it('skips the orchestrator entirely without ORCHESTRATOR_URL', async () => {
+    delete process.env.ORCHESTRATOR_URL
+    const res = await callRoute(PUT as any, { method: 'PUT', body: { cpu_warning: 75 } })
+    expect(res.status).toBe(200)
+    expect(updateThresholdsMock).not.toHaveBeenCalled()
+    expect((await res.json()).cpu_warning).toBe(75)
+  })
+
+  it('denies without the settings permission', async () => {
+    checkPermissionMock.mockResolvedValue(new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 }))
+    const res = await callRoute(PUT as any, { method: 'PUT', body: {} })
+    expect(res.status).toBe(403)
+    expect(setSettingMock).not.toHaveBeenCalled()
+  })
+})

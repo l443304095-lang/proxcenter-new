@@ -1,0 +1,1053 @@
+// src/lib/auth/config.ts
+import { NextAuthOptions } from "next-auth"
+import CredentialsProvider from "next-auth/providers/credentials"
+import type { OAuthConfig } from "next-auth/providers/oauth"
+
+import { nanoid } from "nanoid"
+
+import { prisma } from "@/lib/db/prisma"
+import { verifyPassword, hashPassword, needsRehash, burnPasswordCheck } from "./password"
+import { readGroupsClaim, isLdapGroupAllowed } from "./groupMapping"
+import { authenticateLdapDetailed, isLdapEnabled, getLdapConfig, resolveLdapRole, syncLdapRoleAssignment } from "./ldap"
+import { getOidcConfig, oidcSeedRoleId, syncOidcRoleAssignment } from "./oidc"
+import { holdsProtectedRole, oidcLinkRefusal, OIDC_LINK_REFUSED } from "./oidcLinking"
+import { oidcOpenidAgent } from "./oidcProxy"
+import { isSessionTenantDisabled, loadJwtContext } from "./jwtContext"
+import { createSession, evaluateSession, revokeSession, touchSession } from "./sessions"
+import { sessionDurations } from "./durations"
+import { beginLoginAttempt } from "./loginLockout"
+import { withTotpThrottle } from "./totpThrottle"
+
+export type UserRole = "super_admin" | "admin" | "operator" | "viewer"
+
+export interface AuthUser {
+  id: string
+  email: string
+  name: string | null
+  avatar: string | null
+  role: UserRole
+  authProvider: "credentials" | "ldap" | "oidc"
+  tenantId: string
+}
+
+declare module "next-auth" {
+  interface Session {
+    user: AuthUser
+  }
+  interface User extends AuthUser {}
+}
+
+declare module "next-auth/jwt" {
+  interface JWT {
+    id: string
+    email: string
+    name: string | null
+    // avatar is NOT stored in JWT to keep cookie size small
+    role: UserRole
+    authProvider: "credentials" | "ldap" | "oidc"
+    tenantId: string
+    mustEnroll2fa?: boolean
+    /**
+     * Server-side session row id (sessions table). Absent only on tokens
+     * issued before session hardening, or when the row insert failed at
+     * sign-in — both refused on the next read-path evaluation.
+     */
+    sid?: string
+    /** When the user authenticated, epoch ms. */
+    authAt?: number
+  }
+}
+
+// Cookie names and the `secure` flag both live in lib/auth/cookies.ts. The
+// names are static (readers must agree with the issuer); the flag is resolved
+// per request in getAuthOptions(req) so a TLS reverse proxy gets `Secure`
+// without the operator having to remember to edit NEXTAUTH_URL.
+import {
+  sessionCookieName,
+  callbackUrlCookieName,
+  csrfCookieName,
+  envPrefersSecureCookies,
+  resolveCookieSecure,
+} from './cookies'
+
+/**
+ * Record why an LDAP sign-in was refused, for the administrator only (server
+ * log + `login_failed` audit row). Before roadmap#38 every refusal collapsed
+ * into the generic message with no trace of its cause, so a filter excluding
+ * a user looked exactly like a wrong password. Never carries the password.
+ */
+async function logLdapRefusal(username: string, reason: string, detail?: string): Promise<void> {
+  console.warn(`[ldap] sign-in refused for "${username}": ${reason}${detail ? ` (${detail})` : ""}`)
+  try {
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "login_failed",
+      category: "auth",
+      userEmail: username,
+      details: { reason, provider: "ldap", ...(detail ? { detail } : {}) },
+      status: "failure",
+      errorMessage: reason,
+    })
+  } catch (e) {
+    console.error("[ldap] cannot audit the refused sign-in:", e)
+  }
+}
+
+/**
+ * Record why an OIDC identity was not bound to the local account sharing its
+ * e-mail (server log + `login_failed` audit row). The user only sees a
+ * generic refusal on the login page.
+ */
+async function logOidcLinkRefusal(email: string, reason: string): Promise<void> {
+  console.warn(`[oidc] sign-in refused for "${email}": ${reason}`)
+  try {
+    const { audit } = await import("@/lib/audit")
+    await audit({
+      action: "login_failed",
+      category: "auth",
+      userEmail: email,
+      details: { reason, provider: "oidc" },
+      status: "failure",
+      errorMessage: reason,
+    })
+  } catch (e) {
+    console.error("[oidc] cannot audit the refused sign-in:", e)
+  }
+}
+
+/**
+ * Best-effort request origin for a new session row.
+ *
+ * The jwt callback receives no request object, so this reads the ambient
+ * request headers. headers() throws outside a request scope, hence the
+ * try/catch: an unknown origin is a cosmetic loss, a thrown sign-in is not.
+ */
+async function requestOrigin(): Promise<{ ipAddress: string | null; userAgent: string | null }> {
+  try {
+    const { headers } = await import("next/headers")
+    const h = await headers()
+    const { clientIpFromHeaders } = await import("@/lib/net/clientIp")
+    return { ipAddress: await clientIpFromHeaders(h), userAgent: h.get("user-agent") }
+  } catch {
+    return { ipAddress: null, userAgent: null }
+  }
+}
+
+/**
+ * Exact messages the `jwt` callback's READ PATH throws below (never the
+ * sign-in path, which never throws). Every one is a deliberate, expected
+ * refusal — a legacy cookie with no `sid`, one of `evaluateSession`'s
+ * `DeadReason`s (missing/revoked/idle/absolute — see ./sessions.ts), a
+ * disabled account, or a user whose every tenant is disabled — not evidence
+ * of a corrupted token or a rotated NEXTAUTH_SECRET. This is an exact-match
+ * Set, not a substring test, so an unrelated error that merely mentions
+ * "session" cannot be swept in here.
+ */
+const OUR_SESSION_REFUSAL_MESSAGES = new Set<string>([
+  'Session not valid: no sid on token',
+  'Session not valid: missing',
+  'Session not valid: revoked',
+  'Session not valid: idle',
+  'Session not valid: absolute',
+  'Account disabled',
+  'Tenant disabled',
+])
+
+function isOurSessionRefusal(code: string, metadata: unknown): metadata is Error {
+  return code === 'JWT_SESSION_ERROR' && metadata instanceof Error && OUR_SESSION_REFUSAL_MESSAGES.has(metadata.message)
+}
+
+export const authOptions: NextAuthOptions = {
+  cookies: {
+    sessionToken: {
+      name: sessionCookieName(),
+      options: {
+        httpOnly: true,
+        sameSite: 'lax' as const,
+        path: '/',
+        secure: envPrefersSecureCookies(),
+      },
+    },
+    callbackUrl: {
+      name: callbackUrlCookieName(),
+      options: {
+        httpOnly: true,
+        sameSite: 'lax' as const,
+        path: '/',
+        secure: envPrefersSecureCookies(),
+      },
+    },
+    csrfToken: {
+      name: csrfCookieName(),
+      options: {
+        httpOnly: true,
+        sameSite: 'lax' as const,
+        path: '/',
+        secure: envPrefersSecureCookies(),
+      },
+    },
+  },
+  providers: [
+    CredentialsProvider({
+      id: "credentials",
+      name: "Email & Password",
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+        totpCode: { label: "TOTP", type: "text" },
+      },
+      async authorize(credentials, req) {
+        if (!credentials?.email || !credentials?.password) {
+          throw new Error("Email and password are required")
+        }
+
+        const email = credentials.email.toLowerCase().trim()
+
+        // Lockout policy: a locked account or IP gets the same answer as a
+        // wrong password, checked before the password so a correct guess
+        // reveals nothing either.
+        const attempt = await beginLoginAttempt(email, req, "credentials")
+        if (attempt.locked) {
+          throw new Error("Invalid credentials")
+        }
+
+        // Chercher l'utilisateur
+        const user = await prisma.user.findUnique({
+          where: { email },
+          select: {
+            id: true,
+            email: true,
+            password: true,
+            name: true,
+            avatar: true,
+            role: true,
+            authProvider: true,
+            enabled: true,
+            totpEnabled: true,
+          },
+        })
+
+        // Fonction pour logger les échecs et les compter pour le verrouillage.
+        // `lockout`: "account" = compte local existant (compte + IP), "ip" =
+        // pas de compte local à verrouiller (IP seule), "none" = refus après
+        // une authentification réussie (non compté).
+        const logFailure = async (reason: string, lockout: "account" | "ip" | "none" = "account") => {
+          if (lockout !== "none") await attempt.fail(lockout === "account")
+          const { audit } = await import("@/lib/audit")
+
+          await audit({
+            action: "login_failed",
+            category: "auth",
+            userEmail: email,
+            details: { reason, provider: "credentials" },
+            status: "failure",
+            errorMessage: reason,
+          })
+        }
+
+        if (!user) {
+          await burnPasswordCheck(credentials.password)
+          await logFailure("User not found", "ip")
+          throw new Error("Invalid credentials")
+        }
+
+        if (!user.enabled) {
+          await logFailure("Account disabled", user.password ? "account" : "ip")
+          throw new Error("Account disabled")
+        }
+
+        // Vérifier le mot de passe
+        if (!user.password) {
+          await burnPasswordCheck(credentials.password)
+          await logFailure("No local password", "ip")
+          throw new Error("This account uses another authentication method")
+        }
+
+        const isValid = await verifyPassword(credentials.password, user.password)
+
+        if (!isValid) {
+          await logFailure("Incorrect password")
+          throw new Error("Invalid credentials")
+        }
+
+        // Before the second factor, so a 2FA user is not told "invalid code".
+        if (await isSessionTenantDisabled(user.id)) {
+          await logFailure("Tenant disabled", "none")
+          throw new Error("Tenant disabled")
+        }
+
+        if (user.totpEnabled) {
+          if (!credentials.totpCode) {
+            throw new Error("TOTP_REQUIRED")
+          }
+          const { verifyTotpOrRecovery } = await import("@/lib/auth/verify-second-factor")
+          // The floor in totpThrottle refuses the code outright after too many
+          // wrong ones, whatever the (default off) lockout policy says. Both
+          // outcomes get the wrong-code answer and count against the policy.
+          const outcome = await withTotpThrottle(user.id, "login", () =>
+            verifyTotpOrRecovery(user.id, credentials.totpCode, null),
+          )
+          if (outcome !== "ok") {
+            await logFailure(outcome === "throttled" ? "2FA throttled" : "Invalid TOTP")
+            throw new Error("Invalid credentials")
+          }
+        }
+
+        // Mettre à jour last_login_at, et passer un hash d'ancien format
+        // (PBKDF2) ou d'anciens paramètres en argon2id courant.
+        const loginNow = new Date()
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            lastLoginAt: loginNow,
+            ...(needsRehash(user.password) ? { password: await hashPassword(credentials.password) } : {}),
+          },
+        })
+
+        // Safety net: ensure user has at least one tenant membership.
+        // Only super admins (cross-tenant by design) get the auto-attach
+        // to the provider tenant `default`. A tenant-scoped user with
+        // zero memberships has been stripped of access by an admin
+        // action; re-attaching them to `default` would silently elevate
+        // them to provider scope. Refuse the login instead so the
+        // operator sees the issue and re-assigns the user explicitly.
+        const anyMembership = await prisma.userTenant.findFirst({
+          where: { userId: user.id },
+          select: { userId: true },
+        })
+
+        if (!anyMembership) {
+          const isSuperAdmin = await prisma.rbacUserRole.findFirst({
+            where: {
+              userId: user.id,
+              roleId: "role_super_admin",
+              OR: [{ expiresAt: null }, { expiresAt: { gt: loginNow } }],
+            },
+            select: { id: true },
+          })
+          if (!isSuperAdmin) {
+            await logFailure("No tenant membership", "none")
+            throw new Error("Account has no tenant, contact your administrator")
+          }
+          await prisma.userTenant.upsert({
+            where: { userId_tenantId: { userId: user.id, tenantId: "default" } },
+            update: {},
+            create: { userId: user.id, tenantId: "default", isDefault: true, joinedAt: loginNow },
+          })
+        }
+
+        await attempt.succeed()
+
+        return {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar || null,
+          role: user.role as UserRole,
+          authProvider: "credentials",
+          tenantId: "default",
+        }
+      },
+    }),
+    CredentialsProvider({
+      id: "ldap",
+      name: "LDAP / Active Directory",
+      credentials: {
+        username: { label: "Username", type: "text" },
+        password: { label: "Password", type: "password" },
+        totpCode: { label: "TOTP", type: "text" },
+      },
+      async authorize(credentials, req) {
+        if (!credentials?.username || !credentials?.password) {
+          throw new Error("Username and password are required")
+        }
+
+        // Vérifier si LDAP est activé
+        if (!(await isLdapEnabled())) {
+          throw new Error("LDAP authentication is not configured")
+        }
+
+        // Lockout policy, checked before the LDAP bind (see credentials above).
+        const attempt = await beginLoginAttempt(credentials.username, req, "ldap")
+        if (attempt.locked) {
+          throw new Error("Invalid LDAP credentials")
+        }
+
+        // Authentifier via LDAP
+        const outcome = await authenticateLdapDetailed(
+          credentials.username,
+          credentials.password
+        )
+        const ldapUser = outcome.user
+
+        if (!ldapUser) {
+          // Lockout: a refused bind counts against the account, a user the
+          // directory does not know against the IP only, an LDAP error not at all.
+          const { failure, reason, detail } = outcome as Extract<typeof outcome, { user: null }>
+          if (failure !== "error") await attempt.fail(failure === "invalid_password")
+          // The cause stays server-side (log + audit trail, roadmap#38): the
+          // person signing in sees the same message whatever the reason.
+          await logLdapRefusal(credentials.username, reason, detail)
+          throw new Error("Invalid LDAP credentials")
+        }
+
+        // Check group restriction BEFORE creating/updating user
+        const ldapConfigForRestriction = await getLdapConfig()
+        if (ldapConfigForRestriction?.requireGroup && ldapConfigForRestriction.allowedGroups.length > 0) {
+          if (!isLdapGroupAllowed(ldapUser.groups, ldapConfigForRestriction.allowedGroups)) {
+            await logLdapRefusal(credentials.username, "not_in_allowed_group", `${ldapUser.dn} holds ${ldapUser.groups.length} group(s), none of them allowed`)
+            throw new Error("Access denied: your LDAP account is not in an authorized group")
+          }
+        }
+
+        const email = ldapUser.email.toLowerCase()
+
+        // Chercher ou créer l'utilisateur (Postgres)
+        let user = await prisma.user.findUnique({
+          where: { email },
+          select: { id: true, email: true, name: true, role: true, enabled: true },
+        })
+
+        const now = new Date()
+
+        if (!user) {
+          // Créer l'utilisateur LDAP
+          const id = nanoid()
+          await prisma.user.create({
+            data: {
+              id,
+              email,
+              name: ldapUser.name,
+              avatar: ldapUser.avatar,
+              role: "viewer",
+              authProvider: "ldap",
+              ldapDn: ldapUser.dn,
+              enabled: true,
+              createdAt: now,
+              updatedAt: now,
+              lastLoginAt: now,
+            },
+          })
+
+          // Add new LDAP user to default tenant (idempotent on retry).
+          await prisma.userTenant.upsert({
+            where: { userId_tenantId: { userId: id, tenantId: "default" } },
+            update: {},
+            create: { userId: id, tenantId: "default", isDefault: true, joinedAt: now },
+          })
+
+          user = { id, email, name: ldapUser.name, role: "viewer", enabled: true }
+        } else {
+          if (!user.enabled) {
+            throw new Error("Account disabled")
+          }
+
+          // Mettre à jour les infos LDAP, avatar et last_login_at
+          await prisma.user.update({
+            where: { id: user.id },
+            data: {
+              name: ldapUser.name,
+              avatar: ldapUser.avatar,
+              ldapDn: ldapUser.dn,
+              lastLoginAt: now,
+              updatedAt: now,
+            },
+          })
+
+          // Safety net only — see credentials provider above for rationale.
+          const hasAnyLdapTenant = await prisma.userTenant.findFirst({
+            where: { userId: user.id },
+            select: { userId: true },
+          })
+
+          if (!hasAnyLdapTenant) {
+            const isSuperAdmin = await prisma.rbacUserRole.findFirst({
+              where: {
+                userId: user.id,
+                roleId: "role_super_admin",
+                OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+              },
+              select: { id: true },
+            })
+            if (!isSuperAdmin) {
+              throw new Error("Account has no tenant, contact your administrator")
+            }
+            await prisma.userTenant.upsert({
+              where: { userId_tenantId: { userId: user.id, tenantId: "default" } },
+              update: {},
+              create: { userId: user.id, tenantId: "default", isDefault: true, joinedAt: now },
+            })
+          }
+        }
+
+        // Sync RBAC role from LDAP groups (Postgres / Prisma). The assignment
+        // is created with scopeType "inherit" so it follows the role's default
+        // scope automatically (issue #383); the helper keys its delete/replace
+        // on the ldap_ id prefix so manual assignments are never clobbered.
+        const ldapConfig = await getLdapConfig()
+        if (ldapConfig) {
+          const resolvedRoleId = resolveLdapRole(ldapUser.groups, ldapConfig)
+          await syncLdapRoleAssignment(prisma, {
+            userId: user.id,
+            resolvedRoleId,
+            defaultRoleId: ldapConfig.defaultRole || "role_viewer",
+            now,
+            newId: () => `ldap_${nanoid(12)}`,
+          })
+        }
+
+        // After the group sync (it can move the user between tenants), before
+        // the second factor (see credentials above).
+        if (await isSessionTenantDisabled(user.id)) {
+          throw new Error("Tenant disabled")
+        }
+
+        const localUser = await prisma.user.findUnique({
+          where: { id: user.id },
+          select: { totpEnabled: true },
+        })
+        if (localUser?.totpEnabled) {
+          if (!credentials.totpCode) {
+            throw new Error("TOTP_REQUIRED")
+          }
+          const { verifyTotpOrRecovery } = await import("@/lib/auth/verify-second-factor")
+          // Same always-on floor as the credentials provider above.
+          const outcome = await withTotpThrottle(user.id, "login", () =>
+            verifyTotpOrRecovery(user.id, credentials.totpCode, null),
+          )
+          if (outcome !== "ok") {
+            await attempt.fail(true)
+            throw new Error("Invalid LDAP credentials")
+          }
+        }
+
+        await attempt.succeed()
+
+        return {
+          id: user.id,
+          email: user.email,
+          name: ldapUser.name || user.name,
+          avatar: ldapUser.avatar || null,
+          role: user.role as UserRole,
+          authProvider: "ldap",
+          tenantId: "default",
+        }
+      },
+    }),
+  ],
+  callbacks: {
+    async signIn({ user, account, profile }) {
+      // Handle OIDC provider sign-in: provision or update user in SQLite
+      if (account?.provider === 'oidc' && profile) {
+        const oidcConfig = await getOidcConfig()
+
+        if (!oidcConfig || !oidcConfig.enabled) return false
+
+        const now = new Date()
+        const sub = (profile as any).sub as string
+        const email = ((profile as any)[oidcConfig.claimEmail] || (profile as any).email || '').toLowerCase().trim()
+        const name = (profile as any)[oidcConfig.claimName] || (profile as any).name || email
+        // groups + whether the IdP actually sent an array (even empty); the
+        // latter decides whether the group->role re-sync is authoritative (#442).
+        const { groups, groupsClaimIsArray } = readGroupsClaim(profile as any, oidcConfig.claimGroups)
+
+        if (!email) return false
+
+        // Look up by oidc_sub first, then by email
+        let existing = await prisma.user.findFirst({
+          where: { oidcSub: sub },
+          select: { id: true, email: true, name: true, role: true, enabled: true, oidcSub: true },
+        })
+
+        const matchedByEmail = !existing
+
+        if (!existing) {
+          existing = await prisma.user.findUnique({
+            where: { email },
+            select: { id: true, email: true, name: true, role: true, enabled: true, oidcSub: true },
+          })
+        }
+
+        // Set when this login created the account: the provisioning below seeds
+        // a `default` membership so the account is never tenant-less, and that
+        // seed has to be cleaned up if the mapping placed the user elsewhere.
+        let justProvisioned = false
+
+        if (existing) {
+          if (!existing.enabled) return false
+
+          // Found by e-mail only: binding this identity to the account is a decision, not a given.
+          if (matchedByEmail) {
+            const accountId = existing.id
+            const refusal = await oidcLinkRefusal({
+              storedSub: existing.oidcSub,
+              emailVerified: (profile as any).email_verified,
+              isProtectedAccount: () => holdsProtectedRole(accountId, now),
+            })
+
+            if (refusal) {
+              await logOidcLinkRefusal(email, refusal)
+              return `/login?error=${OIDC_LINK_REFUSED}`
+            }
+          }
+
+          // Update existing user. The legacy users.role column is left as-is
+          // (mirrors LDAP); the authoritative RBAC assignment is re-synced from
+          // the current groups below (issue #383).
+          await prisma.user.update({
+            where: { id: existing.id },
+            data: {
+              name,
+              oidcSub: sub,
+              lastLoginAt: now,
+              updatedAt: now,
+              authProvider: "oidc",
+            },
+          })
+
+          // Safety net only — see credentials provider above for rationale.
+          const hasAnyTenant = await prisma.userTenant.findFirst({
+            where: { userId: existing.id },
+            select: { userId: true },
+          })
+
+          if (!hasAnyTenant) {
+            const isSuperAdmin = await prisma.rbacUserRole.findFirst({
+              where: {
+                userId: existing.id,
+                roleId: "role_super_admin",
+                OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+              },
+              select: { id: true },
+            })
+            if (!isSuperAdmin) {
+              throw new Error("Account has no tenant, contact your administrator")
+            }
+            await prisma.userTenant.upsert({
+              where: { userId_tenantId: { userId: existing.id, tenantId: "default" } },
+              update: {},
+              create: { userId: existing.id, tenantId: "default", isDefault: true, joinedAt: now },
+            })
+          }
+
+          user.id = existing.id
+          user.email = existing.email
+          user.name = name
+          user.role = existing.role as UserRole
+          user.authProvider = 'oidc'
+        } else {
+          // Auto-provision new user
+          if (!oidcConfig.autoProvision) return false
+
+          const id = nanoid()
+          // Legacy users.role display column (the authoritative RBAC assignment
+          // is created by syncOidcRoleAssignment below).
+          const roleName = oidcSeedRoleId(groups, oidcConfig).replace(/^role_/, '')
+
+          await prisma.user.create({
+            data: {
+              id,
+              email,
+              name,
+              role: roleName,
+              authProvider: "oidc",
+              oidcSub: sub,
+              enabled: true,
+              createdAt: now,
+              updatedAt: now,
+              lastLoginAt: now,
+            },
+          })
+
+          // Add user to default tenant
+          await prisma.userTenant.upsert({
+            where: { userId_tenantId: { userId: id, tenantId: "default" } },
+            update: {},
+            create: { userId: id, tenantId: "default", isDefault: true, joinedAt: now },
+          })
+
+          user.id = id
+          user.email = email
+          user.name = name
+          user.role = roleName as UserRole
+          user.authProvider = 'oidc'
+          justProvisioned = true
+        }
+
+        // Re-sync the RBAC assignments from the current IdP groups on every
+        // login (new or existing), mirroring the LDAP path. A mapping entry may
+        // name a tenant and a vDC, so this reconciles every oidc_ row across
+        // tenants and keeps membership in step; manual assignments are never
+        // touched (issues #383, #940).
+        //
+        // lib/tenant is imported lazily: it pulls lib/auth/principal, which
+        // would close an import cycle back onto this module.
+        const { addUserToTenant, removeUserFromTenant } = await import("@/lib/tenant")
+        await syncOidcRoleAssignment(prisma, {
+          userId: user.id,
+          groups,
+          config: oidcConfig,
+          now,
+          newId: () => `oidc_${nanoid(12)}`,
+          groupsClaimIsArray,
+          membership: {
+            add: (userId, tenantId) => addUserToTenant(userId, tenantId),
+            remove: (userId, tenantId) => removeUserFromTenant(userId, tenantId),
+          },
+        })
+
+        // A brand new account mapped only into customer tenants would otherwise
+        // stay a member of the provider tenant with no role there, i.e. a ghost
+        // in its member list. removeUserFromTenant keeps its own guards, so a
+        // user this would leave tenant-less simply keeps the seed.
+        if (justProvisioned) {
+          const roleInDefault = await prisma.rbacUserRole.findFirst({
+            where: {
+              userId: user.id,
+              tenantId: "default",
+              OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+            },
+            select: { id: true },
+          })
+          if (!roleInDefault) {
+            try {
+              await removeUserFromTenant(user.id, "default")
+            } catch (e: any) {
+              console.warn(`[oidc] keeping the default membership of ${user.id}: ${e?.message || e}`)
+            }
+          }
+        }
+
+        // Same refusal as a disabled account above (the local providers throw
+        // "Tenant disabled" from authorize instead).
+        if (await isSessionTenantDisabled(user.id)) return false
+      }
+
+      return true
+    },
+    async jwt({ token, user, account }) {
+      // ---- SIGN-IN PATH -------------------------------------------------
+      // callbacks.jwt runs here from core/routes/callback.js:397-413, which
+      // has NO try/catch around it. Anything thrown below is a 500 on login
+      // for every user. This branch must therefore swallow every error.
+      if (user) {
+        token.id = user.id
+        token.email = user.email
+        token.name = user.name
+        // Don't store avatar in JWT to keep cookie size small
+        // Avatar will be fetched from DB in session callback
+        token.role = user.role
+        token.authProvider = account?.provider === 'oidc' ? 'oidc' : user.authProvider
+
+        try {
+          const origin = await requestOrigin()
+          // The id_token is kept for RP-initiated logout: without an
+          // id_token_hint the IdP either refuses to end its own session or asks
+          // the user to confirm, and the local sign-out alone leaves the SSO
+          // session standing. It goes on the session ROW, never in the cookie:
+          // with group claims it weighs several KB, and a cookie that size is
+          // rejected on the HTTP/1.1 upgrade the consoles open (the same
+          // request rides HTTP/2 everywhere else, where HPACK hides it).
+          token.sid = await createSession({
+            userId: user.id,
+            ...origin,
+            idToken: account?.provider === 'oidc' ? (account.id_token ?? null) : null,
+          })
+          token.authAt = Date.now()
+        } catch (e: any) {
+          // No sid means the next read-path evaluation refuses this token, so
+          // the user is asked to sign in again. That is the safe outcome; a
+          // 500 here would deny everyone.
+          console.error('[auth-session] could not create the session row:', e?.message ?? e)
+        }
+
+        try {
+          const ctx = await loadJwtContext(user.id, null)
+          token.tenantId = ctx.tenantId
+          token.mustEnroll2fa = ctx.mustEnroll2fa
+        } catch {
+          token.tenantId = token.tenantId || 'default'
+          token.mustEnroll2fa = false
+        }
+
+        return token
+      }
+
+      // ---- READ PATH ----------------------------------------------------
+      // Reached from core/routes/session.js:53, which IS wrapped in a
+      // try/catch that calls sessionStore.clean(). Throwing here therefore
+      // clears the cookie and makes getServerSession return null, which is
+      // exactly the refusal we want, on every guarded route, with no
+      // call-site changes.
+      if (!token.id) return token
+
+      const sid = token.sid ?? null
+      if (!sid) {
+        // A token with no sid predates session hardening (or its row insert
+        // failed at sign-in): no row can vouch for it, so refuse without a
+        // database read. This is the intended one-off reconnection at deploy,
+        // and it must hold even while the database is unreachable — the
+        // fail-open below only protects sessions that were once valid.
+        throw new Error('Session not valid: no sid on token')
+      }
+
+      let ctx
+      try {
+        ctx = await loadJwtContext(token.id, sid)
+      } catch (e: any) {
+        // FAIL OPEN, deliberately: a Postgres outage already breaks every
+        // route (they all need the DB, including to decrypt the PVE token),
+        // so refusing buys no security and only causes a reconnection storm
+        // when the database comes back. Logged loudly on purpose.
+        console.error('[auth-session] validity check unavailable, allowing:', e?.message ?? e)
+        return token
+      }
+
+      if (!ctx.enabled) {
+        throw new Error('Account disabled')
+      }
+
+      // Every tenant of the user is disabled (roadmap#79). With one left, the
+      // session moves to it (loadJwtContext). Disabling a tenant also revokes
+      // the sessions running in it (updateTenant); this covers the rest.
+      if (!ctx.tenantEnabled) {
+        throw new Error('Tenant disabled')
+      }
+
+      const verdict = evaluateSession(ctx.session)
+      if (!verdict.alive) {
+        // Cast: tsconfig has strict:false, which disables discriminated-union
+        // narrowing, so `verdict.reason` does not typecheck on its own.
+        const { reason } = verdict as { alive: false; reason: string }
+        throw new Error(`Session not valid: ${reason}`)
+      }
+
+      token.tenantId = ctx.tenantId
+      token.mustEnroll2fa = ctx.mustEnroll2fa
+      if (!token.authAt && ctx.session) token.authAt = ctx.session.createdAt.getTime()
+
+      // Throttled inside touchSession using the row we already read.
+      try {
+        await touchSession(sid, new Date(), ctx.session)
+      } catch (e: any) {
+        console.warn('[auth-session] lastSeenAt refresh failed:', e?.message ?? e)
+      }
+
+      return token
+    },
+    async session({ session, token }) {
+      // Fetch avatar from DB instead of storing in JWT (avoids large cookies)
+      let avatar: string | null = null
+      try {
+        const user = await prisma.user.findUnique({
+          where: { id: token.id as string },
+          select: { avatar: true },
+        })
+        avatar = user?.avatar || null
+      } catch (e) {
+        // Ignore DB errors for avatar fetch
+      }
+
+      session.user = {
+        id: token.id as string,
+        email: token.email as string,
+        name: token.name as string | null,
+        avatar,
+        role: token.role as UserRole,
+        authProvider: token.authProvider as "credentials" | "ldap" | "oidc",
+        tenantId: (token.tenantId as string) || 'default',
+      }
+
+      return session
+    },
+  },
+  events: {
+    async signIn({ user }) {
+      // Repair accounts created while the Community super-admin grant was
+      // wrongly withheld (issue #755): Community hides the role picker, so
+      // without this the operator has no way to give them any right at all.
+      // No-op on every other installation, and on any user who already holds
+      // a grant. Never allowed to block a login that already succeeded.
+      try {
+        const { backfillCommunitySuperAdmin } = await import("@/lib/auth/communitySuperAdmin")
+        await backfillCommunitySuperAdmin(user.id)
+      } catch (e) {
+        console.error("[auth] Community super-admin backfill failed:", e)
+      }
+
+      // Audit login réussi
+      const { audit } = await import("@/lib/audit")
+
+      await audit({
+        action: "login",
+        category: "auth",
+        userId: user.id,
+        userEmail: user.email || undefined,
+        details: { provider: (user as any).authProvider || "credentials" },
+        status: "success",
+      })
+    },
+    async signOut({ token }) {
+      // Without this the row stays alive until its idle or absolute timeout,
+      // so a cookie captured before sign-out keeps working (roadmap#80).
+      // Local, LDAP and OIDC sign-outs (federatedSignOut included) all land
+      // here. A failure must not block the sign-out itself.
+      if (token?.sid && token?.id) {
+        try {
+          await revokeSession(token.sid as string, token.id as string)
+        } catch (e: any) {
+          console.error('[auth-session] could not revoke the session at sign-out:', e?.message ?? e)
+        }
+      }
+
+      // Audit logout
+      const { audit } = await import("@/lib/audit")
+
+      await audit({
+        action: "logout",
+        category: "auth",
+        userId: token?.id as string,
+        userEmail: token?.email as string,
+        status: "success",
+      })
+    },
+  },
+  pages: {
+    signIn: "/login",
+    error: "/login",
+  },
+  // Every idle timeout, absolute-cap expiry, revocation, and pre-branch
+  // cookie surfaces as a JWT_SESSION_ERROR (next-auth core/routes/session.js
+  // catches the jwt callback's throw, calls sessionStore.clean(), logs, and
+  // returns an empty body). next-auth's default logger prints those at
+  // `error` level with a full stack — indistinguishable from a genuine
+  // decode failure (corrupted token, changed NEXTAUTH_SECRET), so the real
+  // signal drowns in routine noise. Only OUR own refusals (matched exactly
+  // above) are downgraded to one quiet info line with no stack; everything
+  // else falls through untouched.
+  //
+  // It cannot delegate to next-auth's real default logger: `next-auth/utils
+  // /logger` is not a published subpath (its package.json `exports` map
+  // omits it; `require("next-auth/utils/logger")` throws
+  // ERR_PACKAGE_PATH_NOT_EXPORTED). An earlier version of this reproduced
+  // that default's `formatError` inline (Error -> {message, stack, name}),
+  // but that reformatting only special-cased a bare Error: for the several
+  // codes next-auth reports with an ENVELOPE object — OAUTH_CALLBACK_ERROR,
+  // OAUTH_CALLBACK_HANDLER_ERROR, OAUTH_PARSE_PROFILE_ERROR,
+  // SIGNIN_OAUTH_ERROR, SIGNIN_EMAIL_ERROR — it discarded every sibling key
+  // (providerId, error_description, the raw OAuthProfile, ...) and kept only
+  // the nested `.error`. That is exactly the OIDC diagnostic detail this app
+  // needs when SSO breaks, so instead of rebuilding next-auth's formatting,
+  // log the metadata exactly as received: `console.error` already renders a
+  // bare Error with its message and stack, and renders an envelope object
+  // with every one of its fields, so nothing can be dropped because nothing
+  // is reconstructed. The cosmetic difference from next-auth's own default
+  // shape is an acceptable trade for never losing a diagnostic field.
+  logger: {
+    error(code, metadata) {
+      if (isOurSessionRefusal(code, metadata)) {
+        console.info('[auth-session] session refused, cookie cleared:', metadata.message)
+        return
+      }
+
+      console.error(`[next-auth][error][${code}]`, metadata)
+    },
+  },
+  session: {
+    strategy: "jwt",
+    // Derived from SESSION_ABSOLUTE_TIMEOUT (default 7 days) so the cookie
+    // cannot outlive the session. This is only the second barrier: the row in
+    // `sessions` is what actually decides, since a JWT's exp is frozen at
+    // encoding time. Evaluated once at module load, which is correct: the
+    // environment is fixed when the process starts.
+    //
+    // updateAge is intentionally absent: next-auth only reads it in the
+    // database branch (core/routes/session.js:109, inside the else), so with
+    // strategy "jwt" it did nothing. lastSeenAt throttling is ours.
+    maxAge: Math.ceil(sessionDurations().absoluteMs / 1000),
+  },
+  secret: process.env.NEXTAUTH_SECRET || "build-time-placeholder",
+}
+
+/**
+ * Returns authOptions with OIDC included when configured, and with the cookie
+ * `secure` flag resolved against THIS request's transport.
+ *
+ * `req` is optional: getServerSession(authOptions) callers only read the JWT
+ * and never issue a cookie, so they do not need it. The NextAuth route handler
+ * does issue cookies, and passes it.
+ */
+export async function getAuthOptions(req?: Request): Promise<NextAuthOptions> {
+  const secure = resolveCookieSecure(req?.headers)
+
+  const withSecure = (opts: NextAuthOptions): NextAuthOptions => ({
+    ...opts,
+    cookies: {
+      sessionToken: {
+        name: sessionCookieName(),
+        options: { ...opts.cookies!.sessionToken!.options, secure },
+      },
+      callbackUrl: {
+        name: callbackUrlCookieName(),
+        options: { ...opts.cookies!.callbackUrl!.options, secure },
+      },
+      csrfToken: {
+        name: csrfCookieName(),
+        options: { ...opts.cookies!.csrfToken!.options, secure },
+      },
+    },
+  })
+
+  const oidcConfig = await getOidcConfig()
+
+  if (!oidcConfig || !oidcConfig.enabled || !oidcConfig.issuerUrl || !oidcConfig.clientId) {
+    return withSecure(authOptions)
+  }
+
+  let issuerBase = oidcConfig.issuerUrl
+  while (issuerBase.endsWith('/')) issuerBase = issuerBase.slice(0, -1)
+
+  const oidcProvider: OAuthConfig<any> = {
+    id: 'oidc',
+    name: oidcConfig.providerName || 'SSO',
+    type: 'oauth',
+    // When manual endpoint overrides are used we skip .well-known discovery,
+    // so openid-client has no canonical issuer to validate the id_token `iss`
+    // claim against and rejects every callback with `expected undefined`.
+    // Passing `issuer` here gives it the value to compare against.
+    issuer: oidcConfig.authorizationUrl ? oidcConfig.issuerUrl : undefined,
+    wellKnown: oidcConfig.authorizationUrl ? undefined : `${issuerBase}/.well-known/openid-configuration`,
+    authorization: oidcConfig.authorizationUrl ? {
+      url: oidcConfig.authorizationUrl,
+      params: { scope: oidcConfig.scopes },
+    } : { params: { scope: oidcConfig.scopes } },
+    token: oidcConfig.tokenUrl || undefined,
+    userinfo: oidcConfig.userinfoUrl || undefined,
+    clientId: oidcConfig.clientId,
+    clientSecret: oidcConfig.clientSecret || '',
+    idToken: true,
+    checks: ['state'],
+    // Discovery, token exchange, JWKS and userinfo are made by this server:
+    // they go through the outbound proxy when one is set (roadmap#78). Always
+    // passed, see oidcOpenidAgent. 10 s instead of openid-client's 3.5 s, a
+    // tunnel through a corporate proxy adds round trips.
+    httpOptions: { agent: oidcOpenidAgent(oidcConfig, issuerBase), timeout: 10000 } as any,
+    allowDangerousEmailAccountLinking: true,
+    profile(profile) {
+      return {
+        id: profile.sub,
+        email: profile[oidcConfig.claimEmail] || profile.email,
+        name: profile[oidcConfig.claimName] || profile.name,
+        avatar: profile.picture || null,
+        role: 'viewer' as UserRole,
+        authProvider: 'oidc' as const,
+        tenantId: 'default',
+      }
+    },
+  }
+
+  return withSecure({
+    ...authOptions,
+    providers: [...authOptions.providers, oidcProvider],
+  })
+}

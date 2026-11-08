@@ -1,0 +1,422 @@
+// Site Recovery Types - Ceph RBD and ZFS cross-cluster replication & disaster recovery
+
+import type { ScheduleSpec } from '@/components/automation/site-recovery/schedule/types'
+
+export type StorageEngine = 'rbd' | 'zfs'
+
+export interface ReplicationStorages {
+  engines: StorageEngine[]
+  rbd: Array<{ storage: string; pool: string }>
+  zfs: Array<{ storage: string; node: string; pool: string; availBytes: number; totalBytes: number; availFormatted: string; active: boolean }>
+}
+
+export interface ReplicableVM {
+  vmid: number
+  node: string
+  diskGb: number
+  mixed: boolean
+  unsupported: boolean
+}
+
+export interface ReplicationCheckRequest {
+  source_cluster: string
+  target_cluster: string
+  storage_engine?: StorageEngine
+  target_node?: string
+  vm_ids?: number[]
+  tags?: string[]
+}
+
+export interface SSHConnectivityResult {
+  connected: boolean
+  source_node: string
+  target_node?: string
+  target_ip: string
+  error?: string
+  checks?: Array<{ source_node: string; target_node: string; ok: boolean; error?: string }>
+}
+
+export interface SnapshotIdentity {
+  cluster_id: string
+  storage_engine?: StorageEngine
+  node?: string
+  pool: string
+  image: string
+  snapshot: string
+}
+
+// ============================================
+// Replication Jobs
+// ============================================
+
+export type ReplicationJobStatus = 'synced' | 'syncing' | 'error' | 'paused' | 'pending' | 'failed_over' | 'no_match' | 'partial'
+
+export interface BandwidthWindow {
+  days: number[]          // 0=Sun, 1=Mon, …, 6=Sat
+  start_hour: number      // 0-23
+  end_hour: number        // 0-23, wraparound if end <= start
+  rate_limit_mbps: number
+}
+
+export interface ReplicationJob {
+  id: string
+  name: string
+  vm_ids: number[]
+  /** Guests this job currently skips because their replica runs on the DR site. */
+  suspended_vmids?: number[]
+  vm_names: string[]
+  tags: string[]            // stored tags for dynamic resolution (empty = VM-based job)
+  source_cluster: string
+  target_cluster: string
+  target_pool: string
+  storage_engine: StorageEngine
+  target_node?: string
+  vmid_prefix: number
+  // Decorate the replica's own name so production and DR are told apart in
+  // the inventory. Empty = the replica carries the source name unchanged.
+  vm_name_prefix?: string
+  vm_name_suffix?: string
+  status: ReplicationJobStatus
+  schedule: string
+  schedule_spec: ScheduleSpec | null   // null = RPO mode
+  timezone: string                     // IANA, "" = UTC
+  rpo_target: number      // seconds
+  last_sync?: string | null
+  next_sync?: string | null
+  retry_count: number
+  next_retry_at?: string | null
+  throughput_bps: number
+  rate_limit_mbps: number
+  bandwidth_windows: BandwidthWindow[]
+  network_mapping: Record<string, string>  // source bridge → target bridge
+  progress_percent: number
+  error_message?: string
+  created_at: string
+  updated_at: string
+  snapshot_keep_source?: number
+  snapshot_keep_target?: number
+}
+
+export interface CreateReplicationJobRequest {
+  name?: string
+  vm_ids: number[]
+  tags?: string[]
+  source_cluster: string
+  target_cluster: string
+  target_pool: string
+  storage_engine: StorageEngine
+  target_node?: string
+  schedule?: string
+  rpo_target?: number
+  schedule_spec?: ScheduleSpec | null
+  timezone?: string
+  rate_limit_mbps: number
+  bandwidth_windows?: BandwidthWindow[]
+  vmid_prefix?: number
+  vm_name_prefix?: string
+  vm_name_suffix?: string
+  install_pv?: boolean
+  network_mapping: Record<string, string>
+  snapshot_keep_source?: number
+  snapshot_keep_target?: number
+}
+
+export interface UpdateReplicationJobRequest {
+  /** Replaces the guest list of a VM-based job (the tag set for a tag-based one). */
+  vm_ids?: number[]
+  tags?: string[]
+  name?: string
+  schedule_spec?: ScheduleSpec | null
+  clear_schedule_spec?: boolean
+  timezone?: string
+  rpo_target?: number
+  rate_limit_mbps?: number
+  bandwidth_windows?: BandwidthWindow[]
+  network_mapping?: Record<string, string>
+  snapshot_keep_source?: number
+  snapshot_keep_target?: number
+  // Editable, unlike vmid_prefix: the replica's config is rewritten from the
+  // source at every sync, so a new affix lands on the next cycle.
+  vm_name_prefix?: string
+  vm_name_suffix?: string
+}
+
+export interface ReplicationJobLog {
+  created_at: string
+  level: 'info' | 'warning' | 'error'
+  message: string
+  bytes_sent: number
+  duration_ms: number
+}
+
+// ============================================
+// Recovery Plans
+// ============================================
+
+// 'partially_failed_over' is derived from the per-guest states: some guests
+// of the plan run on the DR site, the others still replicate (ui#943).
+export type RecoveryPlanStatus = 'ready' | 'degraded' | 'executing' | 'failed' | 'not_ready' | 'failed_over' | 'partially_failed_over' | 'failing_back'
+
+// The DR state of one guest inside a plan. A guest without an entry is
+// protected: it replicates normally and its replica sits stopped.
+export type RecoveryPlanGuestState = 'failing_over' | 'failed_over' | 'failing_back'
+
+export interface RecoveryPlanGuest {
+  vm_id: number
+  state: RecoveryPlanGuestState
+  // The execution acting on the guest (its failover, then its failback).
+  execution_id: string
+  job_id: string
+  failed_over_at: string | null
+  updated_at: string
+}
+
+export interface RecoveryPlanVM {
+  vm_id: number
+  vm_name: string
+  replication_job_id: string
+  tier: 1 | 2 | 3
+  boot_order: number
+}
+
+export interface RecoveryPlan {
+  id: string
+  name: string
+  description: string
+  status: RecoveryPlanStatus
+  source_cluster: string
+  target_cluster: string
+  vms: RecoveryPlanVM[]
+  last_test: string | null
+  last_failover: string | null
+  active_test_execution_id?: string | null
+  active_failback_execution_id?: string | null
+  // Per-guest DR states; absent or empty when every guest is protected.
+  guests?: RecoveryPlanGuest[]
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateRecoveryPlanRequest {
+  name: string
+  description: string
+  source_cluster: string
+  target_cluster: string
+  vms: Array<{ vm_id: number; tier: 1 | 2 | 3; boot_order: number; replication_job_id?: string }>
+}
+
+export interface UpdateRecoveryPlanRequest {
+  name?: string
+  description?: string
+  vms?: Array<{ vm_id: number; tier: 1 | 2 | 3; boot_order: number }>
+}
+
+// TestFailoverOptions are the per-run choices the Test Failover dialog sends
+// with a test: an older restore point per VM, whether DR VMs boot with their
+// NICs shut (default) or connected to the mapped target bridges, and how long
+// the orchestrator lets the guests settle before capturing boot screenshots
+// (omitted or 0 = the orchestrator's own default).
+export interface TestFailoverOptions {
+  restorePoints?: Record<number, string>
+  networkIsolated?: boolean
+  screenshotDelaySeconds?: number
+}
+
+// ============================================
+// Restore Points
+// ============================================
+
+export interface RestorePoint {
+  snapshot: string
+  created_ts: number
+  created_iso: string
+}
+
+export interface VMRestorePoints {
+  vm_id: number
+  vm_name: string
+  target_vmid: number
+  job_id?: string
+  disk_count: number
+  restore_points: RestorePoint[]
+  error?: string
+}
+
+export interface PlanRestorePoints {
+  plan_id: string
+  target_cluster: string
+  vms: VMRestorePoints[]
+}
+
+// ============================================
+// Recovery Executions
+// ============================================
+
+export type RecoveryExecutionType = 'test' | 'failover' | 'failback'
+export type RecoveryExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface TestCloneRef {
+  device: string
+  storage: string
+  original: string
+  clone: string
+  options: string
+}
+
+export interface RecoveryVMResult {
+  test_point?: string
+  // 'cleaning' is the guest the cleanup is working on right now: it stops
+  // the guest and rolls every replica image back, minutes per guest on large
+  // images, so the dialog names it rather than showing a bar that sits still.
+  test_state?: 'cloning' | 'config_rewritten' | 'started' | 'cleanup_pending' | 'cleaning' | 'cleaned'
+  test_clones?: TestCloneRef[]
+  vm_id: number
+  vm_name: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  progress_percent: number
+  error?: string
+  target_node?: string
+  target_vmid?: number
+  // Fine-grained machine code for where a REAL failover or an in-progress
+  // failback currently stands for this VM: 'fencing', 'restoring', 'starting'
+  // (failover), or a reverse-sync/cutover step code (failback). Cleared ("")
+  // once the VM reaches 'completed'; left in place on failure. Never set for
+  // a test failover. The UI maps the code to translated prose
+  // (siteRecovery.failover.step.*).
+  step?: string
+  // Reverse-sync progress for a failback in phase 'reverse_sync': when this
+  // VM's per-disk delta was last transferred back to the source, and how
+  // many bytes it carried. Absent until the first reverse-sync pass for the
+  // VM completes.
+  last_reverse_sync_at?: string
+  last_reverse_sync_bytes?: number
+}
+
+/** One line of the step log of a failover or failback (ui#943). */
+export interface RecoveryExecutionEvent {
+  id: number
+  execution_id: string
+  vm_id: number
+  step?: string
+  /** check = a verified fact, info = a step starting, warning = non-fatal, error = what stopped the run. */
+  level: 'info' | 'check' | 'warning' | 'error'
+  message: string
+  at: string
+}
+
+export interface RecoveryExecution {
+  id: string
+  plan_id: string
+  type: RecoveryExecutionType
+  status: RecoveryExecutionStatus
+  network_isolated?: boolean
+  // A failover or failback restricted to one guest of the plan (ui#943).
+  // Absent for a plan-wide execution.
+  scope_vmid?: number
+  started_at: string
+  completed_at?: string
+  vm_results: RecoveryVMResult[]
+  // Fine-grained progress marker for a running execution. For type === 'test',
+  // set past VM boot as the post-boot screenshot pipeline advances: 'booting',
+  // 'stabilizing', 'capturing', then cleared once it's done. For
+  // type === 'failback', tracks the two-phase flow: 'reverse_sync' (ongoing
+  // convergence loop back to source) then 'cutover' (operator-triggered
+  // switchback), cleared once the failback completes.
+  phase?: string
+  // Deadline for the current 'stabilizing' phase (ISO timestamp), so the
+  // frontend can show a live countdown instead of an indefinite spinner.
+  // Cleared alongside phase for every other phase/transition.
+  phase_ends_at?: string
+  // Test failover only: the stabilization delay this run asked for, in
+  // seconds. Absent on runs that took the orchestrator's default.
+  screenshot_delay_seconds?: number
+  // Test failover only: the last cleanup's progress and verdict, refreshed by
+  // the orchestrator after every guest. Absent until a cleanup has started.
+  // While phase === 'cleaning' it is still moving.
+  cleanup_result?: CleanupResult
+}
+
+// CleanupResult is the progress and verdict of a test failover cleanup. The
+// cleanup runs in the background (it rolls terabyte-scale replica images
+// back, far past any request timeout), so this is polled from the execution
+// rather than returned by the request that started it.
+export interface CleanupResult {
+  plan_id: string
+  vms_stopped: number
+  nics_reconnected: number
+  disks_rolled: number
+  clones_destroyed: number
+  jobs_resumed: number
+  connect_failed: boolean
+  all_cleaned: boolean
+  errors: string[]
+  guests_total: number
+  guests_cleaned: number
+  // The guest being worked on, absent when none is.
+  current_vmid?: number
+  started_at: string
+  finished_at?: string
+}
+
+// CleanupStarted is the receipt the cleanup request returns: the work itself
+// runs in the background and is watched through execution_id.
+export interface CleanupStarted {
+  plan_id: string
+  execution_id?: string
+}
+
+// ============================================
+// Health & Dashboard
+// ============================================
+
+export type SiteRole = 'primary' | 'dr'
+export type SiteStatus = 'online' | 'degraded' | 'offline'
+
+export interface SiteInfo {
+  cluster_id: string
+  name: string
+  role: SiteRole
+  status: SiteStatus
+  node_count: number
+  vm_count: number
+}
+
+export interface ReplicationActivity {
+  timestamp: string
+  type: 'sync' | 'failover' | 'failback' | 'error' | 'job_created' | 'plan_tested'
+  message: string
+  severity: 'info' | 'warning' | 'error' | 'success'
+}
+
+export interface ReplicationHealthKPIs {
+  protected_vms: number
+  unprotected_vms: number
+  avg_rpo_seconds: number
+  last_sync: string
+  replicated_bytes: number
+  error_count: number
+  total_jobs: number
+  rpo_compliance: number   // 0-100 percentage
+  concurrent_jobs: number
+  max_concurrent_jobs: number
+}
+
+export interface JobStatusSummary {
+  synced: number
+  syncing: number
+  pending: number
+  error: number
+  paused: number
+  no_match: number
+  partial: number
+}
+
+export interface ReplicationHealthStatus {
+  engines?: StorageEngine[]
+  sites: SiteInfo[]
+  connectivity: 'connected' | 'degraded' | 'disconnected'
+  latency_ms: number
+  kpis: ReplicationHealthKPIs
+  recent_activity: ReplicationActivity[]
+  job_summary: JobStatusSummary
+}

@@ -1,0 +1,81 @@
+import { describe, it, expect, beforeEach } from 'vitest'
+import { renderHook, waitFor, act } from '@testing-library/react'
+import { server, http, HttpResponse } from '@/__tests__/setup/msw-server'
+import { LicenseProvider, useLicense, Features } from './LicenseContext'
+
+const LICENSE_STATUS_URL = '*/api/v1/license/status'
+
+const ENTERPRISE_WITH_OPTION = {
+  licensed: true,
+  expired: false,
+  edition: 'enterprise',
+  features: ['drs'],
+  options: ['control_plane_ha'],
+}
+
+const wrapper = ({ children }: { children: React.ReactNode }) => (
+  <LicenseProvider>{children}</LicenseProvider>
+)
+
+describe('LicenseContext', () => {
+  beforeEach(() => {
+    server.use(
+      http.get(LICENSE_STATUS_URL, () => HttpResponse.json(ENTERPRISE_WITH_OPTION)),
+    )
+  })
+
+  it('grants an option capability through hasFeature', async () => {
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.isLicensed).toBe(true))
+    expect(result.current.hasFeature(Features.HA)).toBe(true)
+    expect(result.current.hasFeature(Features.DRS)).toBe(true)
+  })
+
+  it('falls back to community when a refresh fails after a valid status (P2)', async () => {
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.isLicensed).toBe(true))
+
+    server.use(http.get(LICENSE_STATUS_URL, () => HttpResponse.error()))
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    await waitFor(() => expect(result.current.isLicensed).toBe(false))
+    expect(result.current.hasFeature(Features.HA)).toBe(false)
+    expect(result.current.status?.edition).toBe('community')
+  })
+
+  it('falls back to community when the server responds non-ok', async () => {
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.isLicensed).toBe(true))
+
+    server.use(http.get(LICENSE_STATUS_URL, () => HttpResponse.json({}, { status: 500 })))
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    await waitFor(() => expect(result.current.isLicensed).toBe(false))
+    expect(result.current.status?.edition).toBe('community')
+  })
+
+  it('exposes the offline flag the status route sends', async () => {
+    server.use(http.get(LICENSE_STATUS_URL, () => HttpResponse.json({ ...ENTERPRISE_WITH_OPTION, offline: true })))
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.offline).toBe(true))
+  })
+
+  it('keeps the offline flag of a non-ok answer, with the community fallback', async () => {
+    server.use(http.get(LICENSE_STATUS_URL, () => HttpResponse.json({ error: 'x', offline: true }, { status: 503 })))
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.offline).toBe(true)
+    expect(result.current.status?.edition).toBe('community')
+    expect(result.current.isLicensed).toBe(false)
+  })
+
+  it('defaults offline to false when the status does not say', async () => {
+    const { result } = renderHook(() => useLicense(), { wrapper })
+    await waitFor(() => expect(result.current.isLicensed).toBe(true))
+    expect(result.current.offline).toBe(false)
+  })
+})
